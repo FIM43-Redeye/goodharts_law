@@ -1,0 +1,57 @@
+x-common-config: &common-config
+  volumes:
+    - .:/app
+  # Keep the container running
+  command: tail -f /dev/null
+  # Shared memory size (crucial for PyTorch dataloaders)
+  shm_size: '8gb'
+  # Security/Group options often needed for GPU access
+  cap_add:
+    - SYS_PTRACE
+  security_opt:
+    - seccomp:unconfined
+  environment:
+    - PYTHONPATH=/app
+
+services:
+  dev-rocm:
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+    image: goodharts_law_rocm
+    profiles: [ "rocm" ]
+    <<: *common-config
+    # Device mapping for AMD ROCm
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - ${RENDER_GID:-render}
+    environment:
+      - HSA_OVERRIDE_GFX_VERSION=10.3.0 # Optional: Helps with some consumer cards (6000/7000 series)
+      - PYTHONPATH=/app
+
+  dev-cuda:
+    build:
+      context: .
+      dockerfile: Dockerfile.cuda
+    image: goodharts_law_cuda
+    profiles: [ "cuda" ]
+    <<: *common-config
+    # Nvidia runtime (requires nvidia-container-toolkit)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+
+  dev-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    image: goodharts_law_cpu
+    profiles: [ "cpu" ]
+    <<: *common-config
