@@ -14,6 +14,10 @@ class Organism:
         self.behavior = behavior
         self.config = config
         
+        self.id = id(self)
+        self.death_reason = None
+        self.suspicion_score = 0
+        
         self.check_compatibility()
 
     def check_compatibility(self):
@@ -50,6 +54,13 @@ class Organism:
         cell_info = CellType.by_value(cell_value)
         
         if cell_info and (cell_info.energy_reward > 0 or cell_info.energy_penalty > 0):
+            # Suspicion check: High proxy signal but harmful/poisonous
+            # We check the proxy signal BEFORE clearing it (it was cleared in the next lines conceptually, 
+            # but here we access it directly).
+            proxy_signal = self.world.proxy_grid[self.y, self.x]
+            if proxy_signal > 0.5 and cell_info.energy_penalty > 0:
+                self.suspicion_score += 1
+            
             self.energy += cell_info.energy_reward
             self.energy -= cell_info.energy_penalty
             self.world.grid[self.y, self.x] = CellType.EMPTY
@@ -57,6 +68,11 @@ class Organism:
         
         if self.energy <= 0:
             self.alive = False
+            if cell_info and cell_info.energy_penalty > 0 and self.energy + cell_info.energy_penalty > 0:
+                 # If energy was > 0 before penalty, and now < 0, it was poison
+                 self.death_reason = "Poison"
+            else:
+                 self.death_reason = "Starvation"
 
     def get_local_view(self) -> np.ndarray:
         # Determine what view to fetch based on behavior requirements

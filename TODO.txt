@@ -5,10 +5,10 @@ We want EMERGENCE, not just optimization failure. The current demo shows proxies
 but the "a-ha" moment should be watching agents *discover* deceptive strategies themselves.
 
 ## Phase 1: Better Measurement & Visualization
-- [ ] Track WHY agents die (starvation vs poison) - add death stats
-- [ ] Per-agent energy over time charts  
-- [ ] Heatmaps showing where agents spend time vs where food/poison is
-- [ ] "Suspicion" metric - how often does an agent choose high-proxy cells that are poison?
+- [x] Track WHY agents die (starvation vs poison) - add death stats
+- [x] Per-agent energy over time charts  
+- [x] Heatmaps showing where agents spend time vs where food/poison is
+- [x] "Suspicion" metric - how often does an agent choose high-proxy cells that are poison?
 
 ## Phase 2: Learned Behaviors (CNN/RL)
 - [ ] Replace hardcoded behaviors with small CNNs that process the local view

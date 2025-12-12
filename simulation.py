@@ -32,13 +32,41 @@ class Simulation:
                 randy = np.random.randint(0, self.world.height)
                 behavior = BehaviorClass()
                 self.agents.append(Organism(randx, randy, config['ENERGY_START'], config['AGENT_VIEW_RANGE'], self.world, behavior, config))
+        
+        self.step_count = 0
+        self.stats = {
+            'deaths': [],  # list of {'step': int, 'id': int, 'reason': str}
+            'energy_history': {a.id: [] for a in self.agents},  # {agent_id: [energy values]}
+            'heatmap': np.zeros((self.world.height, self.world.width)),  # count of visits
+            'suspicion_history': {a.id: [] for a in self.agents} # {agent_id: [suspicion values]}
+        }
 
     def step(self):
+        self.step_count += 1
         for agent in self.agents[:]:
             if not agent.alive:
+                self.stats['deaths'].append({
+                    'step': self.step_count,
+                    'id': agent.id,
+                    'reason': agent.death_reason
+                })
                 self.agents.remove(agent)
                 continue
+            
             agent.update()
+            
+            # Update Stats
+            if agent.id not in self.stats['energy_history']:
+                 self.stats['energy_history'][agent.id] = []
+            self.stats['energy_history'][agent.id].append(agent.energy)
+            
+            if agent.id not in self.stats['suspicion_history']:
+                 self.stats['suspicion_history'][agent.id] = []
+            self.stats['suspicion_history'][agent.id].append(agent.suspicion_score)
+            
+            # Update Heatmap
+            if 0 <= agent.y < self.world.height and 0 <= agent.x < self.world.width:
+                self.stats['heatmap'][agent.y, agent.x] += 1
 
     def get_render_grid(self):
         render_grid = self.world.grid.copy()
