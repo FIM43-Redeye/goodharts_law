@@ -1,0 +1,33 @@
+FROM pytorch/pytorch:2.9.1-cuda13.0-cudnn9-devel
+
+WORKDIR /app
+
+RUN pip install --upgrade pip
+
+COPY requirements.txt .
+
+# Install dependencies
+# We rely on the pre-installed torch for CUDA, but install other requirements
+RUN pip install -r requirements.txt || echo "Warning: Some requirements failed. Ignoring for pre-built image."
+
+# Install dev tools
+RUN apt-get update && apt-get install -y git vim curl
+
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+
+# Handle case where user/group IDs already exist
+RUN if getent group $GROUP_ID; then \
+    groupmod -n appuser $(getent group $GROUP_ID | cut -d: -f1); \
+    else \
+    groupadd -g $GROUP_ID appuser; \
+    fi && \
+    if getent passwd $USER_ID; then \
+    usermod -l appuser -g $GROUP_ID -d /home/appuser -m $(getent passwd $USER_ID | cut -d: -f1); \
+    else \
+    useradd -l -u $USER_ID -g $GROUP_ID -m appuser; \
+    fi
+
+RUN chown -R appuser:appuser /app
+
+USER appuser

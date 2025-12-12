@@ -1,0 +1,43 @@
+# Use the official AMD ROCm PyTorch image.
+# New look, same great taste, this image is validated
+# You can check https://hub.docker.com/r/rocm/pytorch/tags for updates.
+FROM rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.9.1
+
+# Set the working directory
+WORKDIR /app
+
+# Upgrade pip
+RUN pip install --upgrade pip
+
+# Copy only requirements first to cache dependencies
+COPY requirements.txt .
+
+# Install dependencies
+# Note: This might warn about torch versions if requirements.txt has specific ones.
+# We usually rely on the pre-installed torch for ROCm, so we might want to exclude torch from here,
+# or trust pip to handle it.
+RUN pip install -r requirements.txt || echo "Warning: Some requirements failed, likely torch version conflict. Ignoring for pre-built image."
+
+# Install useful dev tools for working inside the container
+RUN apt-get update && apt-get install -y git vim curl
+
+# Set up a non-root user that matches the host user ID (typically 1000)
+# This makes file permissions much easier when using volumes.
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+
+# Handle case where user/group IDs already exist (common in Ubuntu images where 1000 is ubuntu)
+RUN if getent group $GROUP_ID; then \
+    groupmod -n appuser $(getent group $GROUP_ID | cut -d: -f1); \
+    else \
+    groupadd -g $GROUP_ID appuser; \
+    fi && \
+    if getent passwd $USER_ID; then \
+    usermod -l appuser -g $GROUP_ID -d /home/appuser -m $(getent passwd $USER_ID | cut -d: -f1); \
+    else \
+    useradd -l -u $USER_ID -g $GROUP_ID -m appuser; \
+    fi
+
+RUN chown -R appuser:appuser /app
+
+USER appuser
