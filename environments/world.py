@@ -1,12 +1,12 @@
 import numpy as np
-from constants import *
-
 
 class World:
-    def __init__(self, width: int, height: int):
+    def __init__(self, width: int, height: int, config: dict):
         self.width = width
         self.height = height
         self.grid = np.zeros((self.height, self.width), np.int8)
+        self.config = config
+        self.CellType = self.config['CellType']
 
     def _place_items(self, item_type: int, amount: int):
         count = 0
@@ -18,7 +18,7 @@ class World:
                 count += 1
 
     def place_food(self, amount: int):
-        self._place_items(CellType.FOOD, amount)  # 2 = Food
+        self._place_items(self.CellType.FOOD, amount)
 
     def place_poison(self, amount: int):
-        self._place_items(CellType.POISON, amount)  # 3 = Poison
+        self._place_items(self.CellType.POISON, amount)

@@ -1,10 +1,12 @@
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib import colors
-from simulation import Simulation
+from simulation_refactored import Simulation
+from configs.default_config import get_config
 
 # 1. Setup Simulation
-sim = Simulation()  # Start with however many agents we have set up
+config = get_config()
+sim = Simulation(config)
 
 # 2. Setup Plotting
 fig, ax = plt.subplots(figsize=(8, 8))
