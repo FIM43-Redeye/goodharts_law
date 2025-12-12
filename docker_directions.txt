@@ -1,0 +1,65 @@
+## The Setup
+We have configured `compose.yaml` to support three different environments (profiles):
+1.  **ROCm**: For AMD GPUs (`docker compose --profile rocm ...`)
+2.  **CUDA**: For NVIDIA GPUs (`docker compose --profile cuda ...`) (UNTESTED!)
+3.  **CPU**: For systems without a compatible GPU (`docker compose --profile cpu ...`)
+
+## How to Work
+
+### 1. Start the Environment
+Open a terminal in the project folder and run ONE of the following commands depending on your hardware:
+
+**For AMD (ROCm):**
+```bash
+docker compose --profile rocm up -d --build
+```
+
+**For NVIDIA (CUDA):**
+```bash
+docker compose --profile cuda up -d --build
+```
+
+**For CPU Only:**
+```bash
+docker compose --profile cpu up -d --build
+```
+
+This builds the image (if needed) and starts a container named `goodharts_law-dev-<profile>-1` in the background.
+
+### 2. Enter the Environment (The "Terminal" Workflow)
+To run your scripts, you need to be *inside* that container. Run the command matching your profile:
+
+**ROCm:**
+```bash
+docker compose exec -it dev-rocm bash
+```
+
+**CUDA:**
+```bash
+docker compose exec -it dev-cuda bash
+```
+
+**CPU:**
+```bash
+docker compose exec -it dev-cpu bash
+```
+
+You will now be at a prompt like `appuser@<container-id>:/app$`.
+
+### 3. Edit Code
+You continue to edit code in **Antigravity** (your editor) just like normal. Since we mapped the volume (`.:/app`), any change you make in the editor is immediately visible inside the container.
+
+### 4. Stop the Environment
+When you are done, run:
+
+```bash
+docker compose down
+```
+
+## Troubleshooting
+- **GPU Not Found or Permission Errors**:
+    - **ROCm**: Ensure you have `/dev/kfd` and `/dev/dri` on your host machine.
+    - If you see `CUDA available: False` or permission denied errors, it may be a Group ID mismatch.
+    - Check the group ID of your render device: `stat -c '%g' /dev/kfd` (e.g., 109).
+    - Run with that GID: `RENDER_GID=109 docker compose --profile rocm up -d --build`
+    - **CUDA**: Ensure you have the NVIDIA Container Toolkit installed and updated drivers.
