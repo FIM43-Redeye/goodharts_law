@@ -10,10 +10,13 @@ def run_verification():
     config['ENERGY_MOVE_COST'] = 0.5
     config['GRID_POISON_INIT'] = 100 
     config['GRID_FOOD_INIT'] = 100
-    config['GRID_AGENTS_INIT'] = 20 
+    config['AGENTS_SETUP'] = [
+        {'behavior_class': 'OmniscientSeeker', 'count': 10},
+        {'behavior_class': 'ProxySeeker', 'count': 10}
+    ]
     
     sim = Simulation(config)
-    print(f"Initialized Simulation with {len(sim.agents)} agents.")
+    print(f"Initialized Simulation.")
     
     omniscient_count = 0
     proxy_count = 0

@@ -17,7 +17,10 @@ GRID_WIDTH = 100
 GRID_HEIGHT = 100
 GRID_FOOD_INIT = 50
 GRID_POISON_INIT = 10
-GRID_AGENTS_INIT = 5
+AGENTS_SETUP = [
+    {'behavior_class': 'OmniscientSeeker', 'count': 5},
+    {'behavior_class': 'ProxySeeker', 'count': 5}
+]
 
 # Agent Properties
 AGENT_VIEW_RANGE = 5
@@ -35,7 +38,8 @@ def get_config():
         'GRID_HEIGHT': GRID_HEIGHT,
         'GRID_FOOD_INIT': GRID_FOOD_INIT,
         'GRID_POISON_INIT': GRID_POISON_INIT,
-        'GRID_AGENTS_INIT': GRID_AGENTS_INIT,
+        'GRID_POISON_INIT': GRID_POISON_INIT,
+        'AGENTS_SETUP': AGENTS_SETUP,
         'AGENT_VIEW_RANGE': AGENT_VIEW_RANGE,
         'CELL_PROPERTIES': CELL_PROPERTIES,
         'CellType': CellType
