@@ -1,10 +1,12 @@
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib import colors
-from simulation_refactored import Simulation
+from simulation import Simulation
 from configs.default_config import get_config
 
 # 1. Setup Simulation
+config = get_config()
+sim = Simulation(config)
 config = get_config()
 sim = Simulation(config)
 
@@ -37,3 +39,4 @@ def update(frame):
 # Run animation
 ani = animation.FuncAnimation(fig, update, interval=50, blit=False)
 plt.show()
+

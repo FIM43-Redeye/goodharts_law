@@ -1,6 +1,6 @@
 import numpy as np
 from abc import ABC, abstractmethod
-from constants import CellType
+from configs.default_config import CellType
 
 
 class BehaviorStrategy(ABC):

@@ -1,5 +1,5 @@
 import numpy as np
-from environment import World
+from environments.world import World
 from behaviors import BehaviorStrategy
 
 

@@ -1,4 +1,10 @@
-from constants_refactored import CellType
+from enum import IntEnum
+
+class CellType(IntEnum):
+    EMPTY = 0
+    WALL = 1
+    FOOD = 2
+    POISON = 3
 
 # Simulation Physics / Hyperparameters
 ENERGY_START = 50.0
