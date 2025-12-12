@@ -7,15 +7,14 @@ from configs.default_config import get_config
 # 1. Setup Simulation
 config = get_config()
 sim = Simulation(config)
-config = get_config()
-sim = Simulation(config)
+
 
 # 2. Setup Plotting
 fig, ax = plt.subplots(figsize=(8, 8))
 
-# Define colors: 0=Empty(Black), 1=Wall(Gray), 2=Food(Green), 3=Poison(Red), 4=Agent(Blue)
-cmap = colors.ListedColormap(['black', 'gray', 'green', 'red', 'cyan'])
-bounds = [0, 1, 2, 3, 4, 5]
+# Define colors: 0=Empty(Black), 1=Wall(Gray), 2=Food(Green), 3=Poison(Red), 4=Omniscient(Cyan), 5=Proxy(Magenta)
+cmap = colors.ListedColormap(['black', 'gray', 'green', 'red', 'cyan', 'magenta'])
+bounds = [0, 1, 2, 3, 4, 5, 6]
 norm = colors.BoundaryNorm(bounds, cmap.N)
 
 # Initialize the image object

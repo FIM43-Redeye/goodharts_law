@@ -1,6 +1,6 @@
 from environments import World
 from agents import Organism
-from behaviors import GreedyFoodSeeker
+from behaviors import OmniscientSeeker, ProxySeeker
 import numpy as np
 
 class Simulation:
@@ -11,10 +11,17 @@ class Simulation:
         self.world.place_poison(config['GRID_POISON_INIT'])
 
         self.agents = []
-        for _ in range(config['GRID_AGENTS_INIT']):
+        num_agents = config['GRID_AGENTS_INIT']
+        for i in range(num_agents):
             randx = np.random.randint(0, self.world.width)
             randy = np.random.randint(0, self.world.height)
-            behavior = GreedyFoodSeeker()
+            
+            # Split population
+            if i < num_agents // 2:
+                behavior = OmniscientSeeker()
+            else:
+                behavior = ProxySeeker()
+                
             self.agents.append(Organism(randx, randy, config['ENERGY_START'], config['AGENT_VIEW_RANGE'], self.world, behavior, config))
 
     def step(self):
@@ -28,6 +35,10 @@ class Simulation:
         render_grid = self.world.grid.copy()
         for agent in self.agents:
             if 0 <= agent.x < self.world.width and 0 <= agent.y < self.world.height:
-                render_grid[agent.y, agent.x] = 4
+                # 4 for Omniscient, 5 for Proxy
+                val = 4
+                if isinstance(agent.behavior, ProxySeeker):
+                    val = 5
+                render_grid[agent.y, agent.x] = val
         return render_grid
 

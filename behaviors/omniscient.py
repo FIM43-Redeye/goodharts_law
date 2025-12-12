@@ -1,8 +1,13 @@
 import numpy as np
 from .base import BehaviorStrategy
 
-class GreedyFoodSeeker(BehaviorStrategy):
+class OmniscientSeeker(BehaviorStrategy):
+    @property
+    def requirements(self) -> list[str]:
+        return ['ground_truth']
+
     def decide_action(self, agent, view):
+        # 'view' is expected to be the ground truth grid
         center = agent.sight_radius
         best_moves = []
         safe_moves = []

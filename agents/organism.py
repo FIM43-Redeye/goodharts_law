@@ -13,6 +13,15 @@ class Organism:
         self.sight_radius = sight_radius
         self.behavior = behavior
         self.config = config
+        
+        self.check_compatibility()
+
+    def check_compatibility(self):
+        reqs = self.behavior.requirements
+        caps = self.world.capabilities
+        for req in reqs:
+            if req not in caps:
+                raise ValueError(f"Incompatible: Behavior requires '{req}' but World only supports {caps}")
 
     def move(self, dx: int, dy: int):
         self.x = max(0, min(self.x + dx, self.world.width - 1))
@@ -29,11 +38,26 @@ class Organism:
             if 'energy_penalty' in properties:
                 self.energy -= properties['energy_penalty']
             self.world.grid[self.y, self.x] = CellType.EMPTY
+            # We don't necessarily clear the proxy grid - maybe the smell lingers? 
+            # But for now let's leave it simple.
+            # If we wanted full realism, we'd clear proxy too if the source is gone.
+            self.world.proxy_grid[self.y, self.x] = 0.0 # Clear signal
         
         if self.energy <= 0:
             self.alive = False
 
     def get_local_view(self) -> np.ndarray:
+        # Determine what view to fetch based on behavior requirements
+        # Default to ground truth if not specified or mixed (simpler for now)
+        reqs = self.behavior.requirements
+        
+        target_grid = self.world.grid
+        constant_val = self.config['CellType'].WALL
+        
+        if 'proxy_metric' in reqs:
+            target_grid = self.world.proxy_grid
+            constant_val = 0.0 # Outside world is 0 signal
+        
         x_min_world = self.x - self.sight_radius
         x_max_world = self.x + self.sight_radius
         y_min_world = self.y - self.sight_radius
@@ -44,7 +68,7 @@ class Organism:
         y_slice_start = max(0, y_min_world)
         y_slice_end = min(self.world.height, y_max_world + 1)
 
-        world_view = self.world.grid[y_slice_start:y_slice_end, x_slice_start:x_slice_end]
+        world_view = target_grid[y_slice_start:y_slice_end, x_slice_start:x_slice_end]
 
         pad_top = y_slice_start - y_min_world
         pad_bottom = (y_max_world + 1) - y_slice_end
@@ -55,7 +79,7 @@ class Organism:
             world_view,
             pad_width=((pad_top, pad_bottom), (pad_left, pad_right)),
             mode='constant',
-            constant_values=self.config['CellType'].WALL
+            constant_values=constant_val
         )
         return view
 

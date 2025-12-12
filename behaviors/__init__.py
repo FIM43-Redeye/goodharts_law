@@ -1,2 +1,3 @@
 from .base import BehaviorStrategy
-from .greedy_food_seeker import GreedyFoodSeeker
+from .omniscient import OmniscientSeeker
+from .proxy_seeker import ProxySeeker
