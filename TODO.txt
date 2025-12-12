@@ -1,0 +1,43 @@
+# Goodhart's Law Simulation - Future Enhancements
+
+## Core Thesis
+We want EMERGENCE, not just optimization failure. The current demo shows proxies fail,
+but the "a-ha" moment should be watching agents *discover* deceptive strategies themselves.
+
+## Phase 1: Better Measurement & Visualization
+- [ ] Track WHY agents die (starvation vs poison) - add death stats
+- [ ] Per-agent energy over time charts  
+- [ ] Heatmaps showing where agents spend time vs where food/poison is
+- [ ] "Suspicion" metric - how often does an agent choose high-proxy cells that are poison?
+
+## Phase 2: Learned Behaviors (CNN/RL)
+- [ ] Replace hardcoded behaviors with small CNNs that process the local view
+- [ ] Train with reward = energy gained (true reward) vs proxy signal (Goodhart trap)
+- [ ] Compare learned policies: ground-truth-trained vs proxy-trained agents
+- [ ] Visualize what the CNN "sees" - attention/saliency maps
+
+## Phase 3: Emergent Deception (the cool stuff!)
+- [ ] Multi-agent dynamics: can agents learn to "signal" to others?
+- [ ] Resource scarcity: what happens when agents compete?
+- [ ] Proxy gaming: can agents learn to CREATE high-proxy cells? (gaming the metric)
+- [ ] "Inspector" agents that try to distinguish food from poison
+- [ ] Adversarial co-evolution: proxy-gamers vs inspectors
+
+## Phase 4: Publication-Ready
+- [ ] Proper README with Goodhart's Law explanation and AI safety connection
+- [ ] Reproducible experiments with seeds and config files
+- [ ] Statistical analysis across many runs
+- [ ] Diagrams showing the information asymmetry (proxy vs ground truth)
+- [ ] Connection to real AI alignment failures
+
+## Wild Ideas
+- Agents that can "lie" about what they found
+- Evolving the proxy function itself
+- Meta-learning: agents learn what proxy to use
+- Hierarchical agents (managers who set proxies, workers who optimize)
+
+## Technical Debt
+- [ ] Add proper logging
+- [ ] Add pytest test suite  
+- [ ] Type hints everywhere
+- [ ] Performance profiling (numpy vectorization?)
