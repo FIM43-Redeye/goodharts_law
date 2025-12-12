@@ -1,29 +1,36 @@
 import torch
 import numpy as np
 from behaviors import BehaviorStrategy
-# from behaviors.brains.tiny_cnn import TinyCNN # Uncomment when implemented
+from behaviors.brains.tiny_cnn import TinyCNN
 
 class LearnedBehavior(BehaviorStrategy):
     """
     A behavior strategy that uses a neural network (TinyCNN) to decide actions.
     """
     def __init__(self, model_path=None):
-        # TODO: Initialize your model here
-        # self.brain = TinyCNN()
-        
-        # If a path is provided, load the weights
-        if model_path:
-            # self.brain.load_state_dict(torch.load(model_path))
-            pass
-            
-        # Put model in evaluation mode (important for inference!)
-        # self.brain.eval() 
-        pass
+        self.brain = None
+        self.model_path = model_path
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     @property
     def requirements(self) -> list[str]:
         # We likely want 'ground_truth' or 'proxy_signal' or both depending on what we train on
         return ['ground_truth']
+
+    def _init_brain(self, input_shape):
+        """Lazy initialization of the brain based on actual view shape."""
+        # 4 actions: Up, Down, Left, Right
+        self.brain = TinyCNN(input_shape=input_shape, input_channels=1, output_size=4)
+        
+        if self.model_path:
+            try:
+                self.brain.load_state_dict(torch.load(self.model_path, map_location=self.device))
+                print(f"Loaded model from {self.model_path}")
+            except FileNotFoundError:
+                print(f"Model path {self.model_path} not found, starting fresh.")
+        
+        self.brain.to(self.device)
+        self.brain.eval() # optimized for inference
 
     def decide_action(self, agent, view: np.ndarray):
         """
@@ -36,7 +43,9 @@ class LearnedBehavior(BehaviorStrategy):
         Returns:
             (int, int): dx, dy movement vector.
         """
-        
+        if self.brain is None:
+            self._init_brain(view.shape)
+            
         # ---------------------------------------------------------------------
         # EDUCATIONAL NOTE: From Numpy to PyTorch
         #
@@ -50,23 +59,28 @@ class LearnedBehavior(BehaviorStrategy):
         # 3. Data type matters! Neural nets usually work with Float32.
         # ---------------------------------------------------------------------
         
-        # TODO: Convert the numpy view to a torch tensor
-        # tensor_view = torch.from_numpy(view).float()
+        # Convert numpy to tensor
+        tensor_view = torch.from_numpy(view).float().to(self.device)
         
-        # TODO: Add batch and channel dimensions
-        # input_tensor = tensor_view.unsqueeze(0).unsqueeze(0) 
+        # Add batch (0) and channel (1) dimensions -> (1, 1, H, W)
+        input_tensor = tensor_view.unsqueeze(0).unsqueeze(0)
         
-        # TODO: Pass through the brain
-        # with torch.no_grad(): # Use no_grad for inference to save memory!
-        #    logits = self.brain(input_tensor)
+        # Inference
+        with torch.no_grad(): # Disable gradient calculation for speed/memory
+            logits = self.brain(input_tensor)
+            
+        # Select action with highest score
+        action_idx = torch.argmax(logits, dim=1).item()
         
-        # TODO: Decipher the output
-        # Usually, the output is a set of scores for each possible action.
-        # We pick the one with the highest score (argmax).
-        # action_idx = torch.argmax(logits, dim=1).item()
+        # Map index to dx, dy
+        # 0: Up (0, -1)
+        # 1: Down (0, 1)
+        # 2: Left (-1, 0)
+        # 3: Right (1, 0)
+        moves = [(0, -1), (0, 1), (-1, 0), (1, 0)]
         
-        # Map index to dx, dy (Example mapping)
-        # moves = [(0, 1), (0, -1), (1, 0), (-1, 0)] # Down, Up, Right, Left
-        # return moves[action_idx]
+        if 0 <= action_idx < len(moves):
+            return moves[action_idx]
         
-        return (0, 0) # Placeholder: don't move
+        return (0, 0) # Fallback
+

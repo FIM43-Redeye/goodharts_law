@@ -41,3 +41,5 @@ but the "a-ha" moment should be watching agents *discover* deceptive strategies 
 - [ ] Add pytest test suite  
 - [ ] Type hints everywhere
 - [ ] Performance profiling (numpy vectorization?)
+- [ ] Reimplement entire simulation on GPU (JAX/Warp) for massive scaling
+
