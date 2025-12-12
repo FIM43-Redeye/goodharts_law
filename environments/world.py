@@ -15,6 +15,7 @@ class World(Environment):
         return ['ground_truth', 'proxy_metric']
 
     def _place_items(self, item_type: int, amount: int):
+        cell_info = self.CellType.by_value(item_type)
         count = 0
         while count < amount:
             randx = np.random.randint(0, self.width)
@@ -22,12 +23,9 @@ class World(Environment):
             if self.grid[randy, randx] == 0:
                 self.grid[randy, randx] = item_type
                 
-                # Update Proxy Grid
-                # Both Food and Poison look "interesting" (high value)
-                if item_type == self.CellType.FOOD:
-                    self.proxy_grid[randy, randx] = 1.0
-                elif item_type == self.CellType.POISON:
-                    self.proxy_grid[randy, randx] = 0.9 # Slightly less, or same. High enough to confuse.
+                # Update Proxy Grid from intrinsic cell properties
+                # Both Food and Poison look "interesting" - the Goodhart trap!
+                self.proxy_grid[randy, randx] = cell_info.interestingness if cell_info else 0.0
                 
                 count += 1
 

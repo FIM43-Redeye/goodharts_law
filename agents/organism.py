@@ -24,24 +24,36 @@ class Organism:
                 raise ValueError(f"Incompatible: Behavior requires '{req}' but World only supports {caps}")
 
     def move(self, dx: int, dy: int):
+        # Apply speed cap - organisms can't move more than MAX_MOVE_DISTANCE per step
+        max_dist = self.config.get('MAX_MOVE_DISTANCE', 3)
+        distance = np.sqrt(dx ** 2 + dy ** 2)
+        if distance > max_dist:
+            # Scale down the movement to stay within speed limit
+            scale = max_dist / distance
+            dx = int(round(dx * scale))
+            dy = int(round(dy * scale))
+            distance = np.sqrt(dx ** 2 + dy ** 2)
+        
+        # Update position (clamped to world bounds)
         self.x = max(0, min(self.x + dx, self.world.width - 1))
         self.y = max(0, min(self.y + dy, self.world.height - 1))
-        self.energy -= np.sqrt(dx ** 2 + dy ** 2) * self.config['ENERGY_MOVE_COST']
+        
+        # Nonlinear energy cost: distance^exponent * base_cost
+        # Exponent > 1 means farther = disproportionately more expensive
+        exponent = self.config.get('MOVE_COST_EXPONENT', 1.0)
+        base_cost = self.config['ENERGY_MOVE_COST']
+        self.energy -= (distance ** exponent) * base_cost
 
     def eat(self):
-        cell_type = self.world.grid[self.y, self.x]
+        cell_value = self.world.grid[self.y, self.x]
         CellType = self.config['CellType']
-        if cell_type in self.config['CELL_PROPERTIES']:
-            properties = self.config['CELL_PROPERTIES'][cell_type]
-            if 'energy_reward' in properties:
-                self.energy += properties['energy_reward']
-            if 'energy_penalty' in properties:
-                self.energy -= properties['energy_penalty']
+        cell_info = CellType.by_value(cell_value)
+        
+        if cell_info and (cell_info.energy_reward > 0 or cell_info.energy_penalty > 0):
+            self.energy += cell_info.energy_reward
+            self.energy -= cell_info.energy_penalty
             self.world.grid[self.y, self.x] = CellType.EMPTY
-            # We don't necessarily clear the proxy grid - maybe the smell lingers? 
-            # But for now let's leave it simple.
-            # If we wanted full realism, we'd clear proxy too if the source is gone.
-            self.world.proxy_grid[self.y, self.x] = 0.0 # Clear signal
+            self.world.proxy_grid[self.y, self.x] = 0.0  # Clear signal
         
         if self.energy <= 0:
             self.alive = False

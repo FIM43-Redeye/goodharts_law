@@ -1,6 +1,13 @@
 import numpy as np
 from .base import BehaviorStrategy
 
+# 8-directional random walk moves (cardinals + diagonals)
+RANDOM_WALK_MOVES = [
+    (0, 1), (0, -1), (1, 0), (-1, 0),  # Cardinals
+    (1, 1), (1, -1), (-1, 1), (-1, -1)  # Diagonals
+]
+
+
 class ProxySeeker(BehaviorStrategy):
     @property
     def requirements(self) -> list[str]:
@@ -23,7 +30,7 @@ class ProxySeeker(BehaviorStrategy):
                     continue
                 
                 val = view[center + dy, center + dx]
-                if val > max_val and val > 0: # Interested in non-zero signals
+                if val > max_val and val > 0:  # Interested in non-zero signals
                     max_val = val
                     best_target = (dx, dy)
         
@@ -34,7 +41,7 @@ class ProxySeeker(BehaviorStrategy):
             step_y = int(np.sign(dy))
             return step_x, step_y
         
-        # Random walk if nothing interesting
-        possible_moves = [(0,1), (0,-1), (1,0), (-1,0)]
-        idx = np.random.randint(0, len(possible_moves))
-        return possible_moves[idx]
+        # Random walk if nothing interesting (8 directions)
+        idx = np.random.randint(0, len(RANDOM_WALK_MOVES))
+        return RANDOM_WALK_MOVES[idx]
+
