@@ -1,6 +1,7 @@
 from environments import create_world
 from agents import Organism
 from behaviors import OmniscientSeeker, ProxySeeker
+from utils.logging_config import get_logger
 import numpy as np
 
 # Mapping string names to classes
@@ -9,14 +10,17 @@ BEHAVIORS = {
     'ProxySeeker': ProxySeeker
 }
 
+logger = get_logger("simulation")
+
 class Simulation:
-    def __init__(self, config):
-        self.config = config
-        self.world = create_world(config)
+    def __init__(self, config: dict):
+        logger.info("Initializing Simulation")
+        self.config: dict = config
+        self.world: 'World' = create_world(config)
         self.world.place_food(config['GRID_FOOD_INIT'])
         self.world.place_poison(config['GRID_POISON_INIT'])
 
-        self.agents = []
+        self.agents: list[Organism] = []
         
         for setup in config['AGENTS_SETUP']:
             b_class_name = setup['behavior_class']
@@ -50,6 +54,7 @@ class Simulation:
                     'id': agent.id,
                     'reason': agent.death_reason
                 })
+                logger.debug(f"Agent {agent.id} died from {agent.death_reason}")
                 self.agents.remove(agent)
                 continue
             
@@ -67,8 +72,11 @@ class Simulation:
             # Update Heatmap
             if 0 <= agent.y < self.world.height and 0 <= agent.x < self.world.width:
                 self.stats['heatmap'][agent.y, agent.x] += 1
+        
+        if self.step_count % 100 == 0:
+            logger.info(f"Completed step {self.step_count}. Alive agents: {len(self.agents)}")
 
-    def get_render_grid(self):
+    def get_render_grid(self) -> np.ndarray:
         render_grid = self.world.grid.copy()
         for agent in self.agents:
             if 0 <= agent.x < self.world.width and 0 <= agent.y < self.world.height:

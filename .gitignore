@@ -141,3 +141,4 @@ cython_debug/
 # Personal!
 intent.txt
 .agent/
+whoami.txt

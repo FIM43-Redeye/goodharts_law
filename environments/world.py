@@ -3,12 +3,12 @@ from .base import Environment
 
 class World(Environment):
     def __init__(self, width: int, height: int, config: dict):
-        self.width = width
-        self.height = height
-        self.grid = np.zeros((self.height, self.width), np.int8)
-        self.proxy_grid = np.zeros((self.height, self.width), np.float32) # The "Goodhart" layer
-        self.config = config
-        self.CellType = self.config['CellType']
+        self.width: int = width
+        self.height: int = height
+        self.grid: np.ndarray = np.zeros((self.height, self.width), np.int8)
+        self.proxy_grid: np.ndarray = np.zeros((self.height, self.width), np.float32) # The "Goodhart" layer
+        self.config: dict = config
+        self.CellType: type = self.config['CellType']
 
     @property
     def capabilities(self) -> list[str]:
