@@ -6,9 +6,9 @@ enabling empirical demonstration of Goodhart's Law.
 """
 import torch
 import numpy as np
-from ..behaviors import BehaviorStrategy
-from ..behaviors.brains.tiny_cnn import TinyCNN
-from ..behaviors.action_space import build_action_space, action_to_index, index_to_action, num_actions
+from goodharts.behaviors import BehaviorStrategy
+from goodharts.behaviors.brains.tiny_cnn import TinyCNN
+from goodharts.behaviors.action_space import build_action_space, action_to_index, index_to_action, num_actions
 
 
 class LearnedBehavior(BehaviorStrategy):

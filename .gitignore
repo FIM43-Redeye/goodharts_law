@@ -4,8 +4,9 @@
 *$py.class
 behaviors/__pycache__
 
-# Models
+# Models and other live-generated things
 models/
+visualizations/
 
 # C extensions
 *.so
@@ -143,4 +144,5 @@ cython_debug/
 
 # Personal!
 personal/
-.agent/
+.agent/*.toml
+config.toml

@@ -1,0 +1,73 @@
+# Goodhart's Law Simulation - Default Configuration
+#
+# This file contains the default settings shipped with the project.
+# To customize, copy this to `config.toml` and edit that file.
+# config.toml is in .gitignore so your changes won't be committed.
+#
+# Usage:
+#   python main.py                     # Uses config.toml (or config.default.toml)
+#   python main.py --config other.toml # Uses specific config
+
+# =============================================================================
+# WORLD
+# =============================================================================
+[world]
+width = 100
+height = 100
+loop = false  # true = edges wrap (toroidal), false = bounded with walls
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+[resources]
+food = 50       # Initial food items
+poison = 10     # Initial poison items
+respawn = true  # Respawn consumed resources
+
+# =============================================================================
+# AGENTS
+# =============================================================================
+# Each [[agents]] block spawns agents of that type.
+# Available types: OmniscientSeeker, ProxySeeker, 
+#                  LearnedGroundTruth, LearnedProxy, LearnedProxyIllAdjusted
+
+[[agents]]
+type = "OmniscientSeeker"
+count = 5
+
+[[agents]]
+type = "ProxySeeker" 
+count = 5
+
+# Example: learned agents
+# [[agents]]
+# type = "LearnedGroundTruth"
+# count = 3
+# model = "goodharts/models/ground_truth.pth"
+
+# =============================================================================
+# AGENT PROPERTIES
+# =============================================================================
+[agent]
+view_range = 5         # How far agents can see
+energy_start = 50.0    # Starting energy
+energy_move_cost = 0.1 # Cost per unit distance
+move_cost_exponent = 1.5
+max_move_distance = 3  # Speed cap
+
+# =============================================================================
+# VISUALIZATION (for main.py)
+# =============================================================================
+[visualization]
+speed = 50    # Animation interval in ms (lower = faster)
+steps = 0     # 0 = run forever, >0 = stop after N steps
+
+# =============================================================================
+# BRAIN VIEW MODE
+# =============================================================================
+# When enabled, spawns a SINGLE agent for neural network visualization.
+# This REPLACES the [[agents]] list above.
+[brain_view]
+enabled = false
+agent_type = "LearnedGroundTruth"
+model = ""  # Optional: specific model path (empty = auto-detect)

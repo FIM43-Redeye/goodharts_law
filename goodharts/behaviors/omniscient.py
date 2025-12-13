@@ -8,7 +8,7 @@ Uses one-hot encoded channels where:
 - Channel 3: is_poison
 """
 import numpy as np
-from .base import BehaviorStrategy
+from goodharts.behaviors.base import BehaviorStrategy
 
 
 # 8-directional random walk moves (cardinals + diagonals)

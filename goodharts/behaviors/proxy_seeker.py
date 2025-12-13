@@ -6,7 +6,7 @@ so this agent cannot distinguish food (interestingness=1.0) from
 poison (interestingness=0.9). This is the Goodhart's Law trap.
 """
 import numpy as np
-from .base import BehaviorStrategy
+from goodharts.behaviors.base import BehaviorStrategy
 
 
 # 8-directional random walk moves (cardinals + diagonals)
