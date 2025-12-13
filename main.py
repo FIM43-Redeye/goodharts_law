@@ -3,9 +3,11 @@ import matplotlib.animation as animation
 from matplotlib import colors
 from simulation import Simulation
 from configs.default_config import get_config
+from utils.logging_config import setup_logging
 import numpy as np
 
 # 1. Setup Simulation
+setup_logging()
 config = get_config()
 sim = Simulation(config)
 

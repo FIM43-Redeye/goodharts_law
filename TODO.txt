@@ -37,9 +37,9 @@ but the "a-ha" moment should be watching agents *discover* deceptive strategies 
 - Hierarchical agents (managers who set proxies, workers who optimize)
 
 ## Technical Debt
-- [ ] Add proper logging
-- [ ] Add pytest test suite  
-- [ ] Type hints everywhere
-- [ ] Performance profiling (numpy vectorization?)
+- [x] Add proper logging
+- [x] Add pytest test suite  
+- [x] Type hints everywhere
+- [x] Performance profiling (numpy vectorization?)
 - [ ] Reimplement entire simulation on GPU (JAX/Warp) for massive scaling
 

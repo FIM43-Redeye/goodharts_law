@@ -1,22 +1,25 @@
 import numpy as np
 from environments.world import World
 from behaviors import BehaviorStrategy
+from utils.logging_config import get_logger
 
+logger = get_logger("agent")
 
 class Organism:
-    def __init__(self, x: int, y: int, energy: float, sight_radius: int, world_ref: World, behavior: BehaviorStrategy, config: dict):
-        self.x = x
-        self.y = y
-        self.world = world_ref
-        self.energy = energy
-        self.alive = True
-        self.sight_radius = sight_radius
-        self.behavior = behavior
-        self.config = config
+    def __init__(self, x: int, y: int, energy: float, sight_radius: int, world_ref: 'World', behavior: 'BehaviorStrategy', config: dict):
+        self.x: int = x
+        self.y: int = y
+        self.world: 'World' = world_ref
+        self.energy: float = energy
+        self.alive: bool = True
+        self.sight_radius: int = sight_radius
+        self.behavior: 'BehaviorStrategy' = behavior
+        self.config: dict = config
+
         
-        self.id = id(self)
-        self.death_reason = None
-        self.suspicion_score = 0
+        self.id: int = id(self)
+        self.death_reason: str | None = None
+        self.suspicion_score: int = 0
         
         self.check_compatibility()
 
@@ -73,6 +76,7 @@ class Organism:
                  self.death_reason = "Poison"
             else:
                  self.death_reason = "Starvation"
+            logger.debug(f"Agent {self.id} died: {self.death_reason}")
 
     def get_local_view(self) -> np.ndarray:
         # Determine what view to fetch based on behavior requirements
