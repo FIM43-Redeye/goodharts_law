@@ -15,6 +15,7 @@ class CellTypeInfo:
     """
     value: int
     name: str
+    color: tuple[int, int, int] = (128, 128, 128)  # RGB visualization color
     # Observable properties (can be exposed to agents)
     interestingness: float = 0.0
     energy_reward: float = 0.0
@@ -37,14 +38,19 @@ class CellTypeInfo:
     def __int__(self):
         return self.value
     
+    @property
+    def channel_index(self) -> int:
+        """Channel index for observation tensors. Equals value for now."""
+        return self.value
+    
     def get_property(self, prop_name: str) -> float:
         """Get a property value by name."""
         return getattr(self, prop_name, 0.0)
     
     @classmethod
     def property_names(cls) -> list[str]:
-        """Get all numeric property names (excludes value and name)."""
-        return [f.name for f in fields(cls) if f.name not in ('value', 'name')]
+        """Get all numeric property names (excludes value, name, color)."""
+        return [f.name for f in fields(cls) if f.name not in ('value', 'name', 'color')]
 
 
 class CellType:
@@ -52,14 +58,16 @@ class CellType:
     Registry of all cell types with their intrinsic properties.
     
     To add new cell types:
-    1. Add a class attribute like: NEW_TYPE = CellTypeInfo(4, "NewType", ...)
-    2. Add it to _BY_VALUE in by_value()
-    3. Update all_types() if needed
+    1. Add a class attribute like: NEW_TYPE = CellTypeInfo(N, "NewType", ...)
+    2. That's it! all_types() auto-discovers via introspection.
     """
-    EMPTY = CellTypeInfo(0, "Empty")
-    WALL = CellTypeInfo(1, "Wall")
-    FOOD = CellTypeInfo(2, "Food", interestingness=1.0, energy_reward=15.0)
-    POISON = CellTypeInfo(3, "Poison", interestingness=0.9, energy_penalty=50.0)
+    EMPTY = CellTypeInfo(0, "Empty", color=(26, 26, 46))
+    WALL = CellTypeInfo(1, "Wall", color=(74, 74, 74))
+    FOOD = CellTypeInfo(2, "Food", color=(22, 199, 154), interestingness=1.0, energy_reward=15.0)
+    POISON = CellTypeInfo(3, "Poison", color=(255, 107, 107), interestingness=0.9, energy_penalty=50.0)
+    # Agent types (visible in observations)
+    PREY = CellTypeInfo(4, "Prey", color=(0, 255, 255), interestingness=0.3)
+    PREDATOR = CellTypeInfo(5, "Predator", color=(255, 0, 0), interestingness=1.0, energy_reward=25.0)  
     
     _BY_VALUE: dict[int, CellTypeInfo] | None = None
     _ALL_TYPES: list[CellTypeInfo] | None = None
@@ -73,9 +81,20 @@ class CellType:
     
     @classmethod
     def all_types(cls) -> list[CellTypeInfo]:
-        """Get all registered cell types in value order."""
+        """
+        Get all registered cell types in value order.
+        
+        Auto-discovers all CellTypeInfo class attributes via introspection.
+        """
         if cls._ALL_TYPES is None:
-            cls._ALL_TYPES = [cls.EMPTY, cls.WALL, cls.FOOD, cls.POISON]
+            types = []
+            for name in dir(cls):
+                if name.startswith('_'):
+                    continue
+                attr = getattr(cls, name)
+                if isinstance(attr, CellTypeInfo):
+                    types.append(attr)
+            cls._ALL_TYPES = sorted(types, key=lambda t: t.value)
         return cls._ALL_TYPES
     
     @classmethod

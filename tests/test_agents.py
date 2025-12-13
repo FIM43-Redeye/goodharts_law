@@ -51,3 +51,47 @@ def test_organism_starvation(world, config):
     agent.update() # Move costs energy
     assert not agent.alive
     assert agent.death_reason == "Starvation"
+
+
+class TestObservationChannels:
+    """Tests for observation channel consistency."""
+    
+    def test_ground_truth_channel_count(self, world, config):
+        """Ground truth view should have one channel per CellType."""
+        from goodharts.configs.observation_spec import ObservationSpec
+        
+        agent = Organism(5, 5, 100, 5, world, MockBehavior(), config)
+        
+        view = agent.get_local_view(mode='ground_truth')
+        spec = ObservationSpec.for_mode('ground_truth', config)
+        
+        assert view.shape[0] == spec.num_channels, \
+            f"ground_truth view has {view.shape[0]} channels but spec says {spec.num_channels}"
+        assert view.shape[0] == len(config['CellType'].all_types()), \
+            f"ground_truth should have one channel per CellType"
+    
+    def test_proxy_channel_count_matches_ground_truth(self, world, config):
+        """Proxy view must have same channel count as ground truth for architecture compat."""
+        agent = Organism(5, 5, 100, 5, world, MockBehavior(), config)
+        
+        gt_view = agent.get_local_view(mode='ground_truth')
+        proxy_view = agent.get_local_view(mode='proxy')
+        
+        assert proxy_view.shape == gt_view.shape, \
+            f"proxy view {proxy_view.shape} must match ground_truth {gt_view.shape}"
+    
+    def test_observation_spec_matches_actual_view(self, world, config):
+        """ObservationSpec channel count should match actual get_local_view output."""
+        from goodharts.configs.observation_spec import ObservationSpec
+        
+        agent = Organism(5, 5, 100, 5, world, MockBehavior(), config)
+        
+        for mode in ['ground_truth', 'proxy', 'proxy_ill_adjusted']:
+            spec = ObservationSpec.for_mode(mode, config)
+            # proxy_ill_adjusted uses proxy observation
+            actual_mode = 'proxy' if 'proxy' in mode else mode
+            view = agent.get_local_view(mode=actual_mode)
+            
+            assert view.shape[0] == spec.num_channels, \
+                f"{mode}: view has {view.shape[0]} channels but spec says {spec.num_channels}"
+

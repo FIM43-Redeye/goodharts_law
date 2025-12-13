@@ -59,6 +59,8 @@ but the "a-ha" moment should be watching agents *discover* deceptive strategies 
 - [x] Add pytest test suite  
 - [x] Type hints everywhere
 - [x] Performance profiling (numpy vectorization?)
+- [ ] Add validation episodes to RL training (periodic eval without exploration)
+- [ ] Make dropout/weight_decay configurable in TOML (avoid magic numbers)
 
 ## Moonshot (do not touch for now!)
 - [ ] Reimplement entire simulation on GPU (JAX/Warp) for massive parallelization

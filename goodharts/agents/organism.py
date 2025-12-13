@@ -113,9 +113,10 @@ class Organism:
         self.x, self.y = self.world.wrap_position(self.x + dx, self.y + dy)
         
         # Nonlinear energy cost (applied for attempted distance)
-        exponent = self.config.get('MOVE_COST_EXPONENT', 1.0)
-        base_cost = self.config['ENERGY_MOVE_COST']
-        self.energy -= (distance ** exponent) * base_cost
+        if not self.config.get('FREEZE_ENERGY', False):
+            exponent = self.config.get('MOVE_COST_EXPONENT', 1.0)
+            base_cost = self.config['ENERGY_MOVE_COST']
+            self.energy -= (distance ** exponent) * base_cost
 
     def eat(self):
         """Consume whatever is at current position and trigger respawning."""
@@ -129,8 +130,10 @@ class Organism:
             if proxy_signal > 0.5 and cell_info.energy_penalty > 0:
                 self.suspicion_score += 1
             
-            self.energy += cell_info.energy_reward
-            self.energy -= cell_info.energy_penalty
+            # Apply energy changes (unless frozen)
+            if not self.config.get('FREEZE_ENERGY', False):
+                self.energy += cell_info.energy_reward
+                self.energy -= cell_info.energy_penalty
             
             # DEBUG: Confirm eating
             # print(f"DEBUG EAT: Found {cell_info.name} (Val={cell_value}) Reward={cell_info.energy_reward}", flush=True)
@@ -171,6 +174,7 @@ class Organism:
         - 'cell_empty': 1.0 where cell is empty, 0 elsewhere
         - 'cell_wall': 1.0 where cell is wall, etc.
         
+        Center cell is blanked so agent can't "see itself".
         Extensible: automatically handles any number of cell types.
         """
         CellType = self.config['CellType']
@@ -179,6 +183,11 @@ class Organism:
         for cell_info in CellType.all_types():
             channel_name = f"cell_{cell_info.name.lower()}"
             channels[channel_name] = (grid_view == cell_info.value).astype(np.float32)
+        
+        # Blank center cell - agent can't see itself
+        center = self.sight_radius
+        for channel in channels.values():
+            channel[center, center] = 0.0
         
         return channels
 
@@ -256,34 +265,44 @@ class Organism:
         """
         Get appropriately formatted view for the current behavior mode.
         
-        For ground truth mode: stacks one-hot cell type channels (4 channels)
-        For proxy mode: stacks interestingness channel repeated 4 times
-            (same architecture, but can't distinguish food from poison)
+        Uses ObservationSpec to determine which channels to include,
+        making this method extensible without hardcoding mode logic.
         
-        This implements Option C: proxy as "corrupted" ground truth.
+        Args:
+            mode: Observation mode (e.g., 'ground_truth', 'proxy').
+                  If None, derived from behavior.requirements.
+                  
+        Returns:
+            Stacked observation array of shape (num_channels, H, W)
         """
+        from goodharts.configs.observation_spec import ObservationSpec, get_mode_for_requirement
+        
         obs = self.get_observation()
-        CellType = self.config['CellType']
         
         # Determine mode from behavior if not specified
         if mode is None:
+            # Use first requirement to determine mode
             reqs = self.behavior.requirements
-            mode = 'proxy' if 'proxy_metric' in reqs else 'ground_truth'
+            req = reqs[0] if reqs else 'ground_truth'
+            mode = get_mode_for_requirement(req, self.config)
         
-        if mode == 'ground_truth':
-            # Stack one-hot channels: agent sees exactly what each cell is
-            # Channels: [is_empty, is_wall, is_food, is_poison]
-            channel_names = [f"cell_{ct.name.lower()}" for ct in CellType.all_types()]
-            return obs.get_stacked_grids(channel_names)
-        else:
-            # Proxy mode: can see empty and wall clearly, but food/poison
-            # are abstracted to just "interestingness" - can't tell them apart
-            # Channels: [is_empty, is_wall, interestingness, interestingness]
-            empty = obs.grids['cell_empty']
-            wall = obs.grids['cell_wall']
-            interestingness = obs.grids['interestingness']
-            # Stack: empty, wall, then interestingness twice (maintains 4 channels)
-            return np.stack([empty, wall, interestingness, interestingness], axis=0)
+        # Get channel names from the spec
+        spec = ObservationSpec.for_mode(mode, self.config)
+        channel_names = spec.channel_names
+        
+        # Build observation by stacking requested channels
+        channels = []
+        for name in channel_names:
+            if name in obs.grids:
+                channels.append(obs.grids[name])
+            else:
+                # Unknown channel - log warning and use zeros
+                import warnings
+                warnings.warn(f"Unknown channel '{name}' for mode '{mode}', using zeros")
+                example = next(iter(obs.grids.values()))
+                channels.append(np.zeros_like(example))
+        
+        return np.stack(channels, axis=0)
 
     def update(self):
         """One simulation step: observe, decide, act."""

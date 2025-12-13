@@ -16,6 +16,7 @@ from typing import Callable
 
 from goodharts.behaviors.brains.tiny_cnn import TinyCNN
 from goodharts.behaviors import LearnedBehavior
+from goodharts.utils.device import get_device
 
 
 def compute_gradient_saliency(
@@ -308,7 +309,7 @@ def load_model_from_path(model_path: str, device: torch.device = None) -> tuple[
         (model, metadata) where metadata contains inferred architecture info
     """
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_device(verbose=False)
     
     state_dict = torch.load(model_path, map_location=device, weights_only=True)
     
@@ -400,7 +401,7 @@ def analyze_model_attention(
     if config is None:
         config = get_config()
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     
     # Load model with auto-detected architecture
     model, metadata = load_model_from_path(model_path, device)

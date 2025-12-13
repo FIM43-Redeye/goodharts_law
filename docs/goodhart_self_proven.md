@@ -44,7 +44,7 @@ But the fundamental misalignment remained: we were teaching imitation, not survi
 
 ## The Pivot
 
-The solution? **True Reinforcement Learning.**
+The solution was **true reinforcement learning.**
 
 - No expert to copy → no expert biases to inherit
 - Reward = actual survival outcomes (energy delta)
@@ -53,15 +53,11 @@ The solution? **True Reinforcement Learning.**
 
 ## Meta-Commentary
 
-This experience IS the Anthropic Fellows project deliverable.
+This experience is my crowning code sample for the Anthropic Fellows Program.
 
-We didn't just build a simulation of Goodhart's Law.
-We lived it.
-We demonstrated that even well-intentioned developers fall into proxy traps.
-And then we recognized it and pivoted.
+Real-world demonstrations of phenomena like Goodhart's Law are often either intentional or so trivial as to be undetectable. The fact that we actually *fell into the same trap while developing actual code* is the best demonstration I can think of for the importance of this work.
 
-That recognition — "wait, we're doing the thing we're studying" — is exactly
-the kind of insight that AI safety work aims to surface.
+That recognition — "wait, we're doing the thing we're studying" — is exactly the kind of insight that AI safety work aims to surface.
 
 ---
 

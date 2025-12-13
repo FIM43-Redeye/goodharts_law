@@ -70,4 +70,33 @@ steps = 0     # 0 = run forever, >0 = stop after N steps
 [brain_view]
 enabled = false
 agent_type = "LearnedGroundTruth"
-model = ""  # Optional: specific model path (empty = auto-detect)
+model = ""           # Optional: specific model path (empty = auto-detect)
+freeze_energy = true # If true, agent energy stays constant (for visualization)
+
+# =============================================================================
+# RUNTIME
+# =============================================================================
+[runtime]
+# device = "cuda"      # Force specific device: "cpu", "cuda", "cuda:0", etc.
+#                      # Leave commented for auto-detection (CUDA > CPU)
+#                      # Can also use GOODHARTS_DEVICE env var
+
+# =============================================================================
+# TRAINING (for train_ppo.py and other training scripts)
+# =============================================================================
+[training]
+# Curriculum learning - gradually make environment harder
+initial_food = 2500         # Start with lots of food (easy)
+final_food = 50             # End with sparse food (hard)
+curriculum_fraction = 0.9   # Fraction of episodes for curriculum
+
+# Environment
+poison_count = 30           # Fixed poison count during training
+steps_per_episode = 500     # Max steps per episode
+
+# PPO hyperparameters
+learning_rate = 0.0003      # 3e-4
+gamma = 0.99                # Discount factor
+eps_clip = 0.2              # PPO clipping parameter
+k_epochs = 4                # PPO epochs per update
+update_timestep = 2000      # Steps between PPO updates

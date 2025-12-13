@@ -21,6 +21,7 @@ from goodharts.training.dataset import ReplayBuffer, SimulationDataset
 from goodharts.training.collect import collect_from_expert, collect_experiences
 from goodharts.configs.default_config import get_config
 from goodharts.utils.logging_config import setup_logging, get_logger
+from goodharts.utils.device import get_device
 
 logger = get_logger("training")
 
@@ -56,7 +57,7 @@ def train_behavior_cloning(
         Trained TinyCNN model
     """
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_device()
     
     logger.info(f"Training on device: {device}")
     logger.info(f"Mode: {mode}, Epochs: {epochs}, Batch size: {batch_size}")
