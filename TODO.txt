@@ -4,17 +4,28 @@
 We want EMERGENCE, not just optimization failure. The current demo shows proxies fail,
 but the "a-ha" moment should be watching agents *discover* deceptive strategies themselves.
 
-## Phase 1: Better Measurement & Visualization
+## Phase 1: Better Measurement & Visualization ✅
 - [x] Track WHY agents die (starvation vs poison) - add death stats
 - [x] Per-agent energy over time charts  
 - [x] Heatmaps showing where agents spend time vs where food/poison is
 - [x] "Suspicion" metric - how often does an agent choose high-proxy cells that are poison?
 
-## Phase 2: Learned Behaviors (CNN/RL)
-- [ ] Replace hardcoded behaviors with small CNNs that process the local view
-- [ ] Train with reward = energy gained (true reward) vs proxy signal (Goodhart trap)
-- [ ] Compare learned policies: ground-truth-trained vs proxy-trained agents
-- [ ] Visualize what the CNN "sees" - attention/saliency maps
+## Phase 2: Learned Behaviors (CNN/RL) 🚧
+- [x] Replace hardcoded behaviors with small CNNs that process the local view
+- [x] LearnedBehavior with dual-mode (ground_truth/proxy) and flexible action space
+- [x] Replay buffer and data collection infrastructure
+- [x] Reward-weighted behavior cloning training loop
+- [x] Saliency visualization (gradient, guided backprop, integrated gradients)
+- [ ] **Run full comparison**: ground-truth-trained vs proxy-trained agents
+- [ ] Statistical validation that proxy-trained agents die more from poison
+
+### Architecture Decisions (In Progress)
+- **Action Space**: Currently discrete (48 actions for max_move_distance=3). Consider:
+  - Keep discrete with max_move_distance=1 (just 8 directions) - simplest
+  - Add continuous mode (2 outputs: dx, dy) for generalization
+  - Make action_mode a config option
+- **Multi-channel Input**: CNN supports arbitrary input_channels - need to make observation
+  generation flexible to stack multiple grids (proxy, density, etc.)
 
 ## Phase 3: Emergent Deception (the cool stuff!)
 - [ ] Multi-agent dynamics: can agents learn to "signal" to others?
@@ -22,6 +33,13 @@ but the "a-ha" moment should be watching agents *discover* deceptive strategies 
 - [ ] Proxy gaming: can agents learn to CREATE high-proxy cells? (gaming the metric)
 - [ ] "Inspector" agents that try to distinguish food from poison
 - [ ] Adversarial co-evolution: proxy-gamers vs inspectors
+
+### New Ideas for Phase 3
+- [ ] **Temporal state**: Feed step count / episode progress to agents (auxiliary MLP head)
+- [ ] **Population awareness**: Tell agents how many others exist - see what emerges
+- [ ] **Noisy vision**: Gaussian noise at view edges, decreasing toward center (uncertainty)
+- [ ] **Recurrent agents**: LSTM/GRU for memory across steps (behavior that evolves over time)
+- [ ] **Auxiliary scalar inputs**: Arbitrary non-grid variables (hunger level, age, etc.)
 
 ## Phase 4: Publication-Ready
 - [ ] Proper README with Goodhart's Law explanation and AI safety connection
@@ -42,4 +60,5 @@ but the "a-ha" moment should be watching agents *discover* deceptive strategies 
 - [x] Type hints everywhere
 - [x] Performance profiling (numpy vectorization?)
 - [ ] Reimplement entire simulation on GPU (JAX/Warp) for massive scaling
+      🚫 MOONSHOT - DO NOT TOUCH UNTIL PROJECT SHINES LIKE A JEWEL
 

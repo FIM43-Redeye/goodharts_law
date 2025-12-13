@@ -19,7 +19,7 @@ def test_shapes():
         try:
             output = model(x)
             print(f"  Output shape: {output.shape}")
-            assert output.shape == (1, 4)
+            assert output.shape == (1, 8), f"Expected (1, 8), got {output.shape}"
             print("  Success!")
         except Exception as e:
             print(f"  Failed! {e}")

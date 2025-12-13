@@ -1,97 +1,176 @@
+"""
+Neural network architectures for learned behaviors.
+
+TinyCNN is a flexible architecture that supports:
+- Arbitrary input shapes and channel counts
+- Optional auxiliary scalar inputs (energy, step count, etc.)
+- Both discrete and continuous action outputs
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+
 class TinyCNN(nn.Module):
     """
-    A small Convolutional Neural Network (CNN) for the agent's brain.
+    A small Convolutional Neural Network for agent decision-making.
     
-    This class inherits from torch.nn.Module, which is the base class for all
-    neural network modules in PyTorch.
+    Takes a local view of the world (like an image) and outputs
+    either discrete action logits or continuous action values.
     
-    The goal is to take a 2D local view of the world (like an image) and output
-    an action (move direction).
+    Supports optional auxiliary scalar inputs that get concatenated
+    after the CNN feature extraction.
     """
-    def __init__(self, input_shape: tuple[int, int], input_channels: int = 1, output_size: int = 4):
+    
+    def __init__(
+        self, 
+        input_shape: tuple[int, int], 
+        input_channels: int = 1, 
+        output_size: int = 8,
+        num_aux_inputs: int = 0,
+        action_mode: str = 'discrete',
+        hidden_size: int = 32,
+    ):
         """
         Args:
-            input_shape (tuple): (height, width) of the input view.
-            input_channels (int): Number of channels (1 for grayscale/grid values).
-            output_size (int): Number of possible actions.
+            input_shape: (height, width) of the input view
+            input_channels: Number of grid channels (e.g., 2 for proxy + ground_truth)
+            output_size: Number of discrete actions (ignored if action_mode='continuous')
+            num_aux_inputs: Number of scalar auxiliary inputs (energy, etc.)
+            action_mode: 'discrete' for classification, 'continuous' for dx/dy regression
+            hidden_size: Size of hidden fully-connected layer
         """
         super(TinyCNN, self).__init__()
         
         self.input_shape = input_shape
+        self.input_channels = input_channels
         self.output_size = output_size
+        self.num_aux_inputs = num_aux_inputs
+        self.action_mode = action_mode
+        self.hidden_size = hidden_size
         
-        # ---------------------------------------------------------------------
-        # EDUCATIONAL NOTE: Convolutional Layers (Conv2d)
-        # 
-        # Conv2d layers slide small "filters" (kernels) over the input to detect features.
-        # - in_channels: Number of input signal planes (1 for a simple grid).
-        # - out_channels: Number of features to detect (e.g., 8).
-        # - kernel_size: Size of the sliding window (3x3 is common).
-        # ---------------------------------------------------------------------
-        self.conv1 = nn.Conv2d(in_channels=input_channels, out_channels=8, kernel_size=3, padding=1)
+        # Convolutional layers
+        # Using padding=1 with kernel_size=3 preserves spatial dimensions
+        self.conv1 = nn.Conv2d(in_channels=input_channels, out_channels=16, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1)
         
-        # ---------------------------------------------------------------------
-        # EDUCATIONAL NOTE: Calculating Flattened Size
-        # 
-        # After convolutions, we have a 3D tensor (Channels, Height, Width).
-        # To feed this into a linear (fully connected) layer, we must "flatten" it
-        # into a 1D vector. We need to calculate how many numbers that is.
-        # 
-        # Since we used padding=1 and kernel_size=3 with stride=1, the spatial 
-        # dimensions (H, W) remain the same after conv1.
-        # ---------------------------------------------------------------------
-        flattened_size = 8 * input_shape[0] * input_shape[1]
+        # Calculate flattened size after convolutions
+        # With padding=1, kernel=3, stride=1: output_size = input_size
+        conv_output_size = 32 * input_shape[0] * input_shape[1]
         
-        # ---------------------------------------------------------------------
-        # EDUCATIONAL NOTE: Linear Layers (Fully Connected)
-        # 
-        # Linear layers connect every input to every output. They are the "decision making"
-        # part of the network, combining the features detected by the conv layers.
-        # ---------------------------------------------------------------------
-        self.fc1 = nn.Linear(in_features=flattened_size, out_features=32)
-        self.fc2 = nn.Linear(in_features=32, out_features=output_size)
+        # Fully connected layers
+        # Input: CNN features + auxiliary scalars
+        fc_input_size = conv_output_size + num_aux_inputs
+        self.fc1 = nn.Linear(fc_input_size, hidden_size)
+        
+        # Output layer depends on action mode
+        if action_mode == 'discrete':
+            self.fc_out = nn.Linear(hidden_size, output_size)
+        elif action_mode == 'continuous':
+            # Output (dx, dy) as two continuous values
+            self.fc_out = nn.Linear(hidden_size, 2)
+        else:
+            raise ValueError(f"Unknown action_mode: {action_mode}")
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor, aux: torch.Tensor | None = None) -> torch.Tensor:
         """
-        Defines the forward pass of the network.
+        Forward pass.
         
         Args:
-            x (torch.Tensor): Input tensor representing the local view.
-                              Shape: (batch_size, channels, height, width)
-                              
+            x: Grid input of shape (batch, channels, height, width)
+            aux: Optional auxiliary scalars of shape (batch, num_aux_inputs)
+            
         Returns:
-            torch.Tensor: Output tensor representing action scores/logits.
-                          Shape: (batch_size, output_size)
+            For discrete mode: logits of shape (batch, output_size)
+            For continuous mode: (dx, dy) of shape (batch, 2), values in [-1, 1]
         """
+        # Convolutional feature extraction
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
         
-        # ---------------------------------------------------------------------
-        # EDUCATIONAL NOTE: Activation Functions (ReLU)
-        # 
-        # ReLU (Rectified Linear Unit) introduces non-linearity.
-        # It simply turns negative numbers into 0. This is crucial for the network
-        # to learn complex patterns, not just linear combinations.
-        # ---------------------------------------------------------------------
+        # Flatten
+        x = x.view(x.size(0), -1)
         
-        # 1. Convolution + Activation
-        x = self.conv1(x)
-        x = F.relu(x)
+        # Concatenate auxiliary inputs if provided
+        if aux is not None:
+            if aux.dim() == 1:
+                aux = aux.unsqueeze(0)  # Add batch dim if missing
+            x = torch.cat([x, aux], dim=1)
+        elif self.num_aux_inputs > 0:
+            # Pad with zeros if aux expected but not provided
+            zeros = torch.zeros(x.size(0), self.num_aux_inputs, device=x.device)
+            x = torch.cat([x, zeros], dim=1)
         
-        # 2. Flatten
-        # x.size(0) is the batch size. We flatten dimensions 1 onwards.
-        x = x.view(x.size(0), -1) 
+        # Dense layers
+        x = F.relu(self.fc1(x))
+        x = self.fc_out(x)
         
-        # 3. Dense Layers + Activation
-        x = self.fc1(x)
-        x = F.relu(x)
-        
-        # 4. Output Layer
-        # No activation here usually! We want raw scores (logits).
-        x = self.fc2(x)
+        # For continuous mode, use tanh to bound output to [-1, 1]
+        if self.action_mode == 'continuous':
+            x = torch.tanh(x)
         
         return x
+    
+    def get_action(self, x: torch.Tensor, aux: torch.Tensor | None = None, 
+                   max_move_distance: int = 1) -> tuple[int, int]:
+        """
+        Convenience method to get (dx, dy) action from network output.
+        
+        Args:
+            x: Grid input
+            aux: Optional auxiliary scalars
+            max_move_distance: Scale factor for continuous mode
+            
+        Returns:
+            (dx, dy) movement tuple
+        """
+        with torch.no_grad():
+            output = self(x, aux)
+            
+            if self.action_mode == 'discrete':
+                action_idx = torch.argmax(output, dim=1).item()
+                # Map index to (dx, dy) - this should match LearnedBehavior's action space
+                return self._index_to_action(action_idx)
+            else:
+                # Continuous: scale tanh output by max_move_distance
+                dx = output[0, 0].item() * max_move_distance
+                dy = output[0, 1].item() * max_move_distance
+                return (int(round(dx)), int(round(dy)))
+    
+    def _index_to_action(self, idx: int) -> tuple[int, int]:
+        """Map action index to (dx, dy) for 8-directional movement."""
+        # Standard mapping for max_move_distance=1
+        actions = [
+            (0, -1),   # 0: Up
+            (0, 1),    # 1: Down
+            (-1, 0),   # 2: Left
+            (1, 0),    # 3: Right
+            (-1, -1),  # 4: Up-Left
+            (1, -1),   # 5: Up-Right
+            (-1, 1),   # 6: Down-Left
+            (1, 1),    # 7: Down-Right
+        ]
+        if 0 <= idx < len(actions):
+            return actions[idx]
+        return (0, 0)
 
+
+class TinyCNNWithMemory(nn.Module):
+    """
+    CNN with LSTM for temporal memory.
+    
+    STUB for Phase 3 - allows agents to develop behavior 
+    that evolves over time.
+    """
+    
+    def __init__(
+        self,
+        input_shape: tuple[int, int],
+        input_channels: int = 1,
+        output_size: int = 8,
+        hidden_size: int = 32,
+        memory_size: int = 16,
+    ):
+        super().__init__()
+        raise NotImplementedError("TinyCNNWithMemory is a Phase 3 stub")

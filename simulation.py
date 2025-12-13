@@ -1,13 +1,15 @@
 from environments import create_world
 from agents import Organism
-from behaviors import OmniscientSeeker, ProxySeeker
+from behaviors import OmniscientSeeker, ProxySeeker, LearnedGroundTruth, LearnedProxy
 from utils.logging_config import get_logger
 import numpy as np
 
 # Mapping string names to classes
 BEHAVIORS = {
     'OmniscientSeeker': OmniscientSeeker,
-    'ProxySeeker': ProxySeeker
+    'ProxySeeker': ProxySeeker,
+    'LearnedGroundTruth': LearnedGroundTruth,
+    'LearnedProxy': LearnedProxy,
 }
 
 logger = get_logger("simulation")

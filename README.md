@@ -173,10 +173,27 @@ The simulation tracks:
 - [x] Activity heatmaps
 - [x] "Suspicion" metric
 
-### 🚧 Phase 2: Learned Behaviors (CNN/RL)
-- [ ] Replace hardcoded behaviors with CNNs
-- [ ] Compare ground-truth-trained vs proxy-trained policies
-- [ ] Attention/saliency visualization
+### ✅ Phase 2: Learned Behaviors (CNN)
+- [x] **TinyCNN architecture** — 4-channel input (one-hot cells), 8-action output
+- [x] **Training pipeline** — behavior cloning from expert demonstrations
+- [x] **One-hot observation encoding** — ground-truth vs proxy modes
+- [x] **Centralized action space** — `behaviors/action_space.py`
+- [x] **Temperature-based sampling** — natural exploration when uncertain
+- [x] **Visibility-weighted training** — 10× weight for samples with visible targets
+- [x] **Resource respawning** — simulation runs indefinitely
+- [x] **CLI verification tools** — `training/verify_models.py`
+
+Train and run learned agents:
+```bash
+# Train both models (takes ~2-3 min with GPU)
+python training/train.py --mode both --epochs 100
+
+# Verify model fitness (headless)
+python training/verify_models.py
+
+# Run visual demo with trained CNNs
+python main.py --learned
+```
 
 ### 🔮 Phase 3: Emergent Deception
 - [ ] Multi-agent signaling dynamics
