@@ -5,9 +5,9 @@ Organisms navigate the world, consume resources, and can be controlled
 by various behavior strategies (hardcoded or learned).
 """
 import numpy as np
-from environments.world import World
-from behaviors import BehaviorStrategy
-from utils.logging_config import get_logger
+from ..environments.world import World
+from ..behaviors import BehaviorStrategy
+from ..utils.logging_config import get_logger
 from dataclasses import dataclass
 
 logger = get_logger("agent")
@@ -131,16 +131,23 @@ class Organism:
             self.energy += cell_info.energy_reward
             self.energy -= cell_info.energy_penalty
             
+            # DEBUG: Confirm eating
+            # print(f"DEBUG EAT: Found {cell_info.name} (Val={cell_value}) Reward={cell_info.energy_reward}", flush=True)
+            
             # Clear consumed cell
             self.world.grid[self.y, self.x] = CellType.EMPTY
             self.world.proxy_grid[self.y, self.x] = 0.0
             
             # Respawn consumed resource elsewhere (keeps simulation running indefinitely)
+            # Respawn consumed resource elsewhere
             if self.config.get('RESPAWN_RESOURCES', True):
                 if cell_info.energy_reward > 0:
-                    self.world.place_food(1)  # Was food, spawn new food
+                    self.world.place_food(1)
                 elif cell_info.energy_penalty > 0:
-                    self.world.place_poison(1)  # Was poison, spawn new poison
+                    self.world.place_poison(1)
+            
+            
+            return (cell_info.name.upper(), cell_info.energy_reward if cell_info.energy_reward > 0 else cell_info.energy_penalty)
         
         # Check for death
         if self.energy <= 0:
@@ -286,15 +293,18 @@ class Organism:
         
         if mode == 'ground_truth':
             # Stack one-hot channels: agent sees exactly what each cell is
+            # Channels: [is_empty, is_wall, is_food, is_poison]
             channel_names = [f"cell_{ct.name.lower()}" for ct in CellType.all_types()]
             return obs.get_stacked_grids(channel_names)
         else:
-            # Proxy mode: use interestingness instead of one-hot
-            # Replicate to same shape as ground truth for architecture compatibility
+            # Proxy mode: can see empty and wall clearly, but food/poison
+            # are abstracted to just "interestingness" - can't tell them apart
+            # Channels: [is_empty, is_wall, interestingness, interestingness]
+            empty = obs.grids['cell_empty']
+            wall = obs.grids['cell_wall']
             interestingness = obs.grids['interestingness']
-            num_types = CellType.num_types()
-            # Stack the same interestingness channel N times (loses type info)
-            return np.stack([interestingness] * num_types, axis=0)
+            # Stack: empty, wall, then interestingness twice (maintains 4 channels)
+            return np.stack([empty, wall, interestingness, interestingness], axis=0)
 
     def update(self):
         """One simulation step: observe, decide, act."""

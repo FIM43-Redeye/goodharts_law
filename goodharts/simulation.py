@@ -1,7 +1,7 @@
-from environments import create_world
-from agents import Organism
-from behaviors import OmniscientSeeker, ProxySeeker, LearnedGroundTruth, LearnedProxy
-from utils.logging_config import get_logger
+from .environments import create_world
+from .agents import Organism
+from .behaviors import OmniscientSeeker, ProxySeeker, LearnedGroundTruth, LearnedProxy
+from .utils.logging_config import get_logger
 import numpy as np
 
 # Mapping string names to classes
@@ -82,10 +82,11 @@ class Simulation:
         render_grid = self.world.grid.copy()
         for agent in self.agents:
             if 0 <= agent.x < self.world.width and 0 <= agent.y < self.world.height:
-                # 4 for Omniscient, 5 for Proxy
-                val = 4
-                if isinstance(agent.behavior, ProxySeeker):
-                    val = 5
+                # 4 for Ground-Truth agents, 5 for Proxy agents
+                # Check for both hardcoded and learned proxy behaviors
+                val = 4  # Default: Ground-Truth (cyan)
+                if isinstance(agent.behavior, (ProxySeeker, LearnedProxy)):
+                    val = 5  # Proxy (magenta)
                 render_grid[agent.y, agent.x] = val
         return render_grid
 

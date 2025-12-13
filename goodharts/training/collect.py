@@ -7,11 +7,11 @@ for subsequent training via behavior cloning or RL.
 import numpy as np
 from typing import Callable
 
-from simulation import Simulation
-from agents import Organism
-from behaviors import LearnedBehavior, OmniscientSeeker, ProxySeeker
-from behaviors.action_space import action_to_index, build_action_space
-from training.dataset import ReplayBuffer, Experience
+from ..simulation import Simulation
+from ..agents import Organism
+from ..behaviors import LearnedBehavior, OmniscientSeeker, ProxySeeker
+from ..behaviors.action_space import action_to_index, build_action_space
+from .dataset import ReplayBuffer, Experience
 
 
 def collect_experiences(

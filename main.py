@@ -15,9 +15,9 @@ import matplotlib.animation as animation
 from matplotlib import colors
 import numpy as np
 
-from simulation import Simulation
-from configs.default_config import get_config
-from utils.logging_config import setup_logging
+from goodharts.simulation import Simulation
+from goodharts.configs.default_config import get_config
+from goodharts.utils.logging_config import setup_logging
 
 
 def parse_args():
@@ -44,6 +44,7 @@ def setup_config(args):
         config['AGENTS_SETUP'] = [
             {'behavior_class': 'LearnedGroundTruth', 'count': args.agents},
             {'behavior_class': 'LearnedProxy', 'count': args.agents}
+            {'behavior_class': 'LearnedProxyIllAdjusted', 'count': args.agents}
         ]
         print("🧠 Using LEARNED agents (CNN-based)")
         print("   Ground-truth trained: cyan | Proxy trained: magenta")
@@ -78,6 +79,7 @@ def create_standard_layout(sim):
         '#ff6b6b',  # Poison - coral red
         '#00d9ff',  # Ground-truth agent - cyan
         '#ff00ff',  # Proxy agent - magenta
+        '#8A2BE2',  # Proxy Ill-Adjusted agent - blue-violet
     ])
     bounds_sim = [0, 1, 2, 3, 4, 5, 6]
     norm_sim = colors.BoundaryNorm(bounds_sim, cmap_sim.N)
@@ -92,6 +94,7 @@ def create_standard_layout(sim):
         Patch(facecolor='#ff6b6b', label='Poison'),
         Patch(facecolor='#00d9ff', label='Ground-Truth Agent'),
         Patch(facecolor='#ff00ff', label='Proxy Agent'),
+        Patch(facecolor='#8A2BE2', label='Proxy Ill-Adjusted Agent'),    
     ]
     ax_sim.legend(handles=legend_elements, loc='upper right', fontsize=8)
     
@@ -176,16 +179,32 @@ def update_frame(frame, sim, viz, args):
     alive_gt = len(gt_agents)
     alive_proxy = len(proxy_agents)
     
-    # Calculate poison deaths by type
-    poison_deaths_proxy = sum(1 for d in deaths if d['reason'] == 'Poison' 
-                              and any(a.id == d['id'] for a in proxy_agents))
-    
     viz['ax_stats'].set_title(
         f"Deaths (Step {sim.step_count}) | "
         f"Alive: GT={alive_gt}, Proxy={alive_proxy}"
     )
     
-    # Check if we should stop
+    # Check if everyone died
+    if len(sim.agents) == 0 and not getattr(viz, 'death_announced', False):
+        viz['death_announced'] = True
+        print("\n" + "="*60)
+        print("  All agents are DEAD. You'll have to check the leaderboard yourself.")
+        print("="*60)
+        print(f"\n  Final step: {sim.step_count}")
+        print(f"  Deaths by starvation: {starved}")
+        print(f"  Deaths by poison: {poisoned}")
+        print("\n  Closing in 5 seconds...")
+        print("="*60 + "\n")
+        
+        # Schedule window close after 5 seconds
+        import threading
+        def close_window():
+            import time
+            time.sleep(5)
+            plt.close(viz['fig'])
+        threading.Thread(target=close_window, daemon=True).start()
+    
+    # Check if we should stop (manual step limit)
     if args.steps and sim.step_count >= args.steps:
         print(f"\n📊 Simulation complete after {sim.step_count} steps")
         print(f"   Survivors: {len(sim.agents)} ({alive_gt} GT, {alive_proxy} Proxy)")

@@ -1,6 +1,6 @@
 # The Day We Proved Goodhart's Law (On Ourselves)
 
-> "When a measure becomes a target, it ceases to be a good measure." — Goodhart
+> "When a measure becomes a target, it ceases to be a good measure." — Goodhart (again)
 
 **Date:** 2025-12-12
 

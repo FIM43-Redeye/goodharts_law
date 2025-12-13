@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
-from environments.world import World
-from configs.default_config import get_config
+from goodharts.environments.world import World
+from goodharts.configs.default_config import get_config
 
 @pytest.fixture
 def config():

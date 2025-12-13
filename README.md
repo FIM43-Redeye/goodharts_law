@@ -21,39 +21,57 @@ Key insight: Poison has high "interestingness" (0.9) compared to food (1.0), mak
 
 ```
 goodharts_law/
-├── main.py                 # Entry point: runs animated simulation
-├── simulation.py           # Core simulation loop & statistics tracking
+├── main.py                     # Entry point: runs animated simulation
+├── pyproject.toml              # Package configuration & dependencies
+├── requirements.txt            # Python dependencies
 │
-├── agents/
-│   └── organism.py         # Agent class: movement, eating, energy, death
+├── goodharts/                  # Main package
+│   ├── simulation.py           # Core simulation loop & statistics tracking
+│   │
+│   ├── agents/
+│   │   └── organism.py         # Agent class: movement, eating, energy, death
+│   │
+│   ├── behaviors/
+│   │   ├── base.py             # BehaviorStrategy abstract base class
+│   │   ├── omniscient.py       # OmniscientSeeker: sees true cell types
+│   │   ├── proxy_seeker.py     # ProxySeeker: only sees proxy signal
+│   │   ├── learned.py          # LearnedBehavior: neural net controller
+│   │   ├── action_space.py     # Centralized action definitions
+│   │   └── brains/
+│   │       └── tiny_cnn.py     # TinyCNN model for learned behaviors
+│   │
+│   ├── environments/
+│   │   ├── base.py             # Environment abstract base class
+│   │   └── world.py            # World: grid with ground_truth + proxy_metric
+│   │
+│   ├── training/
+│   │   ├── train.py            # Behavior cloning training loop
+│   │   ├── train_rl.py         # Reinforcement learning training
+│   │   ├── train_ppo.py        # PPO algorithm implementation
+│   │   ├── collect.py          # Expert demonstration collection
+│   │   ├── dataset.py          # Dataset utilities for training
+│   │   ├── verify_models.py    # CLI model verification tool
+│   │   └── visualize_saliency.py  # Neural network interpretability
+│   │
+│   ├── configs/
+│   │   ├── default_config.py   # Hyperparameters, CellType definitions
+│   │   └── observation_spec.py # Observation encoding specifications
+│   │
+│   ├── models/                 # Trained model weights (.pth files)
+│   │
+│   └── utils/
+│       ├── logging_config.py   # Logging setup
+│       └── numba_utils.py      # Numba JIT acceleration utilities
 │
-├── behaviors/
-│   ├── base.py             # BehaviorStrategy abstract base class
-│   ├── omniscient.py       # OmniscientSeeker: sees true cell types
-│   ├── proxy_seeker.py     # ProxySeeker: only sees proxy signal
-│   ├── learned.py          # LearnedBehavior: neural net controller (WIP)
-│   └── brains/
-│       └── tiny_cnn.py     # TinyCNN model skeleton for learned behaviors
+├── tests/                      # pytest test suite
 │
-├── environments/
-│   ├── base.py             # Environment abstract base class
-│   └── world.py            # World: grid with ground_truth + proxy_metric
+├── Dockerfile.rocm             # AMD GPU (ROCm) environment
+├── Dockerfile.cuda             # NVIDIA GPU (CUDA) environment
+├── Dockerfile.cpu              # CPU-only environment
+├── compose.yaml                # Docker Compose with profiles
+├── docker_directions.txt       # Docker workflow instructions
 │
-├── training/
-│   ├── train.py            # Training loop skeleton
-│   └── dataset.py          # Dataset utilities for RL/supervised learning
-│
-├── configs/
-│   └── default_config.py   # Hyperparameters, CellType definitions
-│
-├── Dockerfile.rocm         # AMD GPU (ROCm) environment
-├── Dockerfile.cuda         # NVIDIA GPU (CUDA) environment
-├── Dockerfile.cpu          # CPU-only environment
-├── compose.yaml            # Docker Compose with profiles: rocm, cuda, cpu
-├── docker_directions.txt   # Docker workflow instructions
-│
-├── TODO.txt                # Roadmap & future enhancements
-└── requirements.txt        # Python dependencies
+├── TODO.txt                    # Roadmap & future enhancements
 ```
 
 ---
@@ -61,8 +79,8 @@ goodharts_law/
 ## Quick Start
 
 ### Prerequisites
-- Python 3.10+
-- Dependencies: `numpy`, `matplotlib`, `torch`, `torchvision`
+- Python 3.9+
+- Dependencies: `numpy`, `matplotlib`, `torch`, `torchvision`, `tqdm`, `pytest`
 
 ### Running Locally
 ```bash
@@ -185,8 +203,8 @@ The simulation tracks:
 
 Train and run learned agents:
 ```bash
-# Train both models (takes ~2-3 min with GPU)
-python training/train.py --mode both --epochs 100
+# Train all models (takes ~2-3 min with GPU)
+python training/train.py --mode all --epochs 100
 
 # Verify model fitness (headless)
 python training/verify_models.py

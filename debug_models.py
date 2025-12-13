@@ -8,12 +8,12 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 
-from configs.default_config import get_config
-from environments.world import World
-from agents.organism import Organism
-from behaviors import LearnedBehavior, LearnedGroundTruth, LearnedProxy, OmniscientSeeker
-from behaviors.brains.tiny_cnn import TinyCNN
-from behaviors.action_space import build_action_space, index_to_action, ACTION_LABELS_8
+from goodharts.configs.default_config import get_config
+from goodharts.environments.world import World
+from goodharts.agents.organism import Organism
+from goodharts.behaviors import LearnedBehavior, LearnedGroundTruth, LearnedProxy, OmniscientSeeker
+from goodharts.behaviors.brains.tiny_cnn import TinyCNN
+from goodharts.behaviors.action_space import build_action_space, index_to_action, ACTION_LABELS_8
 
 
 def load_model(path: str, input_shape=(4, 11, 11)) -> TinyCNN:
@@ -83,7 +83,7 @@ def visualize_model_behavior(model_path: str, model_name: str):
 
 def analyze_training_data():
     """Check what actions were recorded during training."""
-    from training.collect import collect_from_expert
+    from goodharts.training.collect import collect_from_expert
     
     config = get_config()
     config['GRID_WIDTH'] = 30
@@ -94,7 +94,7 @@ def analyze_training_data():
     print("="*50)
     
     # Collect a small sample from OmniscientSeeker
-    from behaviors import OmniscientSeeker
+    from goodharts.behaviors import OmniscientSeeker
     buffer = collect_from_expert(config, OmniscientSeeker, num_steps=100, num_agents=3)
     
     # Count actions

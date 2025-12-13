@@ -1,5 +1,5 @@
-from simulation import Simulation
-from configs.default_config import get_config
+from goodharts.simulation import Simulation
+from goodharts.configs.default_config import get_config
 
 try:
     print("Testing imports and instantiation...")

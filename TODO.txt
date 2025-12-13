@@ -59,6 +59,6 @@ but the "a-ha" moment should be watching agents *discover* deceptive strategies 
 - [x] Add pytest test suite  
 - [x] Type hints everywhere
 - [x] Performance profiling (numpy vectorization?)
-- [ ] Reimplement entire simulation on GPU (JAX/Warp) for massive scaling
-      🚫 MOONSHOT - DO NOT TOUCH UNTIL PROJECT SHINES LIKE A JEWEL
 
+## Moonshot (do not touch for now!)
+- [ ] Reimplement entire simulation on GPU (JAX/Warp) for massive parallelization

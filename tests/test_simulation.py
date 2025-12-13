@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
-from simulation import Simulation
-from configs.default_config import get_config
+from goodharts.simulation import Simulation
+from goodharts.configs.default_config import get_config
 
 @pytest.fixture
 def config():
