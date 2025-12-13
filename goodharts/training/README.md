@@ -7,8 +7,8 @@ This document covers the CNN training pipeline for learned agent behaviors.
 ## Quick Start
 
 ```bash
-# Train both ground-truth and proxy models
-python training/train.py --mode both --epochs 100 --collection-steps 2000
+# Train all models
+python training/train.py --mode all --epochs 100 --collection-steps 2000
 
 # Verify model fitness (headless)
 python training/verify_models.py

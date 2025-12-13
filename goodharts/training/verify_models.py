@@ -18,13 +18,13 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from ..configs.default_config import get_config
-from ..environments.world import World
-from ..agents.organism import Organism
-from ..behaviors import OmniscientSeeker, ProxySeeker, LearnedGroundTruth, LearnedProxy
-from ..behaviors.brains.tiny_cnn import TinyCNN
-from ..behaviors.action_space import ACTION_LABELS_8, index_to_action
-from ..simulation import Simulation
+from goodharts.configs.default_config import get_config
+from goodharts.environments.world import World
+from goodharts.agents.organism import Organism
+from goodharts.behaviors import OmniscientSeeker, ProxySeeker, LearnedGroundTruth, LearnedProxy
+from goodharts.behaviors.brains.tiny_cnn import TinyCNN
+from goodharts.behaviors.action_space import ACTION_LABELS_8, index_to_action
+from goodharts.simulation import Simulation
 
 
 def check_gpu():

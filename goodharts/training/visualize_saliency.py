@@ -14,8 +14,8 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Callable
 
-from ..behaviors.brains.tiny_cnn import TinyCNN
-from ..behaviors import LearnedBehavior
+from goodharts.behaviors.brains.tiny_cnn import TinyCNN
+from goodharts.behaviors import LearnedBehavior
 
 
 def compute_gradient_saliency(
@@ -300,32 +300,114 @@ def compare_models_saliency(
     return fig
 
 
+def load_model_from_path(model_path: str, device: torch.device = None) -> tuple[torch.nn.Module, dict]:
+    """
+    Load a TinyCNN model, inferring architecture from the saved weights.
+    
+    Returns:
+        (model, metadata) where metadata contains inferred architecture info
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    state_dict = torch.load(model_path, map_location=device, weights_only=True)
+    
+    # Infer architecture from weight shapes
+    # conv1.weight shape: (out_channels, in_channels, kernel_h, kernel_w)
+    conv1_shape = state_dict['conv1.weight'].shape
+    input_channels = conv1_shape[1]
+    
+    # fc1.weight shape: (hidden_size, flatten_size)
+    fc1_shape = state_dict['fc1.weight'].shape
+    hidden_size = fc1_shape[0]
+    flatten_size = fc1_shape[1]
+    
+    # fc_out.weight shape: (output_size, hidden_size)
+    fc_out_shape = state_dict['fc_out.weight'].shape
+    output_size = fc_out_shape[0]
+    
+    # Infer input spatial size from flatten_size
+    # flatten_size = 32 * H * W (after conv2 with 32 output channels)
+    spatial_size = flatten_size // 32
+    side = int(np.sqrt(spatial_size))
+    input_shape = (side, side)
+    
+    metadata = {
+        'input_channels': input_channels,
+        'input_shape': input_shape,
+        'hidden_size': hidden_size,
+        'output_size': output_size,
+    }
+    
+    print(f"📐 Inferred architecture: {input_channels}ch × {side}×{side} → hidden={hidden_size} → {output_size} actions")
+    
+    model = TinyCNN(
+        input_shape=input_shape,
+        input_channels=input_channels,
+        output_size=output_size,
+        hidden_size=hidden_size,
+    ).to(device)
+    
+    model.load_state_dict(state_dict)
+    model.eval()
+    
+    return model, metadata
+
+
+def find_default_model() -> str:
+    """Find the first available model in the models directory."""
+    models_dir = Path(__file__).parent.parent / 'models'
+    
+    # Prefer ground_truth.pth if it exists
+    preferred = models_dir / 'ground_truth.pth'
+    if preferred.exists():
+        return str(preferred)
+    
+    # Otherwise, find any .pth file
+    pth_files = list(models_dir.glob('*.pth'))
+    if pth_files:
+        return str(pth_files[0])
+    
+    raise FileNotFoundError(f"No .pth files found in {models_dir}")
+
+
 def analyze_model_attention(
-    model_path: str,
-    config: dict,
+    model_path: str | None = None,
+    config: dict | None = None,
     output_dir: str = 'visualizations',
     num_samples: int = 5,
+    show: bool = True,
 ):
     """
     Load a model and generate saliency visualizations on sample views.
     
-    Convenience function for command-line usage.
+    Args:
+        model_path: Path to model weights. If None, auto-detects from models/
+        config: Simulation config. If None, uses default config.
+        output_dir: Where to save visualization images
+        num_samples: Number of views to visualize
+        show: If True, display plots interactively
     """
-    from .collect import collect_from_expert
-    from ..behaviors import OmniscientSeeker
+    from goodharts.training.collect import collect_from_expert
+    from goodharts.behaviors import OmniscientSeeker
+    from goodharts.configs.default_config import get_config
     
-    # Determine input shape
-    view_range = config['AGENT_VIEW_RANGE']
-    view_side = view_range * 2 + 1
-    input_shape = (view_side, view_side)
+    # Auto-detect model if not specified
+    if model_path is None:
+        model_path = find_default_model()
+        print(f"🔍 Auto-detected model: {model_path}")
     
-    # Load model
+    if config is None:
+        config = get_config()
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TinyCNN(input_shape=input_shape, input_channels=1, output_size=8).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    model.eval()
     
-    # Collect sample views
+    # Load model with auto-detected architecture
+    model, metadata = load_model_from_path(model_path, device)
+    
+    # Collect sample views (mode depends on input channels)
+    mode = 'ground_truth' if metadata['input_channels'] == 4 else 'proxy_metric'
+    print(f"📊 Collecting {num_samples} sample views (mode: {mode})...")
     buffer = collect_from_expert(config, OmniscientSeeker, num_steps=100, num_agents=5)
     
     # Create output directory
@@ -333,9 +415,142 @@ def analyze_model_attention(
     model_name = Path(model_path).stem
     
     # Generate visualizations
+    print(f"🎨 Generating saliency maps...")
     for i in range(min(num_samples, len(buffer))):
-        view = buffer.buffer[i].state
+        view = buffer.buffer[i].state  # Shape: (C, H, W) or (H, W)
+        
+        # Handle multi-channel views for saliency - aggregate across channels
+        if view.ndim == 3:
+            # Sum across channels for visualization (shows overall attention)
+            view_2d = view.sum(axis=0)
+        else:
+            view_2d = view
+        
         save_path = f"{output_dir}/{model_name}_saliency_{i}.png"
-        visualize_saliency(model, view, method='gradient', save_path=save_path, title_prefix=model_name)
+        fig = visualize_saliency(
+            model, view, 
+            method='gradient', 
+            save_path=save_path, 
+            title_prefix=model_name
+        )
+        
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
     
-    print(f"Generated {num_samples} saliency visualizations in {output_dir}/")
+    print(f"✅ Generated {num_samples} saliency visualizations in {output_dir}/")
+
+
+# Also update visualize_saliency to handle multi-channel inputs
+def visualize_saliency(
+    model: torch.nn.Module,
+    view: np.ndarray,
+    method: str = 'gradient',
+    figsize: tuple[int, int] = (12, 4),
+    save_path: str | None = None,
+    title_prefix: str = '',
+) -> plt.Figure:
+    """
+    Create a visualization of input view alongside saliency map.
+    
+    Args:
+        model: Trained neural network
+        view: Agent's view as numpy array (H, W) or (C, H, W)
+        method: 'gradient', 'guided', or 'integrated'
+        figsize: Figure size
+        save_path: If provided, save figure to this path
+        title_prefix: Prefix for plot title (e.g., "Ground Truth Model")
+    
+    Returns:
+        matplotlib Figure object
+    """
+    device = next(model.parameters()).device
+    
+    # Handle different input shapes
+    if view.ndim == 2:
+        # Single channel: (H, W) -> (1, 1, H, W)
+        input_tensor = torch.from_numpy(view).float().unsqueeze(0).unsqueeze(0).to(device)
+        view_display = view
+    elif view.ndim == 3:
+        # Multi-channel: (C, H, W) -> (1, C, H, W)
+        input_tensor = torch.from_numpy(view).float().unsqueeze(0).to(device)
+        # For display, sum channels or use first channel
+        view_display = view.sum(axis=0)  # Aggregate for visualization
+    else:
+        raise ValueError(f"Expected 2D or 3D view, got shape {view.shape}")
+    
+    # Get prediction
+    with torch.no_grad():
+        logits = model(input_tensor)
+        probs = F.softmax(logits, dim=1)
+        action_idx = logits.argmax(dim=1).item()
+        confidence = probs[0, action_idx].item()
+    
+    # Compute saliency
+    if method == 'gradient':
+        saliency = compute_gradient_saliency(model, input_tensor)
+    elif method == 'guided':
+        saliency = compute_guided_backprop_saliency(model, input_tensor)
+    elif method == 'integrated':
+        saliency = compute_integrated_gradients(model, input_tensor)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    # Handle multi-channel saliency output
+    if saliency.ndim == 3:
+        saliency = saliency.sum(axis=0)  # Aggregate across channels
+    
+    # Create figure
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    
+    # Original view
+    im0 = axes[0].imshow(view_display, cmap='viridis')
+    axes[0].set_title("Agent's View")
+    plt.colorbar(im0, ax=axes[0], fraction=0.046)
+    
+    # Saliency map
+    im1 = axes[1].imshow(saliency, cmap='hot')
+    axes[1].set_title(f"Saliency ({method})")
+    plt.colorbar(im1, ax=axes[1], fraction=0.046)
+    
+    # Overlay
+    axes[2].imshow(view_display, cmap='viridis', alpha=0.5)
+    axes[2].imshow(saliency, cmap='hot', alpha=0.5)
+    axes[2].set_title(f"Overlay (action={action_idx}, conf={confidence:.2f})")
+    
+    for ax in axes:
+        ax.axis('off')
+    
+    fig.suptitle(f"{title_prefix} - {method.title()} Saliency" if title_prefix else f"{method.title()} Saliency")
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"  💾 Saved: {save_path}")
+    
+    return fig
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Generate saliency visualizations for trained models")
+    parser.add_argument('--model', type=str, default=None,
+                        help='Path to trained model (default: auto-detect from models/)')
+    parser.add_argument('--output', type=str, default='visualizations',
+                        help='Output directory for images')
+    parser.add_argument('--samples', type=int, default=5,
+                        help='Number of sample views to visualize')
+    parser.add_argument('--no-show', action='store_true',
+                        help='Save images without displaying')
+    args = parser.parse_args()
+    
+    analyze_model_attention(
+        model_path=args.model,
+        output_dir=args.output,
+        num_samples=args.samples,
+        show=not args.no_show,
+    )
+
+

@@ -1,7 +1,7 @@
-from .environments import create_world
-from .agents import Organism
-from .behaviors import OmniscientSeeker, ProxySeeker, LearnedGroundTruth, LearnedProxy
-from .utils.logging_config import get_logger
+from goodharts.environments import create_world
+from goodharts.agents import Organism
+from goodharts.behaviors import OmniscientSeeker, ProxySeeker, LearnedGroundTruth, LearnedProxy
+from goodharts.utils.logging_config import get_logger
 import numpy as np
 
 # Mapping string names to classes

@@ -5,9 +5,9 @@ Organisms navigate the world, consume resources, and can be controlled
 by various behavior strategies (hardcoded or learned).
 """
 import numpy as np
-from ..environments.world import World
-from ..behaviors import BehaviorStrategy
-from ..utils.logging_config import get_logger
+from goodharts.environments.world import World
+from goodharts.behaviors import BehaviorStrategy
+from goodharts.utils.logging_config import get_logger
 from dataclasses import dataclass
 
 logger = get_logger("agent")
@@ -90,9 +90,11 @@ class Organism:
 
     def move(self, dx: int | float, dy: int | float):
         """
-        Move by (dx, dy), respecting speed limits and boundaries.
+        Move by (dx, dy), respecting speed limits.
         
-        Accepts floats for continuous action mode (will be rounded).
+        Energy cost is applied for the ATTEMPTED move distance,
+        so agents still pay for trying to move into walls.
+        World handles coordinate normalization (wrap or clamp).
         """
         # Handle continuous actions
         dx = int(round(dx))
@@ -107,11 +109,10 @@ class Organism:
             dy = int(round(dy * scale))
             distance = np.sqrt(dx ** 2 + dy ** 2)
         
-        # Update position (clamped to world bounds)
-        self.x = max(0, min(self.x + dx, self.world.width - 1))
-        self.y = max(0, min(self.y + dy, self.world.height - 1))
+        # Update position (world handles topology - wrap or clamp)
+        self.x, self.y = self.world.wrap_position(self.x + dx, self.y + dy)
         
-        # Nonlinear energy cost
+        # Nonlinear energy cost (applied for attempted distance)
         exponent = self.config.get('MOVE_COST_EXPONENT', 1.0)
         base_cost = self.config['ENERGY_MOVE_COST']
         self.energy -= (distance ** exponent) * base_cost
@@ -159,30 +160,8 @@ class Organism:
             logger.debug(f"Agent {self.id} died: {self.death_reason}")
 
     def _extract_grid_view(self, grid: np.ndarray, fill_value: float = 0.0) -> np.ndarray:
-        """Extract local view from a grid with padding for edges."""
-        x_min = self.x - self.sight_radius
-        x_max = self.x + self.sight_radius
-        y_min = self.y - self.sight_radius
-        y_max = self.y + self.sight_radius
-
-        x_slice_start = max(0, x_min)
-        x_slice_end = min(self.world.width, x_max + 1)
-        y_slice_start = max(0, y_min)
-        y_slice_end = min(self.world.height, y_max + 1)
-
-        world_view = grid[y_slice_start:y_slice_end, x_slice_start:x_slice_end]
-
-        pad_top = y_slice_start - y_min
-        pad_bottom = (y_max + 1) - y_slice_end
-        pad_left = x_slice_start - x_min
-        pad_right = (x_max + 1) - x_slice_end
-
-        return np.pad(
-            world_view,
-            pad_width=((pad_top, pad_bottom), (pad_left, pad_right)),
-            mode='constant',
-            constant_values=fill_value
-        )
+        """Extract local view from a grid - delegates to world."""
+        return self.world.get_view(grid, self.x, self.y, self.sight_radius, fill_value)
 
     def _build_onehot_channels(self, grid_view: np.ndarray) -> dict[str, np.ndarray]:
         """

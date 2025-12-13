@@ -1,1 +1,1 @@
-from .organism import Organism
+from goodharts.agents.organism import Organism

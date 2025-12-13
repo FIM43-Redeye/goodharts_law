@@ -15,12 +15,12 @@ import os
 import argparse
 from pathlib import Path
 
-from ..behaviors.brains.tiny_cnn import TinyCNN
-from ..behaviors import LearnedBehavior
-from .dataset import ReplayBuffer, SimulationDataset
-from .collect import collect_from_expert, collect_experiences
-from ..configs.default_config import get_config
-from ..utils.logging_config import setup_logging, get_logger
+from goodharts.behaviors.brains.tiny_cnn import TinyCNN
+from goodharts.behaviors import LearnedBehavior
+from goodharts.training.dataset import ReplayBuffer, SimulationDataset
+from goodharts.training.collect import collect_from_expert, collect_experiences
+from goodharts.configs.default_config import get_config
+from goodharts.utils.logging_config import setup_logging, get_logger
 
 logger = get_logger("training")
 
