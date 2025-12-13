@@ -104,7 +104,9 @@ AGENT_VIEW_RANGE = 5
 
 
 def get_config():
-    return {
+    from .observation_spec import ObservationSpec
+    
+    config = {
         'ENERGY_START': ENERGY_START,
         'ENERGY_MOVE_COST': ENERGY_MOVE_COST,
         'MOVE_COST_EXPONENT': MOVE_COST_EXPONENT,
@@ -117,3 +119,9 @@ def get_config():
         'AGENT_VIEW_RANGE': AGENT_VIEW_RANGE,
         'CellType': CellType
     }
+    
+    # Central observation spec factory - derives from CellType and view range
+    config['get_observation_spec'] = lambda mode: ObservationSpec.for_mode(mode, config)
+    
+    return config
+

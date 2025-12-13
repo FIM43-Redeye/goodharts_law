@@ -6,9 +6,9 @@ enabling empirical demonstration of Goodhart's Law.
 """
 import torch
 import numpy as np
-from behaviors import BehaviorStrategy
-from behaviors.brains.tiny_cnn import TinyCNN
-from behaviors.action_space import build_action_space, action_to_index, index_to_action, num_actions
+from ..behaviors import BehaviorStrategy
+from ..behaviors.brains.tiny_cnn import TinyCNN
+from ..behaviors.action_space import build_action_space, action_to_index, index_to_action, num_actions
 
 
 class LearnedBehavior(BehaviorStrategy):
@@ -74,6 +74,8 @@ class LearnedBehavior(BehaviorStrategy):
         """
         Lazy initialization of the brain based on actual view shape.
         
+        Supports loading both TinyCNN and ActorCritic (PPO) models.
+        
         Args:
             input_shape: (num_channels, height, width) from observation
         """
@@ -86,12 +88,38 @@ class LearnedBehavior(BehaviorStrategy):
         
         if self.model_path:
             try:
-                self.brain.load_state_dict(
-                    torch.load(self.model_path, map_location=self.device, weights_only=True)
-                )
-                print(f"[LearnedBehavior] Loaded model from {self.model_path}")
+                state_dict = torch.load(self.model_path, map_location=self.device, weights_only=True)
+                
+                # Detect if this is an ActorCritic model (has 'actor' keys)
+                if any('actor' in k for k in state_dict.keys()):
+                    # Map ActorCritic keys to TinyCNN keys
+                    # ActorCritic: conv1, conv2, fc_shared (64), actor, critic
+                    # TinyCNN: conv1, conv2, fc1 (64), fc_out (output)
+                    new_state_dict = {}
+                    for k, v in state_dict.items():
+                        if k.startswith('conv1') or k.startswith('conv2'):
+                            new_state_dict[k] = v
+                        elif k.startswith('fc_shared'):
+                            # fc_shared -> fc1
+                            new_key = k.replace('fc_shared', 'fc1')
+                            new_state_dict[new_key] = v
+                        elif k.startswith('actor'):
+                            # actor -> fc_out (output layer)
+                            new_key = k.replace('actor', 'fc_out')
+                            new_state_dict[new_key] = v
+                        # Skip 'critic' - not needed for inference
+                    
+                    self.brain.load_state_dict(new_state_dict)
+                    print(f"[LearnedBehavior] Loaded PPO ActorCritic model from {self.model_path}")
+                else:
+                    # Standard TinyCNN model
+                    self.brain.load_state_dict(state_dict)
+                    print(f"[LearnedBehavior] Loaded TinyCNN model from {self.model_path}")
+                    
             except FileNotFoundError:
                 print(f"[LearnedBehavior] Model not found at {self.model_path}, using random weights")
+            except Exception as e:
+                print(f"[LearnedBehavior] Error loading model: {e}, using random weights")
         
         self.brain.to(self.device)
         self.brain.eval()
@@ -220,43 +248,24 @@ class LearnedProxy(LearnedBehavior):
         )
 
 
-# =============================================================================
-# RL STUBS - To be implemented for full reinforcement learning support
-# =============================================================================
+class LearnedProxyIllAdjusted(LearnedBehavior):
+    """
+    Learned behavior trained with ill-adjusted proxy rewards.
+    
+    During training, this agent was rewarded for touching interesting cells
+    (regardless of whether they're food or poison). It sees the same proxy
+    observations as LearnedProxy but learned a different policy due to
+    the reward misalignment - a demonstration of Goodhart's Law.
+    """
+    def __init__(self, model_path: str | None = None, epsilon: float = 0.0,
+                 max_move_distance: int = 1, temperature: float = 0.5):
+        if model_path is None:
+            model_path = 'models/ppo_proxy_ill_adjusted.pth'
+        super().__init__(
+            mode='proxy',  # Same observation as proxy
+            model_path=model_path, 
+            epsilon=epsilon,
+            max_move_distance=max_move_distance,
+            temperature=temperature
+        )
 
-class RLTrainer:
-    """
-    Stub for reinforcement learning trainer.
-    
-    TODO: Implement policy gradient (REINFORCE) or Q-learning.
-    
-    Current plan: Start with reward-weighted behavior cloning,
-    then upgrade to this for true RL.
-    """
-    
-    def __init__(self, behavior: LearnedBehavior, lr: float = 1e-3):
-        self.behavior = behavior
-        self.lr = lr
-        self.optimizer = None  # Will be torch.optim.Adam
-        
-    def compute_policy_gradient_loss(self, states, actions, rewards):
-        """
-        REINFORCE-style policy gradient.
-        
-        loss = -sum(log_prob(action) * reward)
-        
-        TODO: Implement with proper baseline subtraction
-        """
-        raise NotImplementedError("Policy gradient not yet implemented")
-    
-    def compute_q_learning_loss(self, states, actions, rewards, next_states, dones):
-        """
-        DQN-style Q-learning.
-        
-        TODO: Implement with target network and experience replay
-        """
-        raise NotImplementedError("Q-learning not yet implemented")
-    
-    def update(self, batch):
-        """Single training step."""
-        raise NotImplementedError("Training step not yet implemented")

@@ -15,12 +15,12 @@ import os
 import argparse
 from pathlib import Path
 
-from behaviors.brains.tiny_cnn import TinyCNN
-from behaviors import LearnedBehavior
-from training.dataset import ReplayBuffer, SimulationDataset
-from training.collect import collect_from_expert, collect_experiences
-from configs.default_config import get_config
-from utils.logging_config import setup_logging, get_logger
+from ..behaviors.brains.tiny_cnn import TinyCNN
+from ..behaviors import LearnedBehavior
+from .dataset import ReplayBuffer, SimulationDataset
+from .collect import collect_from_expert, collect_experiences
+from ..configs.default_config import get_config
+from ..utils.logging_config import setup_logging, get_logger
 
 logger = get_logger("training")
 
@@ -62,8 +62,8 @@ def train_behavior_cloning(
     logger.info(f"Mode: {mode}, Epochs: {epochs}, Batch size: {batch_size}")
     
     # Determine expert class based on mode
-    from behaviors import OmniscientSeeker, ProxySeeker
-    from training.collect import generate_poison_avoidance_samples
+    from ..behaviors import OmniscientSeeker, ProxySeeker
+    from .collect import generate_poison_avoidance_samples
     expert_class = OmniscientSeeker if mode == 'ground_truth' else ProxySeeker
     
     # Collect expert demonstrations

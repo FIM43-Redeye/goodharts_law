@@ -14,8 +14,8 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Callable
 
-from behaviors.brains.tiny_cnn import TinyCNN
-from behaviors import LearnedBehavior
+from ..behaviors.brains.tiny_cnn import TinyCNN
+from ..behaviors import LearnedBehavior
 
 
 def compute_gradient_saliency(
@@ -311,8 +311,8 @@ def analyze_model_attention(
     
     Convenience function for command-line usage.
     """
-    from training.collect import collect_from_expert
-    from behaviors import OmniscientSeeker
+    from .collect import collect_from_expert
+    from ..behaviors import OmniscientSeeker
     
     # Determine input shape
     view_range = config['AGENT_VIEW_RANGE']

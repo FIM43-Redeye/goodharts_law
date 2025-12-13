@@ -105,10 +105,14 @@ Current training uses small batch sizes and models - may actually be **CPU-bound
 
 | File | Purpose |
 |------|---------|
-| `behaviors/action_space.py` | Single source of truth for action indices |
-| `behaviors/learned.py` | LearnedBehavior with temperature sampling |
-| `behaviors/brains/tiny_cnn.py` | CNN architecture |
-| `agents/organism.py` | One-hot observation encoding |
-| `training/train.py` | Training loop with visibility weighting |
-| `training/dataset.py` | SimulationDataset with combined weights |
-| `training/collect.py` | Expert demonstration collection |
+| `goodharts/behaviors/action_space.py` | Single source of truth for action indices |
+| `goodharts/behaviors/learned.py` | LearnedBehavior with temperature sampling |
+| `goodharts/behaviors/brains/tiny_cnn.py` | CNN architecture |
+| `goodharts/agents/organism.py` | One-hot observation encoding |
+| `goodharts/training/train.py` | Behavior cloning training loop |
+| `goodharts/training/train_rl.py` | Reinforcement learning training |
+| `goodharts/training/train_ppo.py` | PPO algorithm implementation |
+| `goodharts/training/dataset.py` | SimulationDataset with combined weights |
+| `goodharts/training/collect.py` | Expert demonstration collection |
+| `goodharts/training/visualize_saliency.py` | Neural network interpretability |
+

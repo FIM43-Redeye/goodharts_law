@@ -1,8 +1,8 @@
 import pytest
 import numpy as np
-from agents.organism import Organism
-from environments.world import World
-from behaviors import OmniscientSeeker
+from goodharts.agents.organism import Organism
+from goodharts.environments.world import World
+from goodharts.behaviors import OmniscientSeeker
 
 class MockBehavior(OmniscientSeeker):
     def decide_action(self, agent, view):
@@ -14,7 +14,7 @@ def world(config):
 
 @pytest.fixture
 def config():
-    from configs.default_config import get_config
+    from goodharts.configs.default_config import get_config
     return get_config()
 
 def test_organism_move(world, config):

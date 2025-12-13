@@ -5,7 +5,7 @@ import os
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from behaviors.brains.tiny_cnn import TinyCNN
+from goodharts.behaviors.brains.tiny_cnn import TinyCNN
 
 def test_shapes():
     shapes = [(5, 5), (11, 11), (21, 21)]

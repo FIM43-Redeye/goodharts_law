@@ -1,6 +1,6 @@
-from simulation import Simulation
-from configs.default_config import get_config
-from behaviors import OmniscientSeeker, ProxySeeker
+from goodharts.simulation import Simulation
+from goodharts.configs.default_config import get_config
+from goodharts.behaviors import OmniscientSeeker, ProxySeeker
 import numpy as np
 
 def run_verification():

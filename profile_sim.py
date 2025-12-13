@@ -1,8 +1,8 @@
 import cProfile
 import pstats
-from simulation import Simulation
-from configs.default_config import get_config
-from utils.logging_config import setup_logging
+from goodharts.simulation import Simulation
+from goodharts.configs.default_config import get_config
+from goodharts.utils.logging_config import setup_logging
 import logging
 
 # Disable logging for profiling to measure core logic

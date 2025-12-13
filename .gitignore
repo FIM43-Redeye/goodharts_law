@@ -4,6 +4,9 @@
 *$py.class
 behaviors/__pycache__
 
+# Models
+models/
+
 # C extensions
 *.so
 

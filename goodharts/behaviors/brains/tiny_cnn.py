@@ -30,12 +30,12 @@ class TinyCNN(nn.Module):
         output_size: int = 8,
         num_aux_inputs: int = 0,
         action_mode: str = 'discrete',
-        hidden_size: int = 32,
+        hidden_size: int = 64,
     ):
         """
         Args:
             input_shape: (height, width) of the input view
-            input_channels: Number of grid channels (e.g., 2 for proxy + ground_truth)
+            input_channels: Number of grid channels (e.g., 4 for one-hot cell types)
             output_size: Number of discrete actions (ignored if action_mode='continuous')
             num_aux_inputs: Number of scalar auxiliary inputs (energy, etc.)
             action_mode: 'discrete' for classification, 'continuous' for dx/dy regression
@@ -73,17 +73,47 @@ class TinyCNN(nn.Module):
         else:
             raise ValueError(f"Unknown action_mode: {action_mode}")
 
-    def forward(self, x: torch.Tensor, aux: torch.Tensor | None = None) -> torch.Tensor:
+    @classmethod
+    def from_spec(cls, spec: 'ObservationSpec', output_size: int, **kwargs) -> 'TinyCNN':
         """
-        Forward pass.
+        Factory: create TinyCNN from an ObservationSpec.
+        
+        This ensures model architecture is derived from the centralized spec,
+        not hardcoded values. Any changes to observation format will
+        automatically propagate to models.
+        
+        Args:
+            spec: ObservationSpec defining input dimensions
+            output_size: Number of output actions
+            **kwargs: Additional args passed to TinyCNN.__init__
+        
+        Returns:
+            TinyCNN configured for the spec
+        
+        Example:
+            spec = config['get_observation_spec']('ground_truth')
+            model = TinyCNN.from_spec(spec, output_size=8)
+        """
+        return cls(
+            input_shape=spec.input_shape,
+            input_channels=spec.num_channels,
+            output_size=output_size,
+            **kwargs
+        )
+
+    def get_features(self, x: torch.Tensor, aux: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Extract feature representation (for value head in PPO).
+        
+        This is the intermediate representation AFTER conv layers and fc1,
+        but BEFORE the final action layer (fc_out).
         
         Args:
             x: Grid input of shape (batch, channels, height, width)
             aux: Optional auxiliary scalars of shape (batch, num_aux_inputs)
-            
+        
         Returns:
-            For discrete mode: logits of shape (batch, output_size)
-            For continuous mode: (dx, dy) of shape (batch, 2), values in [-1, 1]
+            Feature tensor of shape (batch, hidden_size)
         """
         # Convolutional feature extraction
         x = F.relu(self.conv1(x))
@@ -95,22 +125,38 @@ class TinyCNN(nn.Module):
         # Concatenate auxiliary inputs if provided
         if aux is not None:
             if aux.dim() == 1:
-                aux = aux.unsqueeze(0)  # Add batch dim if missing
+                aux = aux.unsqueeze(0)
             x = torch.cat([x, aux], dim=1)
         elif self.num_aux_inputs > 0:
-            # Pad with zeros if aux expected but not provided
             zeros = torch.zeros(x.size(0), self.num_aux_inputs, device=x.device)
             x = torch.cat([x, zeros], dim=1)
         
-        # Dense layers
-        x = F.relu(self.fc1(x))
-        x = self.fc_out(x)
+        # Final feature layer
+        features = F.relu(self.fc1(x))
+        return features
+
+    def forward(self, x: torch.Tensor, aux: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Forward pass: observation → action logits.
         
-        # For continuous mode, use tanh to bound output to [-1, 1]
+        Args:
+            x: Grid input of shape (batch, channels, height, width)
+            aux: Optional auxiliary scalars of shape (batch, num_aux_inputs)
+            
+        Returns:
+            For discrete mode: logits of shape (batch, output_size)
+            For continuous mode: (dx, dy) of shape (batch, 2), values in [-1, 1]
+        """
+        # Get features (shared computation with value head)
+        features = self.get_features(x, aux)
+        
+        # Action output
+        output = self.fc_out(features)
+        
         if self.action_mode == 'continuous':
-            x = torch.tanh(x)
+            output = torch.tanh(output)
         
-        return x
+        return output
     
     def get_action(self, x: torch.Tensor, aux: torch.Tensor | None = None, 
                    max_move_distance: int = 1) -> tuple[int, int]:
