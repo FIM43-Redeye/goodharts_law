@@ -72,7 +72,6 @@ goodharts_law/
 ├── docker_directions.txt       # Docker workflow instructions
 │
 ├── TODO.txt                    # Roadmap & future enhancements
-└── personal/intent.txt         # Background: Anthropic Fellows Program context
 ```
 
 ---
