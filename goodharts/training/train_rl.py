@@ -22,6 +22,7 @@ from goodharts.behaviors.learned import LearnedBehavior
 from goodharts.behaviors.brains.tiny_cnn import TinyCNN
 from goodharts.behaviors.action_space import build_action_space, num_actions
 from goodharts.utils.logging_config import get_logger
+from goodharts.utils.device import get_device
 
 logger = get_logger("rl_training")
 
@@ -57,7 +58,7 @@ def collect_episode(
         Episode with all states, actions, rewards
     """
     if device is None:
-        device = torch.device('cpu')
+        device = get_device(verbose=False)
     
     model.eval()
     
@@ -182,7 +183,7 @@ def train_reinforce(
         config = get_config()
     
     if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = get_device()
     
     print(f"\n🚀 Starting REINFORCE training on {device}", flush=True)
     print(f"   Mode: {mode}, Episodes: {num_episodes}, LR: {lr}", flush=True)
@@ -194,11 +195,13 @@ def train_reinforce(
     training_config['GRID_POISON_INIT'] = 30
     training_config['MAX_EPISODE_STEPS'] = 500
     
+    # Get observation spec for dynamic channel count
+    obs_spec = training_config['get_observation_spec'](mode)
+    
     # Initialize model
-    view_size = 2 * config['AGENT_VIEW_RANGE'] + 1
     model = TinyCNN(
-        input_shape=(view_size, view_size),
-        input_channels=4,
+        input_shape=obs_spec.input_shape,
+        input_channels=obs_spec.num_channels,
         output_size=num_actions(1)
     ).to(device)
     

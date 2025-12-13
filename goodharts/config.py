@@ -132,3 +132,22 @@ def get_brain_view_config() -> dict:
 def get_agents_list() -> list[dict]:
     """Get [[agents]] list."""
     return get_config().get('agents', [])
+
+
+def get_training_config() -> dict:
+    """
+    Get [training] config section.
+    
+    Contains curriculum learning and PPO hyperparameters.
+    """
+    return get_config().get('training', {})
+
+
+def get_runtime_config() -> dict:
+    """
+    Get [runtime] config section.
+    
+    Contains device selection and other runtime settings.
+    """
+    return get_config().get('runtime', {})
+

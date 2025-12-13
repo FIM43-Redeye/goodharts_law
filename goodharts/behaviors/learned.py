@@ -9,6 +9,7 @@ import numpy as np
 from goodharts.behaviors import BehaviorStrategy
 from goodharts.behaviors.brains.tiny_cnn import TinyCNN
 from goodharts.behaviors.action_space import build_action_space, action_to_index, index_to_action, num_actions
+from goodharts.utils.device import get_device
 
 
 class LearnedBehavior(BehaviorStrategy):
@@ -46,7 +47,7 @@ class LearnedBehavior(BehaviorStrategy):
         self.temperature = temperature
         
         self.brain: TinyCNN | None = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = get_device(verbose=False)
         
         # Get action space from centralized module
         self._actions = build_action_space(max_move_distance)
@@ -221,9 +222,72 @@ class LearnedBehavior(BehaviorStrategy):
         return (0, 1)
 
 
-# Convenience subclasses for cleaner config
+# =============================================================================
+# PRESET FACTORY (preferred way to create learned behaviors)
+# =============================================================================
+
+# Preset configurations for common learned behavior types
+LEARNED_PRESETS: dict[str, dict] = {
+    'ground_truth': {
+        'mode': 'ground_truth',
+        'color': (0, 200, 255),  # Light cyan
+    },
+    'proxy': {
+        'mode': 'proxy',
+        'color': (255, 100, 255),  # Light magenta
+    },
+    'proxy_ill_adjusted': {
+        'mode': 'proxy',
+        'model_path': 'models/ppo_proxy_ill_adjusted.pth',
+        'color': (138, 43, 226),  # Blue-violet
+    },
+}
+
+
+def create_learned_behavior(preset: str = 'ground_truth', **kwargs) -> LearnedBehavior:
+    """
+    Create a learned behavior from a preset.
+    
+    This is the preferred way to create learned behaviors. Presets define
+    sensible defaults that can be overridden via kwargs.
+    
+    Args:
+        preset: One of 'ground_truth', 'proxy', 'proxy_ill_adjusted'
+        **kwargs: Override preset values (model_path, epsilon, temperature, etc.)
+        
+    Returns:
+        Configured LearnedBehavior instance
+        
+    Example:
+        behavior = create_learned_behavior('ground_truth', model_path='models/my_model.pth')
+    """
+    if preset not in LEARNED_PRESETS:
+        available = ', '.join(sorted(LEARNED_PRESETS.keys()))
+        raise ValueError(f"Unknown preset: '{preset}'. Available: [{available}]")
+    
+    config = LEARNED_PRESETS[preset].copy()
+    color = config.pop('color', None)
+    config.update(kwargs)
+    
+    behavior = LearnedBehavior(**config)
+    if color:
+        behavior._color = color
+    return behavior
+
+
+# =============================================================================
+# BACKWARDS COMPATIBILITY ONLY - prefer create_learned_behavior() instead
+# =============================================================================
+
 class LearnedGroundTruth(LearnedBehavior):
-    """Learned behavior that sees true cell types."""
+    """
+    Learned behavior that sees true cell types.
+    
+    .. deprecated::
+        Use create_learned_behavior('ground_truth') instead.
+    """
+    _color = (0, 200, 255)  # Light cyan
+    
     def __init__(self, model_path: str | None = None, epsilon: float = 0.0, 
                  max_move_distance: int = 1, temperature: float = 0.5):
         super().__init__(
@@ -231,12 +295,19 @@ class LearnedGroundTruth(LearnedBehavior):
             model_path=model_path, 
             epsilon=epsilon,
             max_move_distance=max_move_distance,
-            temperature=temperature  # Lower = more deterministic when confident
+            temperature=temperature
         )
 
 
 class LearnedProxy(LearnedBehavior):
-    """Learned behavior that only sees proxy/interestingness signals."""
+    """
+    Learned behavior that only sees proxy/interestingness signals.
+    
+    .. deprecated::
+        Use create_learned_behavior('proxy') instead.
+    """
+    _color = (255, 100, 255)  # Light magenta
+    
     def __init__(self, model_path: str | None = None, epsilon: float = 0.0,
                  max_move_distance: int = 1, temperature: float = 0.5):
         super().__init__(
@@ -256,16 +327,22 @@ class LearnedProxyIllAdjusted(LearnedBehavior):
     (regardless of whether they're food or poison). It sees the same proxy
     observations as LearnedProxy but learned a different policy due to
     the reward misalignment - a demonstration of Goodhart's Law.
+    
+    .. deprecated::
+        Use create_learned_behavior('proxy_ill_adjusted') instead.
     """
+    _color = (138, 43, 226)  # Blue-violet
+    
     def __init__(self, model_path: str | None = None, epsilon: float = 0.0,
                  max_move_distance: int = 1, temperature: float = 0.5):
         if model_path is None:
             model_path = 'models/ppo_proxy_ill_adjusted.pth'
         super().__init__(
-            mode='proxy',  # Same observation as proxy
+            mode='proxy',
             model_path=model_path, 
             epsilon=epsilon,
             max_move_distance=max_move_distance,
             temperature=temperature
         )
+
 

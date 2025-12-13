@@ -25,6 +25,9 @@ class ProxySeeker(BehaviorStrategy):
     Cannot distinguish food from poison - will eat both!
     """
     
+    # Distinct color for visualization (magenta)
+    _color = (255, 0, 255)
+    
     @property
     def requirements(self) -> list[str]:
         return ['proxy_metric']

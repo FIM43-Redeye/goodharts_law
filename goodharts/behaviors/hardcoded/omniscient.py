@@ -1,14 +1,12 @@
 """
 Omniscient behavior that sees ground truth cell types.
 
-Uses one-hot encoded channels where:
-- Channel 0: is_empty
-- Channel 1: is_wall  
-- Channel 2: is_food
-- Channel 3: is_poison
+Uses one-hot encoded channels derived from CellType for full observability.
+This agent can distinguish food from poison perfectly.
 """
 import numpy as np
 from goodharts.behaviors.base import BehaviorStrategy
+from goodharts.configs.default_config import CellType
 
 
 # 8-directional random walk moves (cardinals + diagonals)
@@ -16,12 +14,6 @@ RANDOM_WALK_MOVES = [
     (0, 1), (0, -1), (1, 0), (-1, 0),   # Cardinals
     (1, 1), (1, -1), (-1, 1), (-1, -1)  # Diagonals
 ]
-
-# Channel indices for one-hot encoding
-CHANNEL_EMPTY = 0
-CHANNEL_WALL = 1
-CHANNEL_FOOD = 2
-CHANNEL_POISON = 3
 
 
 class OmniscientSeeker(BehaviorStrategy):
@@ -31,6 +23,9 @@ class OmniscientSeeker(BehaviorStrategy):
     Uses one-hot encoded view with separate channels for each cell type.
     This agent can distinguish food from poison perfectly.
     """
+    
+    # Distinct color for visualization (bright green)
+    _color = (0, 255, 128)
     
     @property
     def requirements(self) -> list[str]:
@@ -49,10 +44,10 @@ class OmniscientSeeker(BehaviorStrategy):
         """
         center = agent.sight_radius
         
-        # Extract relevant channels
-        food_channel = view[CHANNEL_FOOD]      # (H, W) - 1.0 where food exists
-        poison_channel = view[CHANNEL_POISON]  # (H, W) - 1.0 where poison exists
-        wall_channel = view[CHANNEL_WALL]      # (H, W) - 1.0 where walls exist
+        # Extract relevant channels using CellType for indices
+        food_channel = view[CellType.FOOD.channel_index]      # (H, W) - 1.0 where food exists
+        poison_channel = view[CellType.POISON.channel_index]  # (H, W) - 1.0 where poison exists
+        wall_channel = view[CellType.WALL.channel_index]      # (H, W) - 1.0 where walls exist
         
         # Find all visible food positions
         food_positions = []

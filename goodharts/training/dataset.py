@@ -71,7 +71,8 @@ class ReplayBuffer:
             (next_states omitted if not needed)
         """
         if device is None:
-            device = torch.device('cpu')
+            from goodharts.utils.device import get_device
+            device = get_device(verbose=False)
             
         batch = self.sample(batch_size)
         

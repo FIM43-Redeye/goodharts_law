@@ -22,21 +22,26 @@ Key insight: Poison has high "interestingness" (0.9) compared to food (1.0), mak
 ```
 goodharts_law/
 ├── main.py                     # Entry point: runs animated simulation
+├── config.default.toml         # Default configuration (copy to config.toml to customize)
 ├── pyproject.toml              # Package configuration & dependencies
 ├── requirements.txt            # Python dependencies
 │
 ├── goodharts/                  # Main package
 │   ├── simulation.py           # Core simulation loop & statistics tracking
+│   ├── config.py               # TOML config loader with caching
+│   ├── visualization.py        # Matplotlib visualization functions
 │   │
 │   ├── agents/
 │   │   └── organism.py         # Agent class: movement, eating, energy, death
 │   │
 │   ├── behaviors/
-│   │   ├── base.py             # BehaviorStrategy abstract base class
-│   │   ├── omniscient.py       # OmniscientSeeker: sees true cell types
-│   │   ├── proxy_seeker.py     # ProxySeeker: only sees proxy signal
-│   │   ├── learned.py          # LearnedBehavior: neural net controller
+│   │   ├── base.py             # BehaviorStrategy base class + ROLE_COLORS
+│   │   ├── registry.py         # Auto-discovery behavior registry
+│   │   ├── learned.py          # LearnedBehavior + create_learned_behavior()
 │   │   ├── action_space.py     # Centralized action definitions
+│   │   ├── hardcoded/          # Baseline behaviors (hand-coded)
+│   │   │   ├── omniscient.py   # OmniscientSeeker: sees true cell types
+│   │   │   └── proxy_seeker.py # ProxySeeker: only sees proxy signal
 │   │   └── brains/
 │   │       └── tiny_cnn.py     # TinyCNN model for learned behaviors
 │   │
@@ -50,17 +55,21 @@ goodharts_law/
 │   │   ├── train_ppo.py        # PPO algorithm implementation
 │   │   ├── collect.py          # Expert demonstration collection
 │   │   ├── dataset.py          # Dataset utilities for training
-│   │   ├── verify_models.py    # CLI model verification tool
+│   │   ├── verification/       # Model fitness testing suite
+│   │   │   ├── directional.py  # Direction accuracy tests
+│   │   │   └── survival.py     # Survival simulation tests
 │   │   └── visualize_saliency.py  # Neural network interpretability
 │   │
 │   ├── configs/
-│   │   ├── default_config.py   # Hyperparameters, CellType definitions
+│   │   ├── default_config.py   # CellType definitions, get_config()
 │   │   └── observation_spec.py # Observation encoding specifications
 │   │
 │   ├── models/                 # Trained model weights (.pth files)
 │   │
 │   └── utils/
+│       ├── device.py           # Centralized PyTorch device selection
 │       ├── logging_config.py   # Logging setup
+│       ├── brain_viz.py        # Neural network visualization
 │       └── numba_utils.py      # Numba JIT acceleration utilities
 │
 ├── tests/                      # pytest test suite
@@ -69,9 +78,7 @@ goodharts_law/
 ├── Dockerfile.cuda             # NVIDIA GPU (CUDA) environment
 ├── Dockerfile.cpu              # CPU-only environment
 ├── compose.yaml                # Docker Compose with profiles
-├── docker_directions.txt       # Docker workflow instructions
-│
-├── TODO.txt                    # Roadmap & future enhancements
+└── docker_directions.txt       # Docker workflow instructions
 ```
 
 ---
@@ -92,10 +99,49 @@ python main.py
 ```
 
 A matplotlib window will open showing:
-1. **Live Simulation Grid** — agents (cyan/magenta) navigating food (green) and poison (red)
+1. **Live Simulation Grid** — agents navigating food (green) and poison (red)
 2. **Energy Plot** — average energy over time per species
 3. **Activity Heatmap** — where agents spend time
 4. **Death Statistics** — starvation vs. poisoning counts
+
+### Configuration
+
+Configuration is managed via TOML files:
+
+```bash
+# Uses config.toml if present, otherwise config.default.toml
+python main.py
+
+# Or specify a config file
+python main.py --config my_config.toml
+
+# CLI flags override config
+python main.py --food 100 --poison 20 --agents 10
+```
+
+Key config sections:
+- `[world]` — Grid dimensions, loop mode
+- `[resources]` — Food/poison counts
+- `[agent]` — View range, energy settings
+- `[runtime]` — Device configuration (CPU/GPU)
+- `[training]` — Curriculum learning, PPO hyperparameters
+- `[[agents]]` — Which behaviors to spawn
+
+### Device Configuration
+
+PyTorch device selection is centralized. Control it via:
+
+```bash
+# Environment variable (highest priority)
+GOODHARTS_DEVICE=cpu python main.py
+GOODHARTS_DEVICE=cuda:1 python -m goodharts.training.train_ppo
+
+# Or in config.toml:
+[runtime]
+device = "cuda"  # Options: "cpu", "cuda", "cuda:0", "cuda:1", etc.
+```
+
+If not specified, the system auto-detects (CUDA > CPU).
 
 ### Running with Docker (GPU Support)
 
@@ -131,32 +177,63 @@ See `docker_directions.txt` for detailed instructions and troubleshooting.
 
 Cells have intrinsic properties that drive the "Goodhart trap":
 
-| Cell | Value | Interestingness | Energy Reward | Energy Penalty |
-|------|-------|-----------------|---------------|----------------|
-| EMPTY | 0 | 0.0 | 0 | 0 |
-| WALL | 1 | 0.0 | 0 | 0 |
-| FOOD | 2 | **1.0** | +15 | 0 |
-| POISON | 3 | **0.9** | 0 | -50 |
+| Cell | Value | Color | Interestingness | Energy Reward | Energy Penalty |
+|------|-------|-------|-----------------|---------------|----------------|
+| EMPTY | 0 | Dark blue | 0.0 | 0 | 0 |
+| WALL | 1 | Gray | 0.0 | 0 | 0 |
+| FOOD | 2 | Teal green | **1.0** | +15 | 0 |
+| POISON | 3 | Coral red | **0.9** | 0 | -50 |
+| PREY | 4 | Cyan | 0.3 | 0 | 0 |
+| PREDATOR | 5 | Red | 1.0 | +25 | 0 |
 
-The **interestingness** field populates the `proxy_grid`—both food and poison appear "interesting", but only food is actually beneficial.
+Each CellType has a `color` property for visualization and a `channel_index` property for observation encoding.
 
-### Behavior Strategy Pattern
+### Behavior Registry
 
-Behaviors are modular and declare their **requirements**:
+Behaviors are auto-discovered and registered. No manual registration needed:
 
 ```python
-class OmniscientSeeker(BehaviorStrategy):
-    @property
-    def requirements(self) -> list[str]:
-        return ['ground_truth']  # Sees actual cell types
+from goodharts.behaviors import get_behavior, list_behavior_names
 
-class ProxySeeker(BehaviorStrategy):
-    @property
-    def requirements(self) -> list[str]:
-        return ['proxy_metric']  # Only sees interestingness signal
+# List all available behaviors
+print(list_behavior_names())
+# ['LearnedBehavior', 'LearnedGroundTruth', 'LearnedProxy', 
+#  'LearnedProxyIllAdjusted', 'OmniscientSeeker', 'ProxySeeker']
+
+# Get a behavior class by name
+BehaviorClass = get_behavior('OmniscientSeeker')
 ```
 
-The `Organism` validates compatibility at construction time, ensuring behaviors only see what they're designed for.
+### Behavior Colors
+
+Each behavior has a `color` property for visualization:
+
+```python
+class BehaviorStrategy(ABC):
+    _color: tuple[int, int, int] | None = None  # Override per-subclass
+    
+    @property
+    def color(self) -> tuple[int, int, int]:
+        if self._color is not None:
+            return self._color
+        return ROLE_COLORS.get(self.role, (128, 128, 128))
+```
+
+Behaviors default to role-based colors (prey=cyan, predator=red) but can override with their own.
+
+### Learned Behaviors
+
+Create learned behaviors using presets:
+
+```python
+from goodharts.behaviors import create_learned_behavior
+
+# Factory function (preferred)
+behavior = create_learned_behavior('ground_truth', model_path='models/my_model.pth')
+behavior = create_learned_behavior('proxy_ill_adjusted')
+
+# Available presets: 'ground_truth', 'proxy', 'proxy_ill_adjusted'
+```
 
 ### Statistics & Visualization
 
@@ -168,22 +245,70 @@ The simulation tracks:
 
 ---
 
-## Hyperparameters (`configs/default_config.py`)
+## Training
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `ENERGY_START` | 50.0 | Initial energy for new agents |
-| `ENERGY_MOVE_COST` | 0.1 | Base cost per unit distance moved |
-| `MOVE_COST_EXPONENT` | 1.5 | Nonlinear scaling: farther moves cost more |
-| `MAX_MOVE_DISTANCE` | 3 | Speed cap per step |
-| `GRID_WIDTH/HEIGHT` | 100×100 | World dimensions |
-| `GRID_FOOD_INIT` | 50 | Initial food items |
-| `GRID_POISON_INIT` | 10 | Initial poison items |
-| `AGENT_VIEW_RANGE` | 5 | Sight radius (Manhattan) |
+### Train Models
+
+```bash
+# Train all models with PPO (takes ~5-10 min with GPU)
+python -m goodharts.training.train_ppo --mode all --episodes 500
+
+# Train a specific mode
+python -m goodharts.training.train_ppo --mode ground_truth --episodes 500
+
+# With live visualization (opens a dashboard window)
+python -m goodharts.training.train_ppo --mode ground_truth --visualize
+
+# Adjust entropy coefficient (lower = more opinionated actions)
+python -m goodharts.training.train_ppo --mode ground_truth --entropy 0.0005
+```
+
+### Training Visualization
+
+The `--visualize` flag opens a live dashboard showing:
+- **Episode rewards and lengths** (with smoothing)
+- **Policy/value losses and entropy**
+- **Action probability distribution** (key diagnostic for uniform action issue)
+- **Curriculum progress** (food density over time)
+
+This helps diagnose training problems like:
+- **Uniform action probabilities** (entropy too high, reward signal too weak)
+- **Value loss not decreasing** (learning rate issues)
+- **Entropy staying at maximum** (not learning to discriminate)
+
+Training configuration is in `config.default.toml` under `[training]`:
+```toml
+[training]
+initial_food = 2500     # Curriculum: start easy
+final_food = 50         # Curriculum: end hard
+curriculum_fraction = 0.9
+poison_count = 30
+steps_per_episode = 500
+```
+
+### Verify Models
+
+```bash
+# Run model verification suite
+python -m goodharts.training.verification
+
+# With more steps and verbose output
+python -m goodharts.training.verification --steps 500 --verbose
+```
+
+### Run with Trained Models
+
+```bash
+# Visual demo with learned agents
+python main.py --learned
+
+# Brain view mode (visualize neural network internals)
+python main.py --brain-view --agent LearnedGroundTruth --model models/ground_truth.pth
+```
 
 ---
 
-## Roadmap (from `TODO.txt`)
+## Roadmap
 
 ### ✅ Phase 1: Better Measurement & Visualization
 - [x] Track death causes (starvation vs poison)
@@ -192,26 +317,20 @@ The simulation tracks:
 - [x] "Suspicion" metric
 
 ### ✅ Phase 2: Learned Behaviors (CNN)
-- [x] **TinyCNN architecture** — 4-channel input (one-hot cells), 8-action output
-- [x] **Training pipeline** — behavior cloning from expert demonstrations
+- [x] **TinyCNN architecture** — dynamic channel input, configurable action output
+- [x] **Training pipeline** — behavior cloning + PPO with curriculum
 - [x] **One-hot observation encoding** — ground-truth vs proxy modes
 - [x] **Centralized action space** — `behaviors/action_space.py`
 - [x] **Temperature-based sampling** — natural exploration when uncertain
-- [x] **Visibility-weighted training** — 10× weight for samples with visible targets
 - [x] **Resource respawning** — simulation runs indefinitely
-- [x] **CLI verification tools** — `training/verify_models.py`
+- [x] **Model verification suite** — `training/verification/`
 
-Train and run learned agents:
-```bash
-# Train all models (takes ~2-3 min with GPU)
-python training/train.py --mode all --epochs 100
-
-# Verify model fitness (headless)
-python training/verify_models.py
-
-# Run visual demo with trained CNNs
-python main.py --learned
-```
+### ✅ Phase 2.5: Code Quality Refactoring
+- [x] **Behavior auto-discovery registry** — no manual registration
+- [x] **CellType enhancements** — color, channel_index properties
+- [x] **D1 rendering** — grid + agent overlay with behavior.color
+- [x] **TOML configuration** — all hyperparameters configurable
+- [x] **Visualization extraction** — main.py reduced from 529 to ~200 lines
 
 ### 🔮 Phase 3: Emergent Deception
 - [ ] Multi-agent signaling dynamics
@@ -230,6 +349,14 @@ This simulation is a **toy model** for understanding real AI alignment failures:
 2. **Information Asymmetry**: The agent lacks access to ground truth—a common scenario when we can't fully specify what we want.
 
 3. **Emergent Failure Modes**: Future phases aim to show agents *discovering* deceptive strategies, not just failing on fixed rules.
+
+---
+
+## Disclosure
+
+This project was developed almost entirely using Google's experimental Antigravity agentic IDE, with the gracious assistance of Claude 4.5 Opus. I acted as an architect and systems lead, manually writing some code where relevant, but I credit Opus for the vast majority of the actual implementation and documentation writing. This project would not have been possible without Google's free Gemini Pro subscription for students and the extremely high usage limits currently available in Antigravity.
+
+I am grateful to Google and Anthropic for making this project possible.
 
 ---
 

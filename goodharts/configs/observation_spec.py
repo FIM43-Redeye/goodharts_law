@@ -62,9 +62,33 @@ def _get_modes(config: dict) -> dict[str, ModeSpec]:
     }
 
 
-def get_all_mode_names() -> list[str]:
+def get_all_mode_names(config: dict) -> list[str]:
     """Get list of all available mode names (for CLI choices)."""
-    return ['ground_truth', 'proxy', 'proxy_ill_adjusted']
+    return list(_get_modes(config).keys())
+
+
+def get_mode_for_requirement(requirement: str, config: dict) -> str:
+    """
+    Get mode name from a behavior requirement.
+    
+    This allows organisms to determine their observation mode from their
+    behavior's requirements without hardcoding mode names.
+    
+    Args:
+        requirement: A behavior requirement like 'ground_truth' or 'proxy_metric'
+        config: Runtime config
+        
+    Returns:
+        Mode name to use (e.g., 'ground_truth', 'proxy')
+    """
+    modes = _get_modes(config)
+    
+    for mode_name, spec in modes.items():
+        if spec.behavior_requirement == requirement:
+            return mode_name
+    
+    # Default to ground_truth if unknown requirement
+    return 'ground_truth'
 
 
 @dataclass

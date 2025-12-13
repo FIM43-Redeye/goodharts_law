@@ -37,6 +37,7 @@ def test_config_has_required_sections():
     assert 'agents' in cfg
     assert 'visualization' in cfg
     assert 'brain_view' in cfg
+    assert 'training' in cfg  # Training hyperparameters
 
 
 def test_config_caching():
@@ -68,6 +69,7 @@ def test_convenience_accessors():
         get_visualization_config,
         get_brain_view_config,
         get_agents_list,
+        get_training_config,
     )
     
     assert 'width' in get_world_config()
@@ -76,6 +78,7 @@ def test_convenience_accessors():
     assert 'speed' in get_visualization_config()
     assert 'enabled' in get_brain_view_config()
     assert isinstance(get_agents_list(), list)
+    assert 'initial_food' in get_training_config()  # Curriculum value
 
 
 def test_default_config_values():
