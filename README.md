@@ -231,8 +231,6 @@ This simulation is a **toy model** for understanding real AI alignment failures:
 
 3. **Emergent Failure Modes**: Future phases aim to show agents *discovering* deceptive strategies, not just failing on fixed rules.
 
-For background on this work's connection to AI safety research, see `personal/intent.txt` (Anthropic Fellows Program context).
-
 ---
 
 ## License
