@@ -38,6 +38,7 @@ class RunState:
     policy_losses: list = field(default_factory=list)
     value_losses: list = field(default_factory=list)
     entropies: list = field(default_factory=list)
+    explained_variances: list = field(default_factory=list)  # Value function quality
     
     # Status
     is_running: bool = True
@@ -112,10 +113,14 @@ class TrainingDashboard:
                     run.rewards.append(data[1])
                 
                 elif update_type == 'ppo':
-                    # data: (policy_loss, value_loss, entropy, action_probs)
+                    # data: (policy_loss, value_loss, entropy, action_probs) or
+                    #       (policy_loss, value_loss, entropy, action_probs, explained_var)
                     run.policy_losses.append(data[0])
                     run.value_losses.append(data[1])
                     run.entropies.append(data[2])
+                    # Handle EV if present (new logs have it, old logs don't)
+                    if len(data) > 4:
+                        run.explained_variances.append(data[4])
                 
                 elif update_type == 'finished':
                     run.is_finished = True
@@ -145,7 +150,7 @@ class TrainingDashboard:
         
         # Layout: 1 row per run
         rows = self.n_runs
-        cols = 3 # Reward, Loss, Entropy
+        cols = 4  # Reward, Loss, Entropy, Explained Variance
         
         # Adjust height based on rows
         fig_height = 3 * rows + 1
@@ -207,6 +212,22 @@ class TrainingDashboard:
         
         self.axes[mode]['entropy'] = ax_ent
         self.line_artists[mode]['entropy'] = l_ent
+        
+        # 4. Explained Variance (Value function quality)
+        ax_ev = self.fig.add_subplot(gs[row_idx, 3])
+        ax_ev.set_title("Expl. Var.", fontsize=10, color='silver')
+        ax_ev.grid(True, alpha=0.15)
+        ax_ev.xaxis.set_major_locator(MaxNLocator(integer=True))
+        
+        # Reference line at 1.0 (perfect value prediction)
+        ax_ev.axhline(y=1.0, color='lime', linestyle='--', alpha=0.3, label='Perfect')
+        ax_ev.axhline(y=0.0, color='gray', linestyle=':', alpha=0.3)
+        ax_ev.set_ylim(-0.5, 1.1)  # EV can be negative if predictions are worse than mean
+        
+        l_ev, = ax_ev.plot([], [], 'y-', linewidth=1.5, alpha=0.9)
+        
+        self.axes[mode]['ev'] = ax_ev
+        self.line_artists[mode]['ev'] = l_ev
 
     def _create_controls(self):
         """Create simple control buttons."""
@@ -301,6 +322,14 @@ class TrainingDashboard:
                 axes['entropy'].set_xlim(0, len(x_data) + 5)
                 # Entropy Y is fixed 0..log(N) usually, but let's autoscale bottom slightly
                 axes['entropy'].set_ylim(0, np.log(self.n_actions)*1.1)
+            
+            # EXPLAINED VARIANCE (blank if no data from old logs)
+            if len(run.explained_variances) > 1:
+                y_data = self._smooth(list(run.explained_variances), alpha=0.9)
+                x_data = list(range(len(y_data)))
+                artists['ev'].set_data(x_data, y_data)
+                axes['ev'].set_xlim(0, len(x_data) + 5)
+                # Keep fixed Y limits for consistency
                 
         return []
 
@@ -377,7 +406,7 @@ def load_run_from_logs(log_prefix: str) -> RunState:
     else:
         print(f"   Warning: Episodes file not found: {episodes_path}")
     
-    # Load updates (losses, entropy)
+    # Load updates (losses, entropy, explained_variance)
     if os.path.exists(updates_path):
         with open(updates_path, 'r') as f:
             reader = csv.DictReader(f)
@@ -386,7 +415,11 @@ def load_run_from_logs(log_prefix: str) -> RunState:
                 run.value_losses.append(float(row['value_loss']))
                 run.entropies.append(float(row['entropy']))
                 run.total_steps = int(row['total_steps'])
-        print(f"   Loaded {len(run.policy_losses)} updates from {updates_path}")
+                # EV may not exist in old logs
+                if 'explained_variance' in row and row['explained_variance']:
+                    run.explained_variances.append(float(row['explained_variance']))
+        ev_status = f" ({len(run.explained_variances)} EV)" if run.explained_variances else ""
+        print(f"   Loaded {len(run.policy_losses)} updates from {updates_path}{ev_status}")
     else:
         print(f"   Warning: Updates file not found: {updates_path}")
     
@@ -457,7 +490,7 @@ def view_logs(log_prefixes: list[str], smoothing: float = 0.9):
     plt.style.use('dark_background')
     
     n_runs = len(runs)
-    fig, axes = plt.subplots(n_runs, 3, figsize=(14, 3 * n_runs + 1), squeeze=False)
+    fig, axes = plt.subplots(n_runs, 4, figsize=(16, 3 * n_runs + 1), squeeze=False)
     fig.suptitle("Training Log Viewer", fontsize=14, fontweight='bold', color='white')
     
     def smooth(data, alpha):
@@ -502,6 +535,18 @@ def view_logs(log_prefixes: list[str], smoothing: float = 0.9):
             ax.axhline(y=np.log(8), color='gray', linestyle='--', alpha=0.3, label='Max (8 actions)')
             ax.set_xlim(0, len(run.entropies))
             ax.set_ylim(0, np.log(8) * 1.1)
+        ax.grid(True, alpha=0.15)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        
+        # Explained Variance (may be empty for old logs)
+        ax = axes[i, 3]
+        ax.set_title("Expl. Var.", fontsize=10, color='silver')
+        ax.axhline(y=1.0, color='lime', linestyle='--', alpha=0.3)
+        ax.axhline(y=0.0, color='gray', linestyle=':', alpha=0.3)
+        ax.set_ylim(-0.5, 1.1)
+        if run.explained_variances:
+            ax.plot(smooth(run.explained_variances, smoothing), 'y-', linewidth=1, alpha=0.9)
+            ax.set_xlim(0, len(run.explained_variances))
         ax.grid(True, alpha=0.15)
         ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     

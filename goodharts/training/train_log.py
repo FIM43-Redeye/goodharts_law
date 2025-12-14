@@ -43,6 +43,7 @@ class UpdateLog:
     policy_loss: float
     value_loss: float
     entropy: float
+    explained_variance: float = 0.0  # How well value function predicts returns
     action_probs: list[float] = field(default_factory=list)
     timestamp: str = ""
     
@@ -59,17 +60,19 @@ class TrainingLogger:
     Designed for easy AI review of training progress.
     """
     
-    def __init__(self, mode: str, output_dir: str = "logs"):
+    def __init__(self, mode: str, output_dir: str = "logs", log_episodes: bool = True):
         """
         Initialize logger for a training run.
         
         Args:
             mode: Training mode name (e.g., 'ground_truth')
             output_dir: Directory to write logs to
+            log_episodes: If True, log per-episode data (batched). If False, skip episode logging.
         """
         self.mode = mode
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.log_episodes = log_episodes
         
         # Generate run ID
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -87,11 +90,16 @@ class TrainingLogger:
         self.hyperparams: dict[str, Any] = {}
         self.episode_rewards: list[float] = []  # Track rewards in memory for dashboard
         
+        # Batched episode logging buffer
+        self._episode_buffer: list[dict] = []
+        
         # Initialize CSV files with headers
-        self._init_csv(self.episodes_path, EpisodeLog)
+        if self.log_episodes:
+            self._init_csv(self.episodes_path, EpisodeLog)
         self._init_csv(self.updates_path, UpdateLog)
         
-        print(f"📝 Training logs: {self.output_dir}/{self.run_id}_*.csv")
+        log_mode = "batched" if self.log_episodes else "disabled"
+        print(f"Logging: {self.output_dir}/{self.run_id}_*.csv (episodes: {log_mode})")
     
     def _init_csv(self, path: Path, dataclass_type):
         """Initialize a CSV file with headers from a dataclass."""
@@ -113,8 +121,12 @@ class TrainingLogger:
     def log_episode(self, episode: int, reward: float, length: int, 
                     food_eaten: int, food_density: int, 
                     curriculum_progress: float, action_prob_std: float):
-        """Log an episode completion."""
+        """Log an episode completion (batched write)."""
         self.episode_count = episode
+        self.episode_rewards.append(reward)
+        
+        if not self.log_episodes:
+            return
         
         log = EpisodeLog(
             episode=episode,
@@ -126,16 +138,32 @@ class TrainingLogger:
             action_prob_std=action_prob_std,
         )
         
-        row = asdict(log)
-        row = asdict(log)
-        self._append_csv(self.episodes_path, row)
-        self.episode_rewards.append(reward)
+        self._episode_buffer.append(asdict(log))
+        
+        # Safety flush if buffer gets too large (prevents memory issues on very long runs)
+        if len(self._episode_buffer) >= 1000:
+            self._flush_episodes()
+    
+    def _flush_episodes(self):
+        """Write buffered episodes to CSV."""
+        if not self._episode_buffer or not self.log_episodes:
+            return
+        
+        with open(self.episodes_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self._episode_buffer[0].keys())
+            writer.writerows(self._episode_buffer)
+        
+        self._episode_buffer.clear()
     
     def log_update(self, update_num: int, total_steps: int,
                    policy_loss: float, value_loss: float, 
-                   entropy: float, action_probs: list[float]):
-        """Log a PPO update."""
+                   entropy: float, action_probs: list[float],
+                   explained_variance: float = 0.0):
+        """Log a PPO update (also flushes buffered episodes)."""
         self.update_count = update_num
+        
+        # Flush episode buffer on each update
+        self._flush_episodes()
         
         log = UpdateLog(
             update_num=update_num,
@@ -143,6 +171,7 @@ class TrainingLogger:
             policy_loss=policy_loss,
             value_loss=value_loss,
             entropy=entropy,
+            explained_variance=explained_variance,
             action_probs=action_probs,
         )
         
@@ -153,6 +182,9 @@ class TrainingLogger:
     
     def finalize(self, best_efficiency: float, final_model_path: str):
         """Write the final summary JSON."""
+        # Flush any remaining episodes
+        self._flush_episodes()
+        
         duration = (datetime.now() - self.start_time).total_seconds()
         
         summary = {

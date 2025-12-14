@@ -27,7 +27,7 @@ except ImportError:
 import threading
 import time
 import torch
-
+from torch.amp import autocast, GradScaler
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
@@ -181,6 +181,7 @@ def _train_ppo_core(
     dashboard = None,  # Dashboard for live visualization
     log_to_file: bool = True,
     log_dir: str = 'logs',
+    use_amp: bool = False,  # Automatic mixed precision (FP16)
 ):
     """
     Vectorized PPO training with GAE (Core Implementation).
@@ -246,10 +247,16 @@ def _train_ppo_core(
     checkpoint_interval = train_cfg.get('checkpoint_interval', 0)
     checkpoint_dir = os.path.dirname(output_path) or 'models'
     if checkpoint_interval > 0:
-        print(f"   Checkpoints: Every {checkpoint_interval} updates → {checkpoint_dir}/")
+        print(f"   Checkpoints: Every {checkpoint_interval} updates -> {checkpoint_dir}/")
+    
+    # AMP (Automatic Mixed Precision) setup
+    device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+    scaler = GradScaler(enabled=use_amp) if use_amp else None
+    amp_status = 'Enabled (FP16)' if use_amp else 'Disabled'
     
     print(f"   Brain: {brain_type} (hidden_size={policy.hidden_size})")
     print(f"   Entropy: {entropy_coef}, GAE Lambda: {gae_lambda}")
+    print(f"   AMP: {amp_status}")
     
     # Initialize logging
     logger = None
@@ -316,14 +323,15 @@ def _train_ppo_core(
         # Get actions and values from policy
         with torch.no_grad():
             states_t = torch.from_numpy(states).float().to(device)
-            logits = policy(states_t)
-            features = policy.get_features(states_t)
-            values = value_head(features).squeeze().cpu().numpy() # Get value estimate
-            
-            dist = Categorical(logits=logits)
-            actions = dist.sample()
-            log_probs = dist.log_prob(actions)
-            action_probs = F.softmax(logits, dim=1).cpu().numpy()
+            with autocast(device_type=device_type, enabled=use_amp):
+                logits = policy(states_t)
+                features = policy.get_features(states_t)
+                values = value_head(features).squeeze().cpu().numpy() # Get value estimate
+                
+                dist = Categorical(logits=logits)
+                actions = dist.sample()
+                log_probs = dist.log_prob(actions)
+                action_probs = F.softmax(logits, dim=1).cpu().numpy()
         
         profiler.tick("Inference")
         actions_np = actions.cpu().numpy()
@@ -377,7 +385,7 @@ def _train_ppo_core(
         # Store experience
         states_buffer.append(states)
         actions_buffer.append(actions_np)
-        log_probs_buffer.append(log_probs.cpu().numpy())
+        log_probs_buffer.append(log_probs.detach())  # Keep on GPU, defer .cpu() to update phase
         rewards_buffer.append(total_rewards) # Use shaped rewards for training
         dones_buffer.append(dones)
         values_buffer.append(values)
@@ -467,7 +475,7 @@ def _train_ppo_core(
             # Flatten for update - keep as NumPy arrays (no .tolist()!)
             all_states = np.concatenate(states_buffer, axis=0)  # (steps*envs, ...)
             all_actions = np.concatenate(actions_buffer, axis=0)
-            all_log_probs = np.concatenate(log_probs_buffer, axis=0)
+            all_log_probs = torch.cat(log_probs_buffer, dim=0).cpu().numpy()  # GPU->CPU once
             all_returns = returns.flatten()
             all_advantages = advantages.flatten()
             all_old_values = np.stack(values_buffer).flatten()
@@ -483,13 +491,15 @@ def _train_ppo_core(
                 entropy_coef=entropy_coef, value_coef=value_coef,
                 returns=all_returns,
                 advantages=all_advantages,
-                old_values=all_old_values
+                old_values=all_old_values,
+                scaler=scaler,
+                device_type=device_type,
             )
             profiler.tick("PPO Update")
             
             update_count += 1
 
-            policy_loss, value_loss, entropy = losses
+            policy_loss, value_loss, entropy, explained_var = losses
             
             # Clear buffers
             states_buffer = []
@@ -506,6 +516,7 @@ def _train_ppo_core(
                     policy_loss=policy_loss,
                     value_loss=value_loss,
                     entropy=entropy,
+                    explained_variance=explained_var,
                     action_probs=action_probs[0].tolist()
                 )
             
@@ -525,7 +536,7 @@ def _train_ppo_core(
                 elif current_reward == float('-inf'):
                     current_reward = 0.0  # Default to 0 if no episodes finished yet
 
-                dashboard.update(mode, 'ppo', (policy_loss, value_loss, entropy, action_probs[0]))
+                dashboard.update(mode, 'ppo', (policy_loss, value_loss, entropy, action_probs[0], explained_var))
                 dashboard.update(mode, 'episode', (episode_count, current_reward, 500, 0, vec_env.initial_food))
             
             if dashboard:
@@ -584,7 +595,9 @@ def _ppo_update(
     value_coef: float = 0.5, 
     returns: np.ndarray = None,
     advantages: np.ndarray = None,
-    old_values: np.ndarray = None
+    old_values: np.ndarray = None,
+    scaler: GradScaler = None,
+    device_type: str = 'cuda',
 ):
     """
     Perform PPO update on collected experience.
@@ -596,7 +609,11 @@ def _ppo_update(
         returns: Computed returns (rewards-to-go), shape (batch,)
         advantages: GAE advantages, shape (batch,)
         old_values: Value estimates from collection, shape (batch,)
+        scaler: GradScaler for AMP (None if disabled)
+        device_type: 'cuda' or 'cpu' for autocast
     """
+    use_amp = scaler is not None
+    
     # Convert NumPy arrays to tensors efficiently (from_numpy is zero-copy when possible)
     old_states = torch.from_numpy(states).float().to(device)
     old_actions = torch.from_numpy(actions).long().to(device)
@@ -614,46 +631,67 @@ def _ppo_update(
     final_entropy = 0.0
     
     for _ in range(k_epochs):
-        logits = policy(old_states)
-        features = policy.get_features(old_states)
-        values = value_head(features).squeeze()
-        
-        dist = Categorical(logits=logits)
-        new_log_probs = dist.log_prob(old_actions)
-        entropy = dist.entropy()
-        
-        # Ratio and clipped surrogate
-        ratios = torch.exp(new_log_probs - old_log_probs)
-        
-        surr1 = ratios * advantages_t
-        surr2 = torch.clamp(ratios, 1 - eps_clip, 1 + eps_clip) * advantages_t
-        
-        policy_loss = -torch.min(surr1, surr2).mean()
-        
-        # Value Loss with Clipping
-        if old_values_t is not None:
-            v_clip = old_values_t + torch.clamp(values - old_values_t, -eps_clip, eps_clip)
-            v_loss1 = F.mse_loss(values, returns_t)
-            v_loss2 = F.mse_loss(v_clip, returns_t)
-            value_loss = torch.max(v_loss1, v_loss2)
-        else:
-            value_loss = F.mse_loss(values, returns_t)
+        with autocast(device_type=device_type, enabled=use_amp):
+            logits = policy(old_states)
+            features = policy.get_features(old_states)
+            values = value_head(features).squeeze()
             
-        entropy_bonus = entropy.mean()
+            dist = Categorical(logits=logits)
+            new_log_probs = dist.log_prob(old_actions)
+            entropy = dist.entropy()
+            
+            # Ratio and clipped surrogate
+            ratios = torch.exp(new_log_probs - old_log_probs)
+            
+            surr1 = ratios * advantages_t
+            surr2 = torch.clamp(ratios, 1 - eps_clip, 1 + eps_clip) * advantages_t
+            
+            policy_loss = -torch.min(surr1, surr2).mean()
+            
+            # Value Loss with Clipping
+            if old_values_t is not None:
+                v_clip = old_values_t + torch.clamp(values - old_values_t, -eps_clip, eps_clip)
+                v_loss1 = F.mse_loss(values, returns_t)
+                v_loss2 = F.mse_loss(v_clip, returns_t)
+                value_loss = torch.max(v_loss1, v_loss2)
+            else:
+                value_loss = F.mse_loss(values, returns_t)
+                
+            entropy_bonus = entropy.mean()
+            
+            loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus
         
-        loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus
-        
+        # Backward pass (outside autocast)
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
-        torch.nn.utils.clip_grad_norm_(value_head.parameters(), 0.5)
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(value_head.parameters(), 0.5)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(value_head.parameters(), 0.5)
+            optimizer.step()
 
         final_policy_loss = policy_loss.item()
         final_value_loss = value_loss.item()
         final_entropy = entropy_bonus.item()
     
-    return final_policy_loss, final_value_loss, final_entropy
+    # Compute explained variance (how well value function predicts returns)
+    # EV = 1 - Var(returns - values) / Var(returns)
+    with torch.no_grad():
+        # Use old_values from rollout (before optimization)
+        var_returns = returns_t.var()
+        if var_returns > 1e-8:
+            explained_var = 1 - (returns_t - old_values_t).var() / var_returns
+            explained_var = explained_var.item()
+        else:
+            explained_var = 0.0  # Undefined if no variance in returns
+    
+    return final_policy_loss, final_value_loss, final_entropy, explained_var
 
 
 if __name__ == '__main__':
@@ -691,11 +729,31 @@ if __name__ == '__main__':
                         help='Train modes sequentially (saves VRAM for high n_envs)')
     parser.add_argument('--n-envs', type=int, default=64,
                         help='Number of parallel environments')
+    parser.add_argument('--use-amp', action='store_true', default=None,
+                        help='Enable automatic mixed precision (FP16) training')
+    parser.add_argument('--no-amp', action='store_true',
+                        help='Disable automatic mixed precision')
     args = parser.parse_args()
     
     # Get training config
     train_cfg = get_training_config()
     steps_per_env = train_cfg.get('steps_per_env', 128)
+    
+    # Determine AMP setting: CLI overrides config
+    # Config can be true/false/"auto", CLI --use-amp or --no-amp override
+    if args.no_amp:
+        use_amp = False
+    elif args.use_amp:
+        use_amp = True
+    else:
+        # Get from config (default: 'auto')
+        amp_cfg = train_cfg.get('use_amp', 'auto')
+        if amp_cfg == 'auto':
+            # Auto = probe device for actual AMP support (result is cached)
+            from goodharts.utils.device import get_amp_support
+            use_amp = get_amp_support(verbose=True)
+        else:
+            use_amp = bool(amp_cfg)
     
     # Determine timesteps from either --timesteps or --updates
     if args.updates is not None:
@@ -735,6 +793,7 @@ if __name__ == '__main__':
                         output_path=output_path,
                         dashboard=dashboard,
                         log_to_file=True,
+                        use_amp=use_amp,
                     )
             
             t = threading.Thread(target=sequential_training, daemon=True)
@@ -762,6 +821,7 @@ if __name__ == '__main__':
                         'output_path': output_path,
                         'dashboard': dashboard,
                         'log_to_file': True,
+                        'use_amp': use_amp,
                     },
                     daemon=True
                 )
@@ -793,6 +853,7 @@ if __name__ == '__main__':
                         'entropy_coef': entropy_coef,
                         'output_path': output_path,
                         'log_to_file': True,
+                        'use_amp': use_amp,
                     }
                 )
                 threads.append(t)
@@ -814,4 +875,5 @@ if __name__ == '__main__':
                     entropy_coef=entropy_coef,
                     output_path=output_path,
                     log_to_file=len(modes_to_train) > 1,  # Log to file if training multiple
+                    use_amp=use_amp,
                 )
