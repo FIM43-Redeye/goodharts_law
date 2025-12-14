@@ -250,17 +250,32 @@ The simulation tracks:
 ### Train Models
 
 ```bash
-# Train all models with PPO (takes ~5-10 min with GPU)
-python -m goodharts.training.train_ppo --mode all --episodes 500
-
-# Train a specific mode
+# Standard training (episode-based)
 python -m goodharts.training.train_ppo --mode ground_truth --episodes 500
 
-# With live visualization (opens a dashboard window)
+# Train all modes in parallel
+python -m goodharts.training.train_ppo --mode all --episodes 500
+
+# With live visualization
 python -m goodharts.training.train_ppo --mode ground_truth --visualize
 
-# Adjust entropy coefficient (lower = more opinionated actions)
-python -m goodharts.training.train_ppo --mode ground_truth --entropy 0.0005
+# With unified dashboard (all modes in one window)
+python -m goodharts.training.train_ppo --mode all --dashboard
+```
+
+### Vectorized Training (Fast!)
+
+For rapid iteration, use vectorized training which runs 64 parallel environments:
+
+```bash
+# Fast vectorized training (~6,000 steps/sec, 50k steps in ~8 seconds)
+python -m goodharts.training.train_ppo --vec --mode ground_truth --timesteps 100000
+
+# With more parallel environments
+python -m goodharts.training.train_ppo --vec --n-envs 128 --timesteps 200000
+
+# Train all modes sequentially with vectorized envs
+python -m goodharts.training.train_ppo --vec --mode all --timesteps 100000
 ```
 
 ### Training Visualization
@@ -279,11 +294,13 @@ This helps diagnose training problems like:
 Training configuration is in `config.default.toml` under `[training]`:
 ```toml
 [training]
-initial_food = 2500     # Curriculum: start easy
-final_food = 50         # Curriculum: end hard
-curriculum_fraction = 0.9
+initial_food = 500      # Curriculum: start moderate
+final_food = 200        # Curriculum: end sparse but learnable
+curriculum_fraction = 0.7
 poison_count = 30
 steps_per_episode = 500
+reward_scale = 10.0     # Amplify reward signal
+entropy_coef = 0.0      # Allow policy specialization
 ```
 
 ### Verify Models

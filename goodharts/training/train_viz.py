@@ -108,6 +108,7 @@ class TrainingVisualizer:
         # Control
         self.running = False
         self._thread = None
+        self._closed = False  # Track if window was closed
     
     def start(self):
         """Start the visualization in a background thread."""
@@ -119,10 +120,18 @@ class TrainingVisualizer:
         self._thread.start()
     
     def stop(self):
-        """Stop the visualization."""
+        """Stop the visualization safely."""
         self.running = False
-        if self.fig:
-            plt.close(self.fig)
+        self._closed = True
+        try:
+            if self.fig:
+                plt.close(self.fig)
+        except Exception:
+            pass  # Ignore errors during cleanup
+    
+    def is_active(self) -> bool:
+        """Check if the visualizer is still running."""
+        return self.running and not self._closed
     
     def update(self, **kwargs):
         """
@@ -135,7 +144,12 @@ class TrainingVisualizer:
             visualizer.update(episode=(reward, length, food, progress))
             visualizer.update(ppo=(policy_loss, value_loss, entropy, action_probs))
         """
-        self.update_queue.put(kwargs)
+        if self._closed:
+            return  # Silently ignore updates after close
+        try:
+            self.update_queue.put_nowait(kwargs)
+        except Exception:
+            pass  # Ignore queue errors
     
     def _process_updates(self):
         """Process all pending updates from the queue."""
@@ -392,19 +406,38 @@ Best Eff: {stats.best_efficiency:.2f}"""
     
     def _run_loop(self):
         """Main visualization loop (runs in background thread)."""
-        plt.ion()  # Interactive mode
-        self._create_figure()
+        try:
+            import matplotlib
+            matplotlib.use('TkAgg')  # Ensure we're using TkAgg backend
+        except Exception:
+            pass
         
-        # Animation with manual updates
-        self.ani = FuncAnimation(
-            self.fig, 
-            self._update_plots,
-            interval=200,  # Update every 200ms
-            blit=False,
-            cache_frame_data=False
-        )
-        
-        plt.show(block=True)
+        try:
+            plt.ion()  # Interactive mode
+            self._create_figure()
+            
+            # Handle window close event
+            def on_close(event):
+                self._closed = True
+                self.running = False
+            
+            self.fig.canvas.mpl_connect('close_event', on_close)
+            
+            # Animation with manual updates
+            self.ani = FuncAnimation(
+                self.fig, 
+                self._update_plots,
+                interval=200,  # Update every 200ms
+                blit=False,
+                cache_frame_data=False
+            )
+            
+            plt.show(block=True)
+        except Exception as e:
+            print(f"Visualization error: {e}")
+        finally:
+            self._closed = True
+            self.running = False
 
 
 def create_training_visualizer(mode: str, n_actions: int = 8) -> TrainingVisualizer:
