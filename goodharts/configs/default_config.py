@@ -64,7 +64,7 @@ class CellType:
     EMPTY = CellTypeInfo(0, "Empty", color=(26, 26, 46))
     WALL = CellTypeInfo(1, "Wall", color=(74, 74, 74))
     FOOD = CellTypeInfo(2, "Food", color=(22, 199, 154), interestingness=1.0, energy_reward=15.0)
-    POISON = CellTypeInfo(3, "Poison", color=(255, 107, 107), interestingness=0.9, energy_penalty=50.0)
+    POISON = CellTypeInfo(3, "Poison", color=(255, 107, 107), interestingness=0.9, energy_penalty=150.0)
     # Agent types (visible in observations)
     PREY = CellTypeInfo(4, "Prey", color=(0, 255, 255), interestingness=0.3)
     PREDATOR = CellTypeInfo(5, "Predator", color=(255, 0, 0), interestingness=1.0, energy_reward=25.0)  
@@ -103,15 +103,16 @@ class CellType:
         return len(cls.all_types())
 
 # Simulation Physics / Hyperparameters
+# These should match config.default.toml
 ENERGY_START = 50.0
-ENERGY_MOVE_COST = 0.1  # Base cost per unit distance
-MOVE_COST_EXPONENT = 1.5  # Nonlinear scaling: cost = distance^exponent * base_cost
-MAX_MOVE_DISTANCE = 3  # Speed cap: organisms can't move more than this per step
+ENERGY_MOVE_COST = 0.01          # Matches config.default.toml (was 0.1)
+MOVE_COST_EXPONENT = 1.5
+MAX_MOVE_DISTANCE = 3
 
 # Grid Settings
 GRID_WIDTH = 100
 GRID_HEIGHT = 100
-GRID_FOOD_INIT = 50
+GRID_FOOD_INIT = 500             # Matches config.default.toml (resources.food)
 GRID_POISON_INIT = 10
 AGENTS_SETUP = [
     {'behavior_class': 'OmniscientSeeker', 'count': 5},
@@ -122,7 +123,26 @@ AGENTS_SETUP = [
 AGENT_VIEW_RANGE = 5
 
 # World Topology
-WORLD_LOOP = False  # If True, world wraps (toroidal); if False, has edges
+WORLD_LOOP = True                # Matches config.default.toml (world.loop)
+
+# Training Defaults (Matches config.default.toml [training])
+TRAINING_DEFAULTS = {
+    'initial_food': 200,
+    'final_food': 50,
+    'curriculum_fraction': 0.7,
+    'poison_count': 30,
+    'steps_per_episode': 500,
+    'learning_rate': 0.001,
+    'gamma': 0.99,
+    'eps_clip': 0.2,
+    'k_epochs': 4,
+    'steps_per_env': 128,
+    'reward_scale': 0.1,
+    'entropy_coef': 0.02,
+    'shaping_food_attract': 0.5,
+    'shaping_poison_repel': 0.3,
+    'enable_shaping': True
+}
 
 
 def get_config(config_path: str | None = None):
@@ -172,21 +192,21 @@ def get_config(config_path: str | None = None):
     # Build runtime config
     config = {
         # World
-        'GRID_WIDTH': world.get('width', 100),
-        'GRID_HEIGHT': world.get('height', 100),
-        'WORLD_LOOP': world.get('loop', False),
+        'GRID_WIDTH': world.get('width', GRID_WIDTH),
+        'GRID_HEIGHT': world.get('height', GRID_HEIGHT),
+        'WORLD_LOOP': world.get('loop', WORLD_LOOP),
         
         # Resources
-        'GRID_FOOD_INIT': resources.get('food', 50),
-        'GRID_POISON_INIT': resources.get('poison', 10),
+        'GRID_FOOD_INIT': resources.get('food', GRID_FOOD_INIT),
+        'GRID_POISON_INIT': resources.get('poison', GRID_POISON_INIT),
         'RESPAWN_RESOURCES': resources.get('respawn', True),
         
         # Agent physics
-        'ENERGY_START': agent_cfg.get('energy_start', 50.0),
-        'ENERGY_MOVE_COST': agent_cfg.get('energy_move_cost', 0.1),
-        'MOVE_COST_EXPONENT': agent_cfg.get('move_cost_exponent', 1.5),
-        'MAX_MOVE_DISTANCE': agent_cfg.get('max_move_distance', 3),
-        'AGENT_VIEW_RANGE': agent_cfg.get('view_range', 5),
+        'ENERGY_START': agent_cfg.get('energy_start', ENERGY_START),
+        'ENERGY_MOVE_COST': agent_cfg.get('energy_move_cost', ENERGY_MOVE_COST),
+        'MOVE_COST_EXPONENT': agent_cfg.get('move_cost_exponent', MOVE_COST_EXPONENT),
+        'MAX_MOVE_DISTANCE': agent_cfg.get('max_move_distance', MAX_MOVE_DISTANCE),
+        'AGENT_VIEW_RANGE': agent_cfg.get('view_range', AGENT_VIEW_RANGE),
         
         # Agents
         'AGENTS_SETUP': agents_setup,

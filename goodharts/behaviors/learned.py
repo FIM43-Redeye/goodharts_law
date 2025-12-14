@@ -25,7 +25,7 @@ class LearnedBehavior(BehaviorStrategy):
     
     def __init__(self, mode: str = 'ground_truth', model_path: str | None = None, 
                  epsilon: float = 0.0, max_move_distance: int = 1,
-                 temperature: float = 1.0):
+                 temperature: float = 1.0, name: str = "LearnedBehavior"):
         """
         Args:
             mode: 'ground_truth' or 'proxy' - determines what the agent can see
@@ -40,6 +40,7 @@ class LearnedBehavior(BehaviorStrategy):
         if mode not in ('ground_truth', 'proxy'):
             raise ValueError(f"mode must be 'ground_truth' or 'proxy', got '{mode}'")
         
+        self.name = name
         self._mode = mode
         self.model_path = model_path
         self.epsilon = epsilon
@@ -221,6 +222,12 @@ class LearnedBehavior(BehaviorStrategy):
             return self._actions[idx]
         return (0, 1)
 
+    def __str__(self):
+        return self.name
+
+    def __repr__(self):
+        return f"<{self.name} mode={self._mode}>"
+
 
 # =============================================================================
 # PRESET FACTORY (preferred way to create learned behaviors)
@@ -230,10 +237,12 @@ class LearnedBehavior(BehaviorStrategy):
 LEARNED_PRESETS: dict[str, dict] = {
     'ground_truth': {
         'mode': 'ground_truth',
+        'model_path': 'models/ppo_ground_truth.pth',
         'color': (0, 200, 255),  # Light cyan
     },
     'proxy': {
         'mode': 'proxy',
+        'model_path': 'models/ppo_proxy.pth',
         'color': (255, 100, 255),  # Light magenta
     },
     'proxy_ill_adjusted': {
@@ -269,80 +278,8 @@ def create_learned_behavior(preset: str = 'ground_truth', **kwargs) -> LearnedBe
     color = config.pop('color', None)
     config.update(kwargs)
     
-    behavior = LearnedBehavior(**config)
+    # Pass preset name as name
+    behavior = LearnedBehavior(name=preset, **config)
     if color:
         behavior._color = color
     return behavior
-
-
-# =============================================================================
-# BACKWARDS COMPATIBILITY ONLY - prefer create_learned_behavior() instead
-# =============================================================================
-
-class LearnedGroundTruth(LearnedBehavior):
-    """
-    Learned behavior that sees true cell types.
-    
-    .. deprecated::
-        Use create_learned_behavior('ground_truth') instead.
-    """
-    _color = (0, 200, 255)  # Light cyan
-    
-    def __init__(self, model_path: str | None = None, epsilon: float = 0.0, 
-                 max_move_distance: int = 1, temperature: float = 0.5):
-        super().__init__(
-            mode='ground_truth', 
-            model_path=model_path, 
-            epsilon=epsilon,
-            max_move_distance=max_move_distance,
-            temperature=temperature
-        )
-
-
-class LearnedProxy(LearnedBehavior):
-    """
-    Learned behavior that only sees proxy/interestingness signals.
-    
-    .. deprecated::
-        Use create_learned_behavior('proxy') instead.
-    """
-    _color = (255, 100, 255)  # Light magenta
-    
-    def __init__(self, model_path: str | None = None, epsilon: float = 0.0,
-                 max_move_distance: int = 1, temperature: float = 0.5):
-        super().__init__(
-            mode='proxy', 
-            model_path=model_path, 
-            epsilon=epsilon,
-            max_move_distance=max_move_distance,
-            temperature=temperature
-        )
-
-
-class LearnedProxyIllAdjusted(LearnedBehavior):
-    """
-    Learned behavior trained with ill-adjusted proxy rewards.
-    
-    During training, this agent was rewarded for touching interesting cells
-    (regardless of whether they're food or poison). It sees the same proxy
-    observations as LearnedProxy but learned a different policy due to
-    the reward misalignment - a demonstration of Goodhart's Law.
-    
-    .. deprecated::
-        Use create_learned_behavior('proxy_ill_adjusted') instead.
-    """
-    _color = (138, 43, 226)  # Blue-violet
-    
-    def __init__(self, model_path: str | None = None, epsilon: float = 0.0,
-                 max_move_distance: int = 1, temperature: float = 0.5):
-        if model_path is None:
-            model_path = 'models/ppo_proxy_ill_adjusted.pth'
-        super().__init__(
-            mode='proxy',
-            model_path=model_path, 
-            epsilon=epsilon,
-            max_move_distance=max_move_distance,
-            temperature=temperature
-        )
-
-

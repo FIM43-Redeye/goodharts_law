@@ -45,8 +45,8 @@ def parse_args():
                         help='Path to TOML config file (CLI flags override config)')
     # Brain-view specific options (CLI overrides)
     parser.add_argument('--agent', type=str, default=None,
-                        choices=['LearnedGroundTruth', 'LearnedProxy', 'LearnedProxyIllAdjusted'],
-                        help='Agent type for brain-view')
+                        choices=['ground_truth', 'proxy', 'proxy_ill_adjusted'],
+                        help='Agent type for brain-view (preset name)')
     parser.add_argument('--model', type=str, default=None,
                         help='Path to model weights')
     parser.add_argument('--food', type=int, default=None,
@@ -107,8 +107,8 @@ def setup_config(args):
     if args.brain_view:
         if args.agent is None:
             print("ERROR: brain_view requires agent_type")
-            print("  Set in config: [brain_view] agent_type = \"LearnedGroundTruth\"")
-            print("  Or use CLI: --brain-view --agent LearnedGroundTruth")
+            print("  Set in config: [brain_view] agent_type = \"ground_truth\"")
+            print("  Or use CLI: --brain-view --agent ground_truth")
             import sys
             sys.exit(1)
         
@@ -128,13 +128,32 @@ def setup_config(args):
             status_parts.append("energy=frozen")
         print(" | ".join(status_parts))
     elif args.learned:
+        # Load EVERYTHING: all hardcoded behaviors + all learned presets
+        from goodharts.behaviors import list_behavior_names, LEARNED_PRESETS, BehaviorStrategy, LearnedBehavior
+        
         count = args.agents or 5
-        config['AGENTS_SETUP'] = [
-            {'behavior_class': 'LearnedGroundTruth', 'count': count},
-            {'behavior_class': 'LearnedProxy', 'count': count},
-            {'behavior_class': 'LearnedProxyIllAdjusted', 'count': count},
-        ]
-        print("Using LEARNED agents (CNN-based)")
+        config['AGENTS_SETUP'] = []
+        
+        # 1. Hardcoded behaviors from registry
+        # Filter out base classes if they appear
+        skip_list = {'BehaviorStrategy', 'LearnedBehavior', 'Agent'}
+        for name in list_behavior_names():
+            if name not in skip_list and name not in LEARNED_PRESETS: # Presets handled separately
+                 # Also make sure it's valid to be instantiated directly (not abstract)
+                 config['AGENTS_SETUP'].append({
+                     'behavior_class': name,
+                     'count': count
+                 })
+        
+        # 2. Learned presets
+        for preset_name in LEARNED_PRESETS.keys():
+            config['AGENTS_SETUP'].append({
+                'behavior_class': preset_name,
+                'count': count
+            })
+            
+        print(f"Using ALL agents (Hardcoded + Learned Presets)")
+        print(f"Agent types: {len(config['AGENTS_SETUP'])}")
     
     return config
 
