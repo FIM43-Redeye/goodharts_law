@@ -38,18 +38,20 @@ def _get_modes(config: dict) -> dict[str, ModeSpec]:
     
     # Proxy channels: empty, wall, then interestingness repeated to match count
     proxy_channels = ['cell_empty', 'cell_wall'] + ['interestingness'] * (gt_count - 2)
-    
+    # We actually want to freeze energy for EVERYBODY so training always runs to time limit and reward accrues nicely
     return {
         'ground_truth': ModeSpec(
             name='ground_truth',
             observation_channels=gt_channels,
             reward_type='energy_delta',
+            freeze_energy_in_training=True,
             behavior_requirement='ground_truth',
         ),
         'proxy': ModeSpec(
             name='proxy',
             observation_channels=proxy_channels,
             reward_type='energy_delta',
+            freeze_energy_in_training=True,
             behavior_requirement='proxy_metric',
         ),
         'proxy_ill_adjusted': ModeSpec(
