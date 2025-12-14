@@ -3,9 +3,10 @@ Simulation orchestrator for Goodhart's Law demonstration.
 
 Manages the world, agents, and simulation loop.
 """
+from goodharts.behaviors.learned import LEARNED_PRESETS
 from goodharts.environments import create_world
 from goodharts.agents import Organism
-from goodharts.behaviors import get_behavior
+from goodharts.behaviors import get_behavior, create_learned_behavior
 from goodharts.utils.logging_config import get_logger
 import numpy as np
 
@@ -38,29 +39,53 @@ class Simulation:
             b_class_name = setup['behavior_class']
             count = setup['count']
             
-            # Use registry for behavior lookup (auto-discovery)
-            BehaviorClass = get_behavior(b_class_name)
+            # Check if it's a learned behavior preset
+            if b_class_name in LEARNED_PRESETS:
+                BehaviorClass = None  # Not used for presets
+                
+                # Extract optional behavior kwargs from setup
+                behavior_kwargs = {k: v for k, v in setup.items() 
+                                 if k not in ('behavior_class', 'count')}
+                
+                for _ in range(count):
+                    randx = np.random.randint(0, self.world.width)
+                    randy = np.random.randint(0, self.world.height)
+                    
+                    # Create behavior using factory
+                    behavior = create_learned_behavior(b_class_name, **behavior_kwargs)
+                    
+                    self.agents.append(Organism(
+                        randx, randy, 
+                        config['ENERGY_START'], 
+                        config['AGENT_VIEW_RANGE'], 
+                        self.world, behavior, config
+                    ))
             
-            # Extract optional behavior kwargs from setup
-            behavior_kwargs = {k: v for k, v in setup.items() 
-                             if k not in ('behavior_class', 'count')}
-            
-            for _ in range(count):
-                randx = np.random.randint(0, self.world.width)
-                randy = np.random.randint(0, self.world.height)
-                behavior = BehaviorClass(**behavior_kwargs)
-                self.agents.append(Organism(
-                    randx, randy, 
-                    config['ENERGY_START'], 
-                    config['AGENT_VIEW_RANGE'], 
-                    self.world, behavior, config
-                ))
+            # Otherwise treat as class name (legacy / hardcoded behaviors)
+            else:
+                # Use registry for behavior lookup (auto-discovery)
+                BehaviorClass = get_behavior(b_class_name)
+                
+                # Extract optional behavior kwargs from setup
+                behavior_kwargs = {k: v for k, v in setup.items() 
+                                 if k not in ('behavior_class', 'count')}
+                
+                for _ in range(count):
+                    randx = np.random.randint(0, self.world.width)
+                    randy = np.random.randint(0, self.world.height)
+                    behavior = BehaviorClass(**behavior_kwargs)
+                    self.agents.append(Organism(
+                        randx, randy, 
+                        config['ENERGY_START'], 
+                        config['AGENT_VIEW_RANGE'], 
+                        self.world, behavior, config
+                    ))
         
         self.step_count = 0
         self.stats = {
             'deaths': [],  # list of {'step': int, 'id': int, 'reason': str}
             'energy_history': {a.id: [] for a in self.agents},
-            'heatmap': np.zeros((self.world.height, self.world.width)),
+            'heatmap': {'all': np.zeros((self.world.height, self.world.width))},
             'suspicion_history': {a.id: [] for a in self.agents}
         }
 
@@ -83,10 +108,16 @@ class Simulation:
         
         for agent in self.agents[:]:
             if not agent.alive:
+                # Use str(behavior) which maps to name for LearnedBehavior
+                b_name = str(agent.behavior)
+                if b_name.startswith('<'):
+                    b_name = type(agent.behavior).__name__
+                    
                 self.stats['deaths'].append({
                     'step': self.step_count,
                     'id': agent.id,
-                    'reason': agent.death_reason
+                    'reason': agent.death_reason,
+                    'behavior': b_name
                 })
                 logger.debug(f"Agent {agent.id} died from {agent.death_reason}")
                 self.agents.remove(agent)
@@ -105,7 +136,18 @@ class Simulation:
             
             # Update Heatmap
             if 0 <= agent.y < self.world.height and 0 <= agent.x < self.world.width:
-                self.stats['heatmap'][agent.y, agent.x] += 1
+                # Global heatmap
+                self.stats['heatmap']['all'][agent.y, agent.x] += 1
+                
+                # Per-behavior heatmap (initialize lazily)
+                # Use str(behavior) which maps to name for LearnedBehavior
+                b_name = str(agent.behavior)
+                if b_name.startswith('<'):
+                    b_name = type(agent.behavior).__name__
+                    
+                if b_name not in self.stats['heatmap']:
+                    self.stats['heatmap'][b_name] = np.zeros((self.world.height, self.world.width))
+                self.stats['heatmap'][b_name][agent.y, agent.x] += 1
         
         # Clear agent markers (agents move, so positions change)
         for x, y, cell_value in agent_positions:

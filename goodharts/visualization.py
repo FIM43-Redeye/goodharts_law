@@ -7,6 +7,7 @@ Separated from main.py for cleaner organization.
 import matplotlib.pyplot as plt
 from matplotlib import colors
 from matplotlib.patches import Patch
+from matplotlib.widgets import RadioButtons
 import numpy as np
 
 from goodharts.configs.default_config import CellType
@@ -67,9 +68,15 @@ def build_legend_elements(sim) -> list[Patch]:
     ]
     
     # Add unique behavior types from current agents
+    # Add unique behavior types from current agents
     seen_behaviors = set()
     for agent in sim.agents:
-        behavior_name = type(agent.behavior).__name__
+        # Use str(behavior) which maps to behavior.name for LearnedBehavior
+        # Fallback to class name for others if they don't override __str__
+        behavior_name = str(agent.behavior)
+        if behavior_name.startswith('<'): # Fallback for default object repr
+            behavior_name = type(agent.behavior).__name__
+            
         if behavior_name not in seen_behaviors:
             seen_behaviors.add(behavior_name)
             color = '#%02x%02x%02x' % agent.behavior.color
@@ -84,23 +91,27 @@ def create_standard_layout(sim):
     
     Layout:
     - Top-left: World view with agents
-    - Top-right: Energy over time
-    - Bottom-left: Activity heatmap
-    - Bottom-right: Death statistics
+    - Top-right: Energy over time (Dynamic lines per behavior)
+    - Bottom-left: Activity heatmap (With RadioButtons)
+    - Bottom-right: Death statistics (Stacked bars)
     
     Returns:
-        Dict with figure, axes, and image/line objects for updates.
+    Dict with figure, axes, and image/line objects for updates.
     """
-    fig = plt.figure(figsize=(14, 10))
+    # Create figure with extra space on left for radio buttons
+    fig = plt.figure(figsize=(15, 10))
     fig.suptitle("Goodhart's Law Simulation", fontsize=14, fontweight='bold')
-    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
+    
+    # Grid: 2 rows, 2 columns.
+    # We'll use a manually placed axes for radio buttons later
+    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3, left=0.15)
     
     ax_sim = fig.add_subplot(gs[0, 0])
     ax_energy = fig.add_subplot(gs[0, 1])
     ax_heatmap = fig.add_subplot(gs[1, 0])
     ax_stats = fig.add_subplot(gs[1, 1])
     
-    # Simulation view - use RGB rendering
+    # 1. Simulation view
     grid = sim.get_render_grid()
     agent_positions = sim.get_agent_positions()
     rgb_grid = render_with_agents(grid, agent_positions, sim.world.width, sim.world.height)
@@ -108,42 +119,88 @@ def create_standard_layout(sim):
     ax_sim.set_title("World View")
     ax_sim.axis('off')
     
-    # Legend for agent types
+    # Legend
     legend_elements = build_legend_elements(sim)
     ax_sim.legend(handles=legend_elements, loc='upper right', fontsize=8)
     
-    # Energy plot
+    # 2. Energy plot (Dynamic lines)
     ax_energy.set_title("Average Energy Over Time")
     ax_energy.set_xlabel("Step")
     ax_energy.set_ylabel("Energy")
-    line_gt, = ax_energy.plot([], [], label='Ground-Truth', color='#00d9ff', linewidth=2)
-    line_proxy, = ax_energy.plot([], [], label='Proxy', color='#ff00ff', linewidth=2)
-    ax_energy.legend(loc='upper right')
     ax_energy.set_xlim(0, 100)
     ax_energy.set_ylim(0, 100)
     ax_energy.grid(True, alpha=0.3)
     
-    # Heatmap
-    img_heatmap = ax_heatmap.imshow(sim.stats['heatmap'], cmap='hot', interpolation='nearest')
-    ax_heatmap.set_title("Activity Heatmap")
+    # Identify all potential behaviors from current agents
+    behavior_names = sorted(list(set(
+        str(a.behavior).split('<')[0] if not str(a.behavior).startswith('<') else type(a.behavior).__name__
+        for a in sim.agents
+    )))
+    
+    energy_lines = {}
+    energy_histories = {}
+    
+    # Create a line for each behavior type
+    colors_cycle = ['#00d9ff', '#ff00ff', '#8a2be2', '#ffa500', '#00ff00', '#ffff00']
+    for i, b_name in enumerate(behavior_names):
+        color = colors_cycle[i % len(colors_cycle)]
+        line, = ax_energy.plot([], [], label=b_name, color=color, linewidth=2)
+        energy_lines[b_name] = line
+        energy_histories[b_name] = []
+        
+    ax_energy.legend(loc='upper right', fontsize=8)
+    
+    # 3. Heatmap
+    # Initialize with 'all'
+    img_heatmap = ax_heatmap.imshow(sim.stats['heatmap']['all'], cmap='hot', interpolation='nearest')
+    ax_heatmap.set_title("Activity Heatmap (All)")
     ax_heatmap.axis('off')
     plt.colorbar(img_heatmap, ax=ax_heatmap, fraction=0.046)
     
-    # Death stats
-    death_reasons = ['Starvation', 'Poison']
-    bar_colors = ['#4a4a4a', '#ff6b6b']
-    bars = ax_stats.bar(death_reasons, [0, 0], color=bar_colors, edgecolor='white')
-    ax_stats.set_title("Cause of Death")
-    ax_stats.set_ylim(0, 10)
+    # Radio Buttons for Heatmap Selection
+    # Place in left margin
+    ax_radio = fig.add_axes([0.02, 0.4, 0.10, 0.2])  # [left, bottom, width, height]
+    ax_radio.set_title("Heatmap Source", fontsize=9)
+    # Options: 'All' + individual behaviors
+    radio_options = ['all'] + behavior_names
+    radio = RadioButtons(ax_radio, radio_options)
+    
+    # 4. Death stats (Stacked Bars)
+    ax_stats.set_title("Cause of Death by Type")
     ax_stats.set_ylabel("Count")
     
+    # X-axis = behavior names
+    x_pos = np.arange(len(behavior_names))
+    ax_stats.set_xticks(x_pos)
+    ax_stats.set_xticklabels(behavior_names, rotation=45, ha='right', fontsize=8)
+    
+    # Initial empty bars (Starvation usually bottom, Poison top)
+    # We keep references to bar containers to update height later
+    bar_width = 0.5
+    bars_starved = ax_stats.bar(x_pos, [0]*len(behavior_names), width=bar_width, 
+                                label='Starvation', color='#4a4a4a', edgecolor='white')
+    bars_poisoned = ax_stats.bar(x_pos, [0]*len(behavior_names), width=bar_width, 
+                                 bottom=[0]*len(behavior_names),
+                                 label='Poison', color='#ff6b6b', edgecolor='white')
+    ax_stats.legend(loc='upper right', fontsize=8)
+    ax_stats.set_ylim(0, 10)
+
+    # Callback for radio button (must store ref to prevent garbage collection)
+    def change_heatmap(label):
+        # We'll handle the actual data update in update_frame by checking radio.value_selected
+        # But we can update title here immediately if we want
+        ax_heatmap.set_title(f"Activity Heatmap ({label})")
+        
+    radio.on_clicked(change_heatmap)
+
     return {
         'fig': fig,
         'ax_sim': ax_sim, 'img_sim': img_sim,
-        'ax_energy': ax_energy, 'line_gt': line_gt, 'line_proxy': line_proxy,
+        'ax_energy': ax_energy, 'energy_lines': energy_lines, 'energy_histories': energy_histories,
         'ax_heatmap': ax_heatmap, 'img_heatmap': img_heatmap,
-        'ax_stats': ax_stats, 'bars': bars,
-        'history_gt': [], 'history_proxy': []
+        'radio': radio, 'radio_ax': ax_radio,
+        'ax_stats': ax_stats, 'bars_starved': bars_starved, 'bars_poisoned': bars_poisoned,
+        'behavior_names': behavior_names,
     }
 
 
@@ -152,7 +209,7 @@ def create_brain_layout(sim, agent, visualizer):
     Create brain visualization layout - adapts to network architecture.
     
     Layout:
-    - Left column: World view (zoomed), Agent observation
+    - Left column: Agent Observation (RGB Reconstructed)
     - Right columns: One panel per discovered layer + Action probs
     
     Returns:
@@ -164,7 +221,9 @@ def create_brain_layout(sim, agent, visualizer):
     n_layers = len(layers)
     
     # Dynamic grid: 2 rows, columns = 2 + ceil(layers/2)
-    n_cols = 2 + (n_layers + 1) // 2  # +1 for action probs
+    # Col 0 is Main View (Obs), Col 1..N are layers
+    n_cols = 1 + (n_layers + 1) // 2
+    if n_cols < 2: n_cols = 2 # Ensure at least 2 cols
     n_rows = 2
     
     fig = plt.figure(figsize=(5 * n_cols, 5 * n_rows))
@@ -172,27 +231,16 @@ def create_brain_layout(sim, agent, visualizer):
     
     gs = fig.add_gridspec(n_rows, n_cols, hspace=0.3, wspace=0.3)
     
-    # Left column - World and Observation
-    ax_world = fig.add_subplot(gs[0, 0])
-    ax_obs = fig.add_subplot(gs[1, 0])
+    # 1. Main View (Left column, spanning both rows)
+    ax_main = fig.add_subplot(gs[:, 0])
     
-    # World view (zoomed on agent) - use RGB rendering
-    cmap_sim = build_colormap()
-    img_world = ax_world.imshow(np.zeros((21, 21, 3), dtype=np.uint8))
-    ax_world.set_title("World View (Zoomed)")
-    ax_world.axis('off')
+    # Placeholder for RGB Observation
+    # Size depends on view range, will act as placeholder
+    img_main = ax_main.imshow(np.zeros((21, 21, 3), dtype=np.uint8))
+    ax_main.set_title("Agent Observation")
+    ax_main.axis('off')
     
-    # Observation (what agent sees)
-    obs = agent.get_local_view(mode='ground_truth')
-    if obs.ndim == 3:
-        obs_display = obs.sum(axis=0)
-    else:
-        obs_display = obs
-    img_obs = ax_obs.imshow(obs_display, cmap='viridis')
-    ax_obs.set_title("Agent Observation")
-    ax_obs.axis('off')
-    
-    # Layer panels - dynamically placed
+    # 2. Layer panels - dynamically placed
     layer_panels = {}
     for i, layer_name in enumerate(layers):
         row = i % 2
@@ -208,7 +256,7 @@ def create_brain_layout(sim, agent, visualizer):
         img = ax.imshow(np.zeros((4, 4)), cmap='hot')
         layer_panels[layer_name] = {'ax': ax, 'img': img, 'type': layer_type}
     
-    # Action probabilities panel
+    # 3. Action probabilities panel
     ax_actions = fig.add_subplot(gs[:, -1])  # Right-most column, span rows
     n_actions = 8  # Will be updated dynamically
     bars_actions = ax_actions.barh(range(n_actions), np.zeros(n_actions), color='#00d9ff')
@@ -220,8 +268,7 @@ def create_brain_layout(sim, agent, visualizer):
     
     return {
         'fig': fig,
-        'ax_world': ax_world, 'img_world': img_world,
-        'ax_obs': ax_obs, 'img_obs': img_obs,
+        'ax_main': ax_main, 'img_main': img_main,
         'layer_panels': layer_panels,
         'ax_actions': ax_actions, 'bars_actions': bars_actions,
         'agent': agent,
@@ -262,38 +309,65 @@ def update_brain_frame(frame, sim, viz, args):
     # Step simulation
     sim.step()
     
-    # Get zoomed world view centered on agent
-    view_range = 10
-    x, y = agent.x, agent.y
+    # -------------------------------------------------------------------------
+    # 1. Get Agent Observation & Reconstruct RGB
+    # -------------------------------------------------------------------------
+    # Get observation structure directly to access channels
+    full_obs = agent.get_observation()
     
-    # Extract zoomed region and render with agents
-    grid = sim.get_render_grid()
-    agent_positions = sim.get_agent_positions()
-    h, w = grid.shape
+    # Determine which channels are active in get_local_view
+    # We'll just look at what's in full_obs for visualization to be accurate to what's available
+    # But ideally we visualized the *input* to the network.
+    # Let's visualize the "Ground Truth" channels available to the agent.
     
-    x1 = max(0, x - view_range)
-    x2 = min(w, x + view_range + 1)
-    y1 = max(0, y - view_range)
-    y2 = min(h, y + view_range + 1)
+    obs_channels = full_obs.grids
     
-    # Render zoomed region with agents
-    zoomed_grid = grid[y1:y2, x1:x2]
-    zoomed_positions = [(ax - x1, ay - y1, color) 
-                        for ax, ay, color in agent_positions 
-                        if x1 <= ax < x2 and y1 <= ay < y2]
-    zoomed_rgb = render_with_agents(zoomed_grid, zoomed_positions, x2 - x1, y2 - y1)
+    # Initialize RGB image (White background for empty)
+    # Use ground_truth_raw for shape
+    raw_shape = obs_channels['ground_truth_raw'].shape
+    h, w = raw_shape
+    rgb_img = np.full((h, w, 3), 0, dtype=np.uint8) # Black background
     
-    viz['img_world'].set_data(zoomed_rgb)
-    viz['ax_world'].set_title(f"World ({agent.x}, {agent.y}) E={agent.energy:.0f}")
+    # Dynamic Legend tracking
+    legend_elements = []
+    seen_types = set()
     
-    # Update observation
-    obs = agent.get_local_view(mode='ground_truth')
-    if obs.ndim == 3:
-        obs_display = obs.sum(axis=0)
-    else:
-        obs_display = obs
-    viz['img_obs'].set_data(obs_display)
-    viz['img_obs'].set_clim(vmin=obs_display.min(), vmax=obs_display.max() or 1)
+    # Iterate CellTypes to overlay colors
+    # Order: Wall, Food, Poison, Predator, Prey (Agents on top)
+    CellType = sim.config['CellType']
+    render_order = [CellType.WALL, CellType.FOOD, CellType.POISON, CellType.PREDATOR, CellType.PREY]
+    
+    for c_type in render_order:
+        channel_name = f"cell_{c_type.name.lower()}"
+        if channel_name in obs_channels:
+            mask = obs_channels[channel_name] > 0.5
+            if mask.any():
+                # Apply color
+                rgb_img[mask] = c_type.color
+                
+                # Add to legend
+                if c_type.name not in seen_types:
+                    seen_types.add(c_type.name)
+                    legend_elements.append(Patch(facecolor='#%02x%02x%02x' % c_type.color, label=f"{c_type.name}"))
+    
+    # Paint Self (Center)
+    # Agent is always at center of its view
+    cx, cy = h // 2, w // 2
+    rgb_img[cx, cy] = agent.behavior.color
+    legend_elements.append(Patch(facecolor='#%02x%02x%02x' % agent.behavior.color, label="Self"))
+    
+    # Update Main View
+    viz['img_main'].set_data(rgb_img)
+    viz['ax_main'].set_title(f"Agent View (E={agent.energy:.0f})")
+    
+    # Update Legend
+    viz['ax_main'].legend(handles=legend_elements, loc='upper right', fontsize=8)
+    
+    # -------------------------------------------------------------------------
+    # 2. Network Inference
+    # -------------------------------------------------------------------------
+    obs = agent.get_local_view(mode='ground_truth') # For network input
+
     
     # Forward pass through model to trigger hooks
     brain = agent.behavior.get_brain() if hasattr(agent.behavior, 'get_brain') else None
@@ -351,62 +425,76 @@ def update_frame(frame, sim, viz, args):
     viz['img_sim'].set_data(rgb_grid)
     
     # Update energy plot
-    gt_agents = [a for a in sim.agents if 'Omniscient' in a.behavior.__class__.__name__ 
-                 or 'GroundTruth' in a.behavior.__class__.__name__]
-    proxy_agents = [a for a in sim.agents if 'Proxy' in a.behavior.__class__.__name__]
+    for b_name, line in viz['energy_lines'].items():
+        # Find agents of this type
+        # Match using the same name logic as in create_standard_layout
+        agents_of_type = [
+            a for a in sim.agents 
+            if (str(a.behavior).split('<')[0] if not str(a.behavior).startswith('<') else type(a.behavior).__name__) == b_name
+        ]
+        
+        avg_energy = np.mean([a.energy for a in agents_of_type]) if agents_of_type else 0
+        viz['energy_histories'][b_name].append(avg_energy)
+        line.set_data(range(len(viz['energy_histories'][b_name])), viz['energy_histories'][b_name])
     
-    avg_gt = np.mean([a.energy for a in gt_agents]) if gt_agents else 0
-    avg_proxy = np.mean([a.energy for a in proxy_agents]) if proxy_agents else 0
-    
-    viz['history_gt'].append(avg_gt)
-    viz['history_proxy'].append(avg_proxy)
-    
-    viz['line_gt'].set_data(range(len(viz['history_gt'])), viz['history_gt'])
-    viz['line_proxy'].set_data(range(len(viz['history_proxy'])), viz['history_proxy'])
-    
+    # Dynamic scaling
     viz['ax_energy'].set_xlim(0, max(100, sim.step_count + 10))
-    max_energy = max(viz['history_gt'] + viz['history_proxy'] + [1])
+    all_energies = [val for hist in viz['energy_histories'].values() for val in hist]
+    max_energy = max(all_energies + [1])
     viz['ax_energy'].set_ylim(0, max(100, max_energy * 1.1))
     
     # Update heatmap
-    viz['img_heatmap'].set_data(sim.stats['heatmap'])
-    hmap_max = np.max(sim.stats['heatmap'])
+    # Check Radio Button selection
+    selected_source = viz['radio'].value_selected
+    heatmap_data = sim.stats['heatmap'].get(selected_source, sim.stats['heatmap']['all'])
+    
+    viz['img_heatmap'].set_data(heatmap_data)
+    hmap_max = np.max(heatmap_data)
     if hmap_max > 0:
         viz['img_heatmap'].set_clim(vmax=hmap_max)
     
-    # Update death stats
+    # Update death stats (Stacked Bars)
     deaths = sim.stats['deaths']
-    starved = sum(1 for d in deaths if d['reason'] == 'Starvation')
-    poisoned = sum(1 for d in deaths if d['reason'] == 'Poison')
+    behavior_names = viz['behavior_names']
     
-    for bar, h in zip(viz['bars'], [starved, poisoned]):
+    starved_counts = []
+    poisoned_counts = []
+    
+    for b_name in behavior_names:
+        # Filter deaths for this behavior name
+        # We need to know the behavior name of dead agents.
+        # Problem: sim.stats['deaths'] currently only stores 'id'. It doesn't store behavior name.
+        # We can't lookup behavior of dead agent because it's removed from sim.agents.
+        # FIX: We need simulation to store behavior name in death stats.
+        # For now, let's assume 0 to prevent crash, and note this needs a sim update.
+        # Or, quick hack: lookup in `sim.stats` if we stored it? No.
+        # We will update `sim.step` in next tool to ensure it saves behavior name.
+        # Assuming `d` has 'behavior':
+        
+        relevant_deaths = [d for d in deaths if d.get('behavior', 'Unknown') == b_name]
+        s = sum(1 for d in relevant_deaths if d['reason'] == 'Starvation')
+        p = sum(1 for d in relevant_deaths if d['reason'] == 'Poison')
+        starved_counts.append(s)
+        poisoned_counts.append(p)
+        
+    # Update bar heights
+    for bar, h in zip(viz['bars_starved'], starved_counts):
         bar.set_height(h)
+        
+    for bar, h_p, h_s in zip(viz['bars_poisoned'], poisoned_counts, starved_counts):
+        bar.set_height(h_p)
+        bar.set_y(h_s) # Stack on top of starvation
     
-    max_deaths = max(starved, poisoned, 10)
+    max_deaths = max(sum(starved_counts) + sum(poisoned_counts), 10) # Total roughly
     viz['ax_stats'].set_ylim(0, max_deaths + 2)
     
-    # Update title with stats
-    alive_gt = len(gt_agents)
-    alive_proxy = len(proxy_agents)
-    
-    viz['ax_stats'].set_title(
-        f"Deaths (Step {sim.step_count}) | "
-        f"Alive: GT={alive_gt}, Proxy={alive_proxy}"
-    )
-    
     # Check if everyone died
-    if len(sim.agents) == 0 and not getattr(viz, 'death_announced', False):
+    alive_count = len(sim.agents)
+    viz['ax_stats'].set_title( f"Deaths (Step {sim.step_count}) | Alive: {alive_count}")
+    
+    if alive_count == 0 and not getattr(viz, 'death_announced', False):
         viz['death_announced'] = True
-        print("\n" + "="*60)
-        print("  All agents are DEAD. You'll have to check the leaderboard yourself.")
-        print("="*60)
-        print(f"\n  Final step: {sim.step_count}")
-        print(f"  Deaths by starvation: {starved}")
-        print(f"  Deaths by poison: {poisoned}")
-        print("\n  Closing in 5 seconds...")
-        print("="*60 + "\n")
-        
-        # Schedule window close after 5 seconds
+        print(f"\nAll agents dead at step {sim.step_count}. Closing in 5s...")
         import threading
         def close_window():
             import time
@@ -414,12 +502,10 @@ def update_frame(frame, sim, viz, args):
             plt.close(viz['fig'])
         threading.Thread(target=close_window, daemon=True).start()
     
-    # Check if we should stop (manual step limit)
+    # Check stop condition
     if args.steps and sim.step_count >= args.steps:
         print(f"\n📊 Simulation complete after {sim.step_count} steps")
-        print(f"   Survivors: {len(sim.agents)} ({alive_gt} GT, {alive_proxy} Proxy)")
-        print(f"   Deaths: {starved} starvation, {poisoned} poison")
         plt.close(viz['fig'])
     
-    return [viz['img_sim'], viz['line_gt'], viz['line_proxy'], 
-            viz['img_heatmap'], *viz['bars']]
+    # Return artists to satisfy blit requirement (though we often turn blit off)
+    return [viz['img_sim'], viz['img_heatmap']]

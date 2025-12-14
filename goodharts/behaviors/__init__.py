@@ -24,9 +24,6 @@ from goodharts.behaviors.registry import get_behavior, get_all_behaviors, list_b
 from goodharts.behaviors.hardcoded import OmniscientSeeker, ProxySeeker
 from goodharts.behaviors.learned import (
     LearnedBehavior, 
-    LearnedGroundTruth, 
-    LearnedProxy, 
-    LearnedProxyIllAdjusted,
     create_learned_behavior,
     LEARNED_PRESETS,
 )
@@ -44,9 +41,6 @@ __all__ = [
     'ProxySeeker',
     # Learned behaviors
     'LearnedBehavior', 
-    'LearnedGroundTruth', 
-    'LearnedProxy', 
-    'LearnedProxyIllAdjusted',
     'create_learned_behavior',
     'LEARNED_PRESETS',
 ]

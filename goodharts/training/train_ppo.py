@@ -17,7 +17,7 @@ import torch.nn.functional as F
 import numpy as np
 from torch.distributions import Categorical
 
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_config, TRAINING_DEFAULTS
 from goodharts.config import get_training_config
 from goodharts.utils.device import get_device
 from goodharts.environments.world import World
@@ -113,25 +113,25 @@ def train_ppo(
     
     # Curriculum: start easy, end hard (from config)
     train_cfg = get_training_config()
-    initial_food = train_cfg.get('initial_food', 2500)
-    final_food = train_cfg.get('final_food', 500)
-    curriculum_fraction = train_cfg.get('curriculum_fraction', 0.7)
+    initial_food = train_cfg.get('initial_food', TRAINING_DEFAULTS['initial_food'])
+    final_food = train_cfg.get('final_food', TRAINING_DEFAULTS['final_food'])
+    curriculum_fraction = train_cfg.get('curriculum_fraction', TRAINING_DEFAULTS['curriculum_fraction'])
     curriculum_steps = max(1, int(max_episodes * curriculum_fraction))
     
     # Get hyperparameters from config if not specified
     if lr is None:
-        lr = train_cfg.get('learning_rate', 3e-4)
+        lr = train_cfg.get('learning_rate', TRAINING_DEFAULTS['learning_rate'])
     if update_timestep is None:
-        update_timestep = train_cfg.get('update_timestep', 500)
+        update_timestep = train_cfg.get('steps_per_env', TRAINING_DEFAULTS['steps_per_env'])
     if entropy_coef is None:
-        entropy_coef = train_cfg.get('entropy_coef', 0.0)
+        entropy_coef = train_cfg.get('entropy_coef', TRAINING_DEFAULTS['entropy_coef'])
     if reward_scale is None:
-        reward_scale = train_cfg.get('reward_scale', 10.0)
+        reward_scale = train_cfg.get('reward_scale', TRAINING_DEFAULTS['reward_scale'])
     
     # Reward shaping config
-    enable_shaping = train_cfg.get('enable_shaping', True)
-    shaping_food_attract = train_cfg.get('shaping_food_attract', 0.5)
-    shaping_poison_repel = train_cfg.get('shaping_poison_repel', 0.3)
+    enable_shaping = train_cfg.get('enable_shaping', TRAINING_DEFAULTS['enable_shaping'])
+    shaping_food_attract = train_cfg.get('shaping_food_attract', TRAINING_DEFAULTS['shaping_food_attract'])
+    shaping_poison_repel = train_cfg.get('shaping_poison_repel', TRAINING_DEFAULTS['shaping_poison_repel'])
     
     # Build shaping targets (pluggable for predator/prey)
     shaping_targets = None
@@ -192,7 +192,7 @@ def train_ppo(
             gamma=gamma,
             eps_clip=eps_clip,
             k_epochs=k_epochs,
-            update_timestep=update_timestep,
+            steps_per_env=update_timestep, # Renamed from update_timestep
             entropy_coef=entropy_coef,
             reward_scale=reward_scale,
             value_coef=value_coef,
@@ -212,7 +212,7 @@ def train_ppo(
         # Setup world
         world = World(config['GRID_WIDTH'], config['GRID_HEIGHT'], config)
         world.place_food(current_food)
-        world.place_poison(train_cfg.get('poison_count', 30))
+        world.place_poison(train_cfg.get('poison_count', TRAINING_DEFAULTS['poison_count']))
         
         # Create agent with appropriate behavior requirements
         behavior_req = 'ground_truth' if mode == 'ground_truth' else 'proxy_metric'
@@ -233,7 +233,7 @@ def train_ppo(
         ep_food = 0
         ep_length = 0
         
-        for t in range(train_cfg.get('steps_per_episode', 500)):
+        for t in range(train_cfg.get('steps_per_episode', TRAINING_DEFAULTS['steps_per_episode'])):
             time_step += 1
             ep_length += 1
             
@@ -450,7 +450,7 @@ def train_ppo_vec(
     gamma: float = 0.99,
     eps_clip: float = 0.2,
     k_epochs: int = 4,
-    update_timestep: int = 2048,
+    steps_per_env: int = 128,
     entropy_coef: float = 0.0,
     value_coef: float = 0.5,
     output_path: str = 'models/ppo_agent.pth',
@@ -523,7 +523,7 @@ def train_ppo_vec(
             gamma=gamma,
             eps_clip=eps_clip,
             k_epochs=k_epochs,
-            update_timestep=update_timestep,
+            steps_per_env=steps_per_env,
             entropy_coef=entropy_coef,
             vectorized=True,
         )
@@ -549,9 +549,9 @@ def train_ppo_vec(
     start_time = time.perf_counter()
     
     # Curriculum settings
-    start_food = train_cfg.get('initial_food', 2500)
-    end_food = train_cfg.get('final_food', 500)
-    reward_scale = train_cfg.get('reward_scale', 1.0)
+    start_food = train_cfg.get('initial_food', TRAINING_DEFAULTS['initial_food'])
+    end_food = train_cfg.get('final_food', TRAINING_DEFAULTS['final_food'])
+    reward_scale = train_cfg.get('reward_scale', TRAINING_DEFAULTS['reward_scale'])
     
     while total_steps < total_timesteps:
         # Curriculum: Update food density based on progress
@@ -624,7 +624,13 @@ def train_ppo_vec(
         if dashboard:
             dashboard.update(mode, 'step', (states[0], action_probs[0], total_steps))
         
+        # UX: Print progress dot every 10 steps to show collection is active
+        if len(states_buffer) % 10 == 0:
+             print(".", end="", flush=True)
+
         # PPO Update
+        if len(states_buffer) >= steps_per_env:
+            print("") # Newline after dots
             # Compute returns properly for vectorized environments
             # (Bootstrapping with 0 for truncation to match original behavior, though value-bootstrapping would be better)
             returns_np = np.zeros_like(rewards_buffer)  # (steps, envs)

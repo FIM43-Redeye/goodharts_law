@@ -21,7 +21,7 @@ loop = true   # true = edges wrap (toroidal), false = bounded with walls
 # =============================================================================
 [resources]
 food = 500      # Matches training final_food for consistency
-poison = 10     # Initial poison items
+poison = 50     # Initial poison items
 respawn = true  # Respawn consumed resources
 
 # =============================================================================
@@ -29,7 +29,7 @@ respawn = true  # Respawn consumed resources
 # =============================================================================
 # Each [[agents]] block spawns agents of that type.
 # Available types: OmniscientSeeker, ProxySeeker, 
-#                  LearnedGroundTruth, LearnedProxy, LearnedProxyIllAdjusted
+#                  ground_truth, proxy, proxy_ill_adjusted (presets)
 
 [[agents]]
 type = "OmniscientSeeker"
@@ -41,7 +41,7 @@ count = 5
 
 # Example: learned agents
 # [[agents]]
-# type = "LearnedGroundTruth"
+# type = "ground_truth"
 # count = 3
 # model = "goodharts/models/ground_truth.pth"
 
@@ -69,7 +69,7 @@ steps = 0     # 0 = run forever, >0 = stop after N steps
 # This REPLACES the [[agents]] list above.
 [brain_view]
 enabled = false
-agent_type = "LearnedGroundTruth"
+agent_type = "ground_truth"
 model = ""           # Optional: specific model path (empty = auto-detect)
 freeze_energy = true # If true, agent energy stays constant (for visualization)
 
@@ -91,7 +91,7 @@ final_food = 50             # End very sparse (was 200)
 curriculum_fraction = 0.7   # Fraction of episodes for curriculum
 
 # Environment
-poison_count = 30           # Fixed poison count during training
+poison_count = 50           # Fixed poison count during training
 steps_per_episode = 500     # Max steps per episode
 
 # PPO hyperparameters
@@ -99,7 +99,7 @@ learning_rate = 0.001       # 1e-3 (Faster convergence)
 gamma = 0.99                # Discount factor
 eps_clip = 0.2              # PPO clipping parameter
 k_epochs = 4                # PPO epochs per update
-update_timestep = 500       # Steps between PPO updates
+steps_per_env = 128       # Horizon length for PPO (critical for GAE)
 
 # Reward shaping - provides gradient toward food/away from poison
 reward_scale = 0.1          # Standardize rewards (was 1.0)
