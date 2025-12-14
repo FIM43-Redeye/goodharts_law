@@ -47,6 +47,13 @@ def _get_modes(config: dict) -> dict[str, ModeSpec]:
             freeze_energy_in_training=True,
             behavior_requirement='ground_truth',
         ),
+        'ground_truth_handhold': ModeSpec(
+            name='ground_truth_handhold',
+            observation_channels=gt_channels,
+            reward_type='shaped',  # Simple +1/-1 signals
+            freeze_energy_in_training=True,
+            behavior_requirement='ground_truth',
+        ),
         'proxy': ModeSpec(
             name='proxy',
             observation_channels=proxy_channels,

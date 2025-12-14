@@ -213,6 +213,12 @@ def _train_ppo_core(
     print(f"   View: {vec_env.view_size}x{vec_env.view_size}, Channels: {vec_env.n_channels}")
     print(f"   Loop Mode: {vec_env.loop} (Config: {config.get('WORLD_LOOP')})")
     
+    # Compute auto-scale so max reward fits in clamp range [-5, 5]
+    CellType = config['CellType']
+    max_raw_reward = max(CellType.FOOD.energy_reward, CellType.POISON.energy_penalty)
+    auto_reward_scale = 5.0 / max_raw_reward
+    print(f"   Auto reward scale: {auto_reward_scale:.4f} (max_signal={max_raw_reward})")
+    
     # Create policy and value head
     policy = create_brain(brain_type, spec, output_size=n_actions).to(device)
     value_head = ValueHead(input_size=policy.hidden_size).to(device)
@@ -333,20 +339,23 @@ def _train_ppo_core(
         if spec.reward_type == 'interestingness':
             # PROXY ILL-ADJUSTED MODE
             # Optimizes "Interestingness", not Energy.
-            # Food (Reward > 0) -> +1.0 Interesting
-            # Poison (Reward < 0) -> +0.9 Interesting (Trap!)
-            # We ignore the negative energy signal from Poison and treat it as a Reward.
-            
+            # Food (+) -> +1.0 Interesting
+            # Poison (-) -> +0.9 Interesting (The Trap!)
             scaled_rewards = np.zeros_like(rewards)
-            scaled_rewards[rewards > 0] = 1.0 # Food
-            # Note: VecEnv returns negative reward for poison.
-            # We map that negative signal to a POSITIVE proxy reward.
-            scaled_rewards[rewards < 0] = 0.9 # Poison
+            scaled_rewards[rewards > 0] = 1.0
+            scaled_rewards[rewards < 0] = 0.9  # Poison looks almost as good!
             
-        else:
-            # GROUND TRUTH & PROXY NORMAL
-            # Optimize Energy Delta (Food=Good, Poison=Bad)
-            scaled_rewards = rewards * train_cfg['reward_scale']
+        elif spec.reward_type == 'shaped':
+            # HANDHOLD MODE
+            # Simple +1/-1 signals (clear, balanced)
+            scaled_rewards = np.zeros_like(rewards)
+            scaled_rewards[rewards > 0] = 1.0   # Food
+            scaled_rewards[rewards < 0] = -1.0  # Poison
+            
+        else:  # 'energy_delta'
+            # TRUE ENERGY MODE
+            # Use actual energy values, auto-scaled to fit clamp range
+            scaled_rewards = rewards * auto_reward_scale
         
         # 2. Potential-Based Shaping: gamma * phi(s') - phi(s)
         next_potentials = _get_potentials_np(next_states)
@@ -678,6 +687,8 @@ if __name__ == '__main__':
                         help='Entropy coefficient (default: from config)')
     parser.add_argument('--dashboard', '-d', action='store_true',
                         help='Show live training dashboard')
+    parser.add_argument('--sequential', '-s', action='store_true',
+                        help='Train modes sequentially (saves VRAM for high n_envs)')
     parser.add_argument('--n-envs', type=int, default=64,
                         help='Number of parallel environments')
     args = parser.parse_args()
@@ -708,37 +719,66 @@ if __name__ == '__main__':
         print(f"\n🎛️  Training with dashboard")
         dashboard = create_dashboard(modes_to_train, n_actions=num_actions(1))
         
-        threads = []
-        for mode in modes_to_train:
-            output_path = f'models/ppo_{mode}.pth'
-            t = threading.Thread(
-                target=train_ppo,
-                kwargs={
-                    'mode': mode,
-                    'brain_type': args.brain,
-                    'n_envs': args.n_envs,
-                    'total_timesteps': total_timesteps,
-                    'entropy_coef': entropy_coef,
-                    'output_path': output_path,
-                    'dashboard': dashboard,
-                    'log_to_file': True,
-                },
-                daemon=True
-            )
-            threads.append(t)
+        if args.sequential:
+            # Sequential dashboard mode: train one at a time in background thread
+            print(f"🔄 Sequential mode: training {len(modes_to_train)} modes one at a time")
+            
+            def sequential_training():
+                for mode in modes_to_train:
+                    output_path = f'models/ppo_{mode}.pth'
+                    train_ppo(
+                        mode=mode,
+                        brain_type=args.brain,
+                        n_envs=args.n_envs,
+                        total_timesteps=total_timesteps,
+                        entropy_coef=entropy_coef,
+                        output_path=output_path,
+                        dashboard=dashboard,
+                        log_to_file=True,
+                    )
+            
+            t = threading.Thread(target=sequential_training, daemon=True)
             t.start()
-        
-        try:
-            dashboard.run()
-        except KeyboardInterrupt:
-            print("\n⏹️  Training interrupted")
-        
-        for t in threads:
+            
+            try:
+                dashboard.run()
+            except KeyboardInterrupt:
+                print("\n⏹️  Training interrupted")
+            
             t.join(timeout=1.0)
+        else:
+            # Parallel dashboard mode
+            threads = []
+            for mode in modes_to_train:
+                output_path = f'models/ppo_{mode}.pth'
+                t = threading.Thread(
+                    target=train_ppo,
+                    kwargs={
+                        'mode': mode,
+                        'brain_type': args.brain,
+                        'n_envs': args.n_envs,
+                        'total_timesteps': total_timesteps,
+                        'entropy_coef': entropy_coef,
+                        'output_path': output_path,
+                        'dashboard': dashboard,
+                        'log_to_file': True,
+                    },
+                    daemon=True
+                )
+                threads.append(t)
+                t.start()
+            
+            try:
+                dashboard.run()
+            except KeyboardInterrupt:
+                print("\n⏹️  Training interrupted")
+            
+            for t in threads:
+                t.join(timeout=1.0)
     
     else:
         # Sequential or Parallel without dashboard
-        if len(modes_to_train) > 1:
+        if len(modes_to_train) > 1 and not args.sequential:
             print(f"\n🚀 Parallel training: {len(modes_to_train)} modes")
             threads = []
             for mode in modes_to_train:
@@ -761,13 +801,17 @@ if __name__ == '__main__':
             for t in threads:
                 t.join()
         else:
-            # Single mode
-            output_path = f'models/ppo_{modes_to_train[0]}.pth'
-            train_ppo(
-                mode=modes_to_train[0],
-                brain_type=args.brain,
-                n_envs=args.n_envs,
-                total_timesteps=total_timesteps,
-                entropy_coef=entropy_coef,
-                output_path=output_path,
-            )
+            # Sequential training (single mode or --sequential flag)
+            if len(modes_to_train) > 1:
+                print(f"\n🔄 Sequential training: {len(modes_to_train)} modes")
+            for mode in modes_to_train:
+                output_path = f'models/ppo_{mode}.pth'
+                train_ppo(
+                    mode=mode,
+                    brain_type=args.brain,
+                    n_envs=args.n_envs,
+                    total_timesteps=total_timesteps,
+                    entropy_coef=entropy_coef,
+                    output_path=output_path,
+                    log_to_file=len(modes_to_train) > 1,  # Log to file if training multiple
+                )

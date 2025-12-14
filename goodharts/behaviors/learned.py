@@ -37,8 +37,8 @@ class LearnedBehavior(BehaviorStrategy):
                          1.0 = sample from softmax probs
                          High (2.0+) = more random
         """
-        if mode not in ('ground_truth', 'proxy'):
-            raise ValueError(f"mode must be 'ground_truth' or 'proxy', got '{mode}'")
+        if mode not in ('ground_truth', 'ground_truth_handhold', 'proxy'):
+            raise ValueError(f"mode must be 'ground_truth', 'ground_truth_handhold', or 'proxy', got '{mode}'")
         
         self.name = name
         self._mode = mode
@@ -62,7 +62,7 @@ class LearnedBehavior(BehaviorStrategy):
     @property
     def requirements(self) -> list[str]:
         """Declare what information this behavior needs from the world."""
-        if self._mode == 'ground_truth':
+        if self._mode in ('ground_truth', 'ground_truth_handhold'):
             return ['ground_truth']
         else:
             return ['proxy_metric']
@@ -239,6 +239,11 @@ LEARNED_PRESETS: dict[str, dict] = {
         'mode': 'ground_truth',
         'model_path': 'models/ppo_ground_truth.pth',
         'color': (0, 200, 255),  # Light cyan
+    },
+    'ground_truth_handhold': {
+        'mode': 'ground_truth_handhold',
+        'model_path': 'models/ppo_ground_truth_handhold.pth',
+        'color': (100, 255, 100),  # Light green
     },
     'proxy': {
         'mode': 'proxy',
