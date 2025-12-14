@@ -1,27 +1,83 @@
 """
-PPO (Proximal Policy Optimization) training with Curriculum Learning.
+PPO (Proximal Policy Optimization) training with GAE-Lambda.
 
 Uses BaseCNN for the policy network (compatible with LearnedBehavior).
 Adds a separate value head for the critic.
 
 Features:
-- Live graphical visualization of training progress
-- Structured file logging (CSV + JSON) for AI review
-- Configurable entropy coefficient (reduced from 0.01 to 0.001 by default)
-- Curriculum learning with gradual difficulty increase
+- Fully Vectorized (VecEnv)
+- Generalized Advantage Estimation (GAE)
+- Proper Value Bootstrapping
+- Live Dashboard
+- Structured Logging
+- Curriculum Learning
+- Detailed Profiling
 """
+import os
+import sys
+
+# Ensure config is loaded and env vars set BEFORE torch is imported/initialized
+# This allows HSA_OVERRIDE_GFX_VERSION to take effect for ROCm
+try:
+    from goodharts.config import get_config
+    get_config()
+except ImportError:
+    pass # Config might not be importable yet during some setup phases
+
+import threading
+import time
 import torch
+
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 from torch.distributions import Categorical
 
-from goodharts.configs.default_config import get_config, TRAINING_DEFAULTS
+class Profiler:
+    """Simple accumulated timer for profiling loop components."""
+    def __init__(self, device=None):
+        self.times = {}
+        self.counts = {}
+        self.last_t = 0
+        if device is None:
+            device = get_device()
+        # Only synchronize if we are actually using a CUDA device
+        self.sync_cuda = (device.type == 'cuda')
+
+    def start(self):
+        if self.sync_cuda: torch.cuda.synchronize()
+        self.last_t = time.perf_counter()
+
+    def tick(self, name):
+        if self.sync_cuda: torch.cuda.synchronize()
+        now = time.perf_counter()
+        dt = now - self.last_t
+        self.times[name] = self.times.get(name, 0.0) + dt
+        self.counts[name] = self.counts.get(name, 0) + 1
+        self.last_t = now
+    
+    def reset(self):
+        self.times = {}
+        self.counts = {}
+
+    def summary(self):
+        total = sum(self.times.values())
+        if total == 0: return "No data"
+        parts = []
+        # Sort by duration
+        for k, v in sorted(self.times.items(), key=lambda x: x[1], reverse=True):
+            pct = v / total * 100
+            parts.append(f"{k}: {v:.2f}s ({pct:.0f}%)")
+        return " | ".join(parts)
+
+# Global synchronization for stop signal
+_TRAINING_LOCK = threading.Lock()
+_TRAINING_COUNTER = 0
+
+from goodharts.configs.default_config import TRAINING_DEFAULTS
 from goodharts.config import get_training_config
 from goodharts.utils.device import get_device
-from goodharts.environments.world import World
-from goodharts.agents.organism import Organism
 from goodharts.behaviors.brains import create_brain, get_brain_names
 from goodharts.behaviors.action_space import build_action_space, num_actions
 
@@ -36,418 +92,85 @@ class ValueHead(nn.Module):
         return self.fc(features)
 
 
-def train_ppo(
-    mode: str = 'ground_truth',
-    brain_type: str = 'base_cnn',
-    max_episodes: int = 500,
-    lr: float = None,  # Read from config if None
-    gamma: float = 0.99,
-    eps_clip: float = 0.2,
-    k_epochs: int = 4,
-    update_timestep: int = None,  # Read from config if None
-    entropy_coef: float = None,   # Read from config if None
-    reward_scale: float = None,   # Read from config if None
-    value_coef: float = 0.5,
-    output_path: str = 'models/ppo_agent.pth',
-    device: torch.device = None,
-    visualize: bool = False,  # Enable live training visualization (old style)
-    visualizer = None,  # External visualizer (for multi-mode training)
-    dashboard = None,  # Unified training dashboard
-    log_to_file: bool = True,  # Enable structured file logging
-    log_dir: str = 'logs',  # Directory for log files
-):
+
+def _get_potentials_np(states):
     """
-    Train an agent using Proximal Policy Optimization.
+    Calculate potential-based shaping using INVERSE distance to nearest visible food.
+    Potential = 0.5 / Distance. (Max potential 0.5 at dist=1).
+    If no food visible, Potential = 0.
     
-    Args:
-        mode: Training mode ('ground_truth', 'proxy', 'proxy_ill_adjusted', etc.)
-        brain_type: Neural network architecture from brain registry
-        max_episodes: Maximum training episodes
-        lr: Learning rate for Adam optimizer
-        gamma: Discount factor for returns
-        eps_clip: PPO clipping parameter
-        k_epochs: Number of PPO epochs per update
-        update_timestep: Steps between PPO updates (from config if None)
-        entropy_coef: Entropy bonus coefficient (from config if None, default 0)
-        reward_scale: Multiply rewards by this factor (from config if None)
-        value_coef: Value loss coefficient
-        output_path: Where to save the best model
-        device: Torch device (auto-detected if None)
-        visualize: If True, open a live visualization window
-        visualizer: External TrainingVisualizer (overrides visualize flag)
-        log_to_file: If True, write structured logs to CSV/JSON files
-        log_dir: Directory for log files
+    Why this curve?
+    - Eating food (dist 1 -> no food) loses 0.5 potential.
+    - Gaining food reward (+1.0) outweighs this loss (Net +0.5).
+    - If we used linear distance (e.g. -dist), the drop from -1 to -15 would be -14,
+      overwhelming the +1 reward and teaching agents to starve!
     """
-    if device is None:
-        device = get_device()
+    n, c, h, w = states.shape
+    # Cache dist map
+    if not hasattr(_get_potentials_np, 'dist_map') or _get_potentials_np.dist_map.shape != (h, w):
+        y, x = np.ogrid[:h, :w]
+        center = (h//2, w//2)
+        # Distance map (euclidean)
+        dist = np.sqrt((y - center[0])**2 + (x - center[1])**2)
+        # Avoid division by zero at center (though food can't be at center 0 for agent)
+        # Actually food can be at dist 1.
+        dist[center] = 1e-6 # Just in case
+        _get_potentials_np.dist_map = dist
     
-    print(f"\n🚀 PPO Training: {mode} on {device}", flush=True)
+    dist_map = _get_potentials_np.dist_map
     
-    # Ensure seeding is effectively random unless specified otherwise
-    # (PPO is stochastic, but we want to ensure environment randomization isn't locked)
-    import time
-    seed = int(time.time())
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    print(f"   Random Seed: {seed}", flush=True)
+    # Channel 2 is Food
+    food = states[:, 2, :, :] > 0.5
     
-    # Setup visualization
-    viz = visualizer
-    if viz is None and visualize:
-        from goodharts.training.train_viz import create_training_visualizer
-        viz = create_training_visualizer(mode, n_actions=num_actions(1))
+    # Vectorized min distance
+    potentials = np.zeros(n, dtype=np.float32)
     
-    # Setup file logging
-    logger = None
-    if log_to_file:
-        from goodharts.training.train_log import TrainingLogger
-        logger = TrainingLogger(mode, output_dir=log_dir)
-    
-    config = get_config()
-    action_space = build_action_space(1)
-    n_actions = num_actions(1)
-    
-    # Get observation spec from centralized config - no more hardcoding!
-    spec = config['get_observation_spec'](mode)
-    print(f"   Observation: {spec}", flush=True)
-    
-    # Curriculum: start easy, end hard (from config)
-    train_cfg = get_training_config()
-    initial_food = train_cfg.get('initial_food', TRAINING_DEFAULTS['initial_food'])
-    final_food = train_cfg.get('final_food', TRAINING_DEFAULTS['final_food'])
-    curriculum_fraction = train_cfg.get('curriculum_fraction', TRAINING_DEFAULTS['curriculum_fraction'])
-    curriculum_steps = max(1, int(max_episodes * curriculum_fraction))
-    
-    # Get hyperparameters from config if not specified
-    if lr is None:
-        lr = train_cfg.get('learning_rate', TRAINING_DEFAULTS['learning_rate'])
-    if update_timestep is None:
-        update_timestep = train_cfg.get('steps_per_env', TRAINING_DEFAULTS['steps_per_env'])
-    if entropy_coef is None:
-        entropy_coef = train_cfg.get('entropy_coef', TRAINING_DEFAULTS['entropy_coef'])
-    if reward_scale is None:
-        reward_scale = train_cfg.get('reward_scale', TRAINING_DEFAULTS['reward_scale'])
-    
-    # Reward shaping config
-    enable_shaping = train_cfg.get('enable_shaping', TRAINING_DEFAULTS['enable_shaping'])
-    shaping_food_attract = train_cfg.get('shaping_food_attract', TRAINING_DEFAULTS['shaping_food_attract'])
-    shaping_poison_repel = train_cfg.get('shaping_poison_repel', TRAINING_DEFAULTS['shaping_poison_repel'])
-    
-    # Build shaping targets (pluggable for predator/prey)
-    shaping_targets = None
-    if enable_shaping:
-        from goodharts.training.reward_shaping import ShapingTarget, compute_shaping_reward
-        from goodharts.configs.default_config import CellType
-        shaping_targets = (
-            ShapingTarget(CellType.FOOD, weight=shaping_food_attract, distance_decay=True),
-            ShapingTarget(CellType.POISON, weight=-shaping_poison_repel, distance_decay=True),
-        )
-        print(f"   Shaping: food={shaping_food_attract:+.2f}, poison={-shaping_poison_repel:+.2f}", flush=True)
-    
-    # Use brain registry - architecture derived from observation spec
-    policy = create_brain(brain_type, spec, output_size=n_actions).to(device)
-    print(f"   Brain: {brain_type} (hidden_size={policy.hidden_size})", flush=True)
-    print(f"   Entropy coef: {entropy_coef}, Reward scale: {reward_scale}x", flush=True)
-    print(f"   Update every: {update_timestep} steps", flush=True)
-    
-    # Separate value head (critic) - connects to brain's feature layer
-    value_head = ValueHead(input_size=policy.hidden_size).to(device)
-    
-    # Optimizer for both
-    optimizer = optim.Adam(
-        list(policy.parameters()) + list(value_head.parameters()), 
-        lr=lr
-    )
-    
-    # Experience buffer
-    states, actions, log_probs, rewards, dones = [], [], [], [], []
-    
-    # Tracking
-    time_step = 0
-    running_reward = 0
-    running_food = 0
-    best_efficiency = float('-inf')
-    
-    # For visualization: track losses
-    last_policy_loss = 0.0
-    last_value_loss = 0.0
-    last_entropy = 0.0
-    last_action_probs = np.ones(n_actions) / n_actions
-    
-    # Derived efficiency decay rate
-    # Goal: An agent with constant "skill" should have equal decayed-efficiency at any curriculum stage
-    # Math: decay = (1 / sqrt(food_ratio))^(1/curriculum_steps)
-    # This ensures early easy-mode performance doesn't dominate late hard-mode performance
-    food_ratio = initial_food / final_food
-    efficiency_decay = (1 / np.sqrt(food_ratio)) ** (1 / curriculum_steps)
-    print(f"   Efficiency decay: {efficiency_decay:.6f}/ep (derived from curriculum)", flush=True)
-    
-    # Record hyperparameters to log
-    if logger:
-        logger.set_hyperparams(
-            mode=mode,
-            brain_type=brain_type,
-            max_episodes=max_episodes,
-            lr=lr,
-            gamma=gamma,
-            eps_clip=eps_clip,
-            k_epochs=k_epochs,
-            steps_per_env=update_timestep, # Renamed from update_timestep
-            entropy_coef=entropy_coef,
-            reward_scale=reward_scale,
-            value_coef=value_coef,
-            initial_food=initial_food,
-            final_food=final_food,
-            curriculum_fraction=curriculum_fraction,
-        )
-    
-    # Track update count for logging
-    update_count = 0
-    
-    for ep in range(1, max_episodes + 1):
-        # Curriculum: gradually reduce food density
-        progress = min(1.0, ep / curriculum_steps)
-        current_food = int(initial_food - progress * (initial_food - final_food))
+    # Find envs with food
+    has_food = food.any(axis=(1, 2))
+    if has_food.any():
+        # Mask distance map where food is present
+        masked_dist = np.where(food[has_food], dist_map, np.inf)
+        min_dists = masked_dist.reshape(masked_dist.shape[0], -1).min(axis=1)
         
-        # Setup world
-        world = World(config['GRID_WIDTH'], config['GRID_HEIGHT'], config)
-        world.place_food(current_food)
-        world.place_poison(train_cfg.get('poison_count', TRAINING_DEFAULTS['poison_count']))
+        # Inverse potential: 0.5 / dist
+        # dist is at least 1.0 (grid cells)
+        potentials[has_food] = 0.5 / (min_dists + 1e-6)
         
-        # Create agent with appropriate behavior requirements
-        behavior_req = 'ground_truth' if mode == 'ground_truth' else 'proxy_metric'
-        class DummyBehavior:
-            requirements = [behavior_req]
-            def decide_action(self, a, b): return (0, 0)
-        
-        agent = Organism(
-            np.random.randint(0, config['GRID_WIDTH']),
-            np.random.randint(0, config['GRID_HEIGHT']),
-            config['ENERGY_START'],
-            config['AGENT_VIEW_RANGE'],
-            world, DummyBehavior(), config
-        )
-        
-        state = agent.get_local_view(mode=mode)
-        ep_reward = 0
-        ep_food = 0
-        ep_length = 0
-        
-        for t in range(train_cfg.get('steps_per_episode', TRAINING_DEFAULTS['steps_per_episode'])):
-            time_step += 1
-            ep_length += 1
-            
-            # Get action from policy
-            with torch.no_grad():
-                state_t = torch.from_numpy(state).float().unsqueeze(0).to(device)
-                logits = policy(state_t)
-                dist = Categorical(logits=logits)
-                action = dist.sample()
-                log_prob = dist.log_prob(action).item()
-                
-                # Track action probabilities for visualization
-                probs = F.softmax(logits, dim=1).squeeze().cpu().numpy()
-                last_action_probs = probs
-            
-            action_idx = action.item()
-            dx, dy = action_space[action_idx]
-            
-            # Execute action
-            energy_before = agent.energy
-            agent.move(dx, dy)
-            
-            # Freeze energy if spec says so (for proxy_ill_adjusted training)
-            if spec.freeze_energy_in_training:
-                agent.energy = energy_before
-            
-            # Calculate reward based on mode
-            if spec.reward_type == 'interestingness':
-                # Reward for touching interesting cells
-                interestingness = world.proxy_grid[agent.y, agent.x]
-                reward = interestingness
-                
-                # Clear the cell (consume it)
-                if interestingness > 0:
-                    world.grid[agent.y, agent.x] = 0
-                    world.proxy_grid[agent.y, agent.x] = 0.0
-                    ep_food += 1  # Track touches
-            else:
-                # Standard energy delta reward
-                consumed = agent.eat()
-                reward = agent.energy - energy_before
-                if consumed and consumed[0] == 'FOOD':
-                    ep_food += 1
-            
-            done = not agent.alive
-            if done:
-                reward -= 10.0
-            
-            # Get new state for shaping calculation
-            new_state = agent.get_local_view(mode=mode)
-            
-            # Apply reward shaping (only considers visible targets)
-            if shaping_targets is not None:
-                view_center = (spec.view_size // 2, spec.view_size // 2)
-                shaping_reward = compute_shaping_reward(
-                    view_before=state,
-                    view_after=new_state,
-                    agent_pos_before=view_center,
-                    agent_pos_after=view_center,
-                    targets=shaping_targets
-                )
-                
-                # Compensate for "disappearing attractor":
-                # When food is eaten, it disappears from view, causing a large drop in shaping score.
-                # We add back the potential of the eaten item to neutralize this drop.
-                if consumed and consumed[0] == 'FOOD':
-                    # Find food target weight
-                    food_weight = 0.0
-                    for t in shaping_targets:
-                        if t.cell_type.name == 'Food':
-                            food_weight = t.weight
-                            break
-                    
-                    if food_weight > 0:
-                        # Add max potential (as if at distance 1)
-                        # We use 1.0 because distance is at least 1 (or 0.1 in formula)
-                        # Actually formula uses 1/dist. If we are on top of it, dist is small.
-                        # However, previous view had it at dist ~0 or 1.
-                        # Let's use a fixed compensation that roughly matches the drop.
-                        # Better yet: calculating the exact score contribution of a food at dist 0.
-                        # In compute_shaping_score, dist is max(real_dist, 0.1).
-                        # If we just ate it, we were at distance 0 (clamped to 0.1).
-                        # So contribution was weight * (1 / 0.1) = 10 * weight.
-                        shaping_reward += food_weight * 10.0
-                
-                reward += shaping_reward
-            
-            # Apply reward scaling
-            reward = reward * reward_scale
-            
-            # Store experience
-            states.append(state)
-            actions.append(action_idx)
-            log_probs.append(log_prob)
-            rewards.append(reward)
-            dones.append(done)
-            
-            ep_reward += reward
-            state = new_state  # Use already-computed new state
-            
-            # Update dashboard with step data (agent view, action probs)
-            if dashboard:
-                dashboard.update(mode, 'step', (state, last_action_probs, time_step))
-            
-            # PPO Update when buffer is full
-            if len(states) >= update_timestep:
-                losses = _ppo_update(
-                    policy, value_head, optimizer, states, actions, log_probs, 
-                    rewards, dones, gamma, eps_clip, k_epochs, device,
-                    entropy_coef=entropy_coef, value_coef=value_coef
-                )
-                last_policy_loss, last_value_loss, last_entropy = losses
-                states, actions, log_probs, rewards, dones = [], [], [], [], []
-                update_count += 1
-                print(f"   [{mode}] Step {time_step}: PPO Update (ent={last_entropy:.3f})", flush=True)
-                
-                # Log PPO update
-                if logger:
-                    logger.log_update(
-                        update_num=update_count,
-                        total_steps=time_step,
-                        policy_loss=last_policy_loss,
-                        value_loss=last_value_loss,
-                        entropy=last_entropy,
-                        action_probs=last_action_probs.tolist()
-                    )
-                
-                # Update visualization with PPO metrics
-                if viz:
-                    viz.update(
-                        ppo=(last_policy_loss, last_value_loss, last_entropy, last_action_probs),
-                        total_steps=time_step
-                    )
-                
-                # Update dashboard with PPO metrics
-                if dashboard:
-                    dashboard.update(mode, 'ppo', 
-                                    (last_policy_loss, last_value_loss, last_entropy, last_action_probs))
-            
-            if done:
-                break
-        
-        running_reward += ep_reward
-        running_food += ep_food
-        
-        # Update visualization with episode data
-        if viz:
-            viz.update(episode=(ep_reward, ep_length, current_food, progress))
-        
-        # Update dashboard with episode data
-        if dashboard:
-            dashboard.update(mode, 'episode', (ep, ep_reward, ep_length, ep_food, current_food))
-        
-        # Log episode
-        if logger:
-            logger.log_episode(
-                episode=ep,
-                reward=ep_reward,
-                length=ep_length,
-                food_eaten=ep_food,
-                food_density=current_food,
-                curriculum_progress=progress,
-                action_prob_std=last_action_probs.std()
-            )
-        
-        # Log every 10 episodes
-        if ep % 10 == 0:
-            avg_rew = running_reward / 10
-            avg_food = running_food / 10
-            eff = avg_rew / np.sqrt(current_food) if current_food > 0 else 0
-            
-            # Decay best_efficiency so early easy-mode wins fade over time
-            # This makes late hard-mode performance more valuable
-            best_efficiency *= efficiency_decay ** 10  # Apply 10 episodes of decay
-            
-            # Diagnostic: action probability std
-            prob_std = last_action_probs.std()
-            prob_indicator = "⚠️" if prob_std < 0.05 else "✓"
-            
-            print(f"[{mode}] Ep {ep:4d}: R={avg_rew:+.0f} | Eff={eff:+.1f} (best={best_efficiency:.1f}) | Food={avg_food:.1f} | "
-                  f"Dens={current_food} ({progress*100:.0f}%) | ProbStd={prob_std:.3f} {prob_indicator}", flush=True)
-            
-            if viz:
-                viz.update(best_efficiency=best_efficiency)
-            
-            if eff > best_efficiency and ep > 20:
-                best_efficiency = eff
-                # Save only the policy - compatible with LearnedBehavior!
-                torch.save(policy.state_dict(), output_path)
-                print(f"  ⭐ Saved (eff={eff:.2f})", flush=True)
-            
-            running_reward = 0
-            running_food = 0
-    
-    # Save final
-    torch.save(policy.state_dict(), output_path.replace('.pth', '_final.pth'))
-    print(f"\n✅ Done! Best: {output_path}", flush=True)
-    
-    # Finalize logging
-    if logger:
-        summary = logger.finalize(best_efficiency=best_efficiency, final_model_path=output_path)
-    
-    # Close visualizer if we created it
-    if viz and visualizer is None:
-        viz.stop()
+    return potentials
 
 
-def train_ppo_vec(
+def train_ppo(*args, **kwargs):
+    """
+    Wrapper for PPO training that handles stop signal synchronization.
+    Ensures the last finishing thread removes the stop signal file.
+    """
+    global _TRAINING_COUNTER
+    
+    with _TRAINING_LOCK:
+        _TRAINING_COUNTER += 1
+        
+    try:
+        _train_ppo_core(*args, **kwargs)
+    finally:
+        with _TRAINING_LOCK:
+            _TRAINING_COUNTER -= 1
+            remaining = _TRAINING_COUNTER
+            
+        if remaining == 0 and os.path.exists('.training_stop_signal'):
+            print(f"\\n🧹 Last thread finished. Removing stop signal.")
+            try:
+                os.remove('.training_stop_signal')
+            except OSError:
+                pass
+
+def _train_ppo_core(
     mode: str = 'ground_truth',
     brain_type: str = 'base_cnn',
     n_envs: int = 64,
     total_timesteps: int = 100_000,
     lr: float = 5e-4,
     gamma: float = 0.99,
+    gae_lambda: float = 0.95,
     eps_clip: float = 0.2,
     k_epochs: int = 4,
     steps_per_env: int = 128,
@@ -460,19 +183,15 @@ def train_ppo_vec(
     log_dir: str = 'logs',
 ):
     """
-    Vectorized PPO training - 10-50x faster than regular train_ppo.
-    
-    Uses VecEnv to run N environments in parallel with batched NumPy operations.
+    Vectorized PPO training with GAE (Core Implementation).
     """
     from goodharts.environments.vec_env import create_vec_env
-    from goodharts.configs.default_config import get_config
-    from goodharts.config import get_training_config
     from goodharts.training.train_log import TrainingLogger
     
     if device is None:
         device = get_device()
     
-    print(f"\n🚀 Vectorized PPO Training: {mode} on {device}")
+    print(f"\n🚀 Vectorized PPO Training (w/ GAE): {mode} on {device}")
     
     # Ensure seeding is effectively random unless specified otherwise
     import time
@@ -480,7 +199,6 @@ def train_ppo_vec(
     np.random.seed(seed)
     torch.manual_seed(seed)
     print(f"   Random Seed: {seed}")
-    
     print(f"   {n_envs} parallel environments")
     
     config = get_config()
@@ -490,13 +208,10 @@ def train_ppo_vec(
     spec = config['get_observation_spec'](mode)
     n_actions = num_actions(1)
     
-    # Create vectorized environment (pulls all settings from config)
-    vec_env = create_vec_env(n_envs=n_envs, obs_spec=spec)
+    # Create vectorized environment
     vec_env = create_vec_env(n_envs=n_envs, obs_spec=spec)
     print(f"   View: {vec_env.view_size}x{vec_env.view_size}, Channels: {vec_env.n_channels}")
     print(f"   Loop Mode: {vec_env.loop} (Config: {config.get('WORLD_LOOP')})")
-    if not vec_env.loop:
-         print("   ⚠️ WARNING: Loop mode is FALSE! Agents will hit walls.")
     
     # Create policy and value head
     policy = create_brain(brain_type, spec, output_size=n_actions).to(device)
@@ -508,7 +223,7 @@ def train_ppo_vec(
     )
     
     print(f"   Brain: {brain_type} (hidden_size={policy.hidden_size})")
-    print(f"   Entropy coef: {entropy_coef}")
+    print(f"   Entropy: {entropy_coef}, GAE Lambda: {gae_lambda}")
     
     # Initialize logging
     logger = None
@@ -521,6 +236,7 @@ def train_ppo_vec(
             total_timesteps=total_timesteps,
             lr=lr,
             gamma=gamma,
+            gae_lambda=gae_lambda, # Record lambda
             eps_clip=eps_clip,
             k_epochs=k_epochs,
             steps_per_env=steps_per_env,
@@ -534,6 +250,7 @@ def train_ppo_vec(
     log_probs_buffer = []
     rewards_buffer = []
     dones_buffer = []
+    values_buffer = [] # Store values for GAE
     
     # Tracking
     total_steps = 0
@@ -548,71 +265,113 @@ def train_ppo_vec(
     import time
     start_time = time.perf_counter()
     
-    # Curriculum settings
-    start_food = train_cfg.get('initial_food', TRAINING_DEFAULTS['initial_food'])
-    end_food = train_cfg.get('final_food', TRAINING_DEFAULTS['final_food'])
-    reward_scale = train_cfg.get('reward_scale', TRAINING_DEFAULTS['reward_scale'])
+    # Curriculum settings - configurable ranges for robustness
+    min_food = train_cfg.get('min_food', 50)
+    max_food = train_cfg.get('max_food', 200)
+    min_poison = train_cfg.get('min_poison', 20)
+    max_poison = train_cfg.get('max_poison', 100)
     
+    vec_env.initial_food = (min_food + max_food) // 2  # Start at midpoint
+    
+    # Initialize potentials for shaping
+    prev_potentials = _get_potentials_np(states)
+
+    profiler = Profiler(device=device)
+
+
     while total_steps < total_timesteps:
-        # Curriculum: Update food density based on progress
-        progress = min(1.0, total_steps / total_timesteps)
-        current_food = int(start_food - progress * (start_food - end_food))
-        vec_env.initial_food = current_food
-        
-        # Calculate consistency-preserving reward scale
-        # As food becomes scarcer, we scale up reward per item to keep
-        # the total potential reward of the episode roughly constant.
-        # This helps PPO value estimation (returns don't vanish).
-        density_scale = start_food / max(current_food, 1)
-        
-        # Get actions from policy
+        profiler.start()
+        # Check for stop signal (from dashboard)
+
+        if os.path.exists('.training_stop_signal'):
+            print(f"\n🛑 Stop signal received! Finalizing training...")
+            break
+
+        # Get actions and values from policy
         with torch.no_grad():
             states_t = torch.from_numpy(states).float().to(device)
             logits = policy(states_t)
+            features = policy.get_features(states_t)
+            values = value_head(features).squeeze().cpu().numpy() # Get value estimate
+            
             dist = Categorical(logits=logits)
             actions = dist.sample()
             log_probs = dist.log_prob(actions)
             action_probs = F.softmax(logits, dim=1).cpu().numpy()
         
+        profiler.tick("Inference")
         actions_np = actions.cpu().numpy()
+
         
         # Step all environments
         next_states, rewards, dones = vec_env.step(actions_np)
-        
-        # Apply global reward scaling and density scaling
-        rewards = rewards * reward_scale * density_scale
-        
-        # Clip scaled rewards to avoid massive outliers
-        rewards = np.clip(rewards, -10.0, 10.0)
-        
+        profiler.tick("Env Step")
 
-
+        
+        # --- REWARD SHAPING & SCALING ---
+        # 1. Scale raw rewards based on Reward Type
+        if spec.reward_type == 'interestingness':
+            # PROXY ILL-ADJUSTED MODE
+            # Optimizes "Interestingness", not Energy.
+            # Food (Reward > 0) -> +1.0 Interesting
+            # Poison (Reward < 0) -> +0.9 Interesting (Trap!)
+            # We ignore the negative energy signal from Poison and treat it as a Reward.
+            
+            scaled_rewards = np.zeros_like(rewards)
+            scaled_rewards[rewards > 0] = 1.0 # Food
+            # Note: VecEnv returns negative reward for poison.
+            # We map that negative signal to a POSITIVE proxy reward.
+            scaled_rewards[rewards < 0] = 0.9 # Poison
+            
+        else:
+            # GROUND TRUTH & PROXY NORMAL
+            # Optimize Energy Delta (Food=Good, Poison=Bad)
+            scaled_rewards = rewards * train_cfg['reward_scale']
+        
+        # 2. Potential-Based Shaping: gamma * phi(s') - phi(s)
+        next_potentials = _get_potentials_np(next_states)
+        # If terminal, next_potential is 0.0 (no food visible state)
+        target_potentials = np.where(dones, 0.0, next_potentials)
+        
+        shaping = (target_potentials * gamma) - prev_potentials
+        
+        # Add shaping (Total Reward)
+        total_rewards = scaled_rewards + shaping
+        
+        # Clip only the total to avoid crazy outliers, but allow range
+        # Food(1.0) + Shaping(~1.0) = 2.0. Clipping to [-5, 5] is safe.
+        total_rewards = np.clip(total_rewards, -5.0, 5.0)
+        
+        # Update potentials
+        prev_potentials = next_potentials # next_states is already reset state
+        
         # Store experience
         states_buffer.append(states)
         actions_buffer.append(actions_np)
         log_probs_buffer.append(log_probs.cpu().numpy())
-        rewards_buffer.append(rewards)
+        rewards_buffer.append(total_rewards) # Use shaped rewards for training
         dones_buffer.append(dones)
+        values_buffer.append(values)
         
         total_steps += n_envs
         episode_rewards += rewards
         
-        # Reset done environments and track episodes
+        # Handle done episodes (stats tracking only)
+        # Note: GAE handles value bootstrapping for non-terminal steps in buffer
         if dones.any():
             done_envs = np.where(dones)[0]
             for i in done_envs:
                 episode_count += 1
                 if episode_rewards[i] > best_reward:
                     best_reward = episode_rewards[i]
-                # Log episode
                 if logger:
                     logger.log_episode(
                         episode=episode_count,
                         reward=episode_rewards[i],
-                        length=500,  # Approximate
+                        length=500, # Approx
                         food_eaten=vec_env.current_episode_food[i],
                         food_density=vec_env.initial_food,
-                        curriculum_progress=total_steps / total_timesteps,
+                        curriculum_progress=0.0, # Removed
                         action_prob_std=action_probs.std(axis=1).mean(),
                     )
             episode_rewards[dones] = 0
@@ -620,50 +379,87 @@ def train_ppo_vec(
         
         states = next_states
         
-        # Update dashboard with current state (sample first env)
+        profiler.tick("Storage")
+
+        # Update dashboard
         if dashboard:
             dashboard.update(mode, 'step', (states[0], action_probs[0], total_steps))
+            profiler.tick("Dashboard Step")
         
-        # UX: Print progress dot every 10 steps to show collection is active
         if len(states_buffer) % 10 == 0:
+
              print(".", end="", flush=True)
 
-        # PPO Update
+        # UPDATE STEP
         if len(states_buffer) >= steps_per_env:
-            print("") # Newline after dots
-            # Compute returns properly for vectorized environments
-            # (Bootstrapping with 0 for truncation to match original behavior, though value-bootstrapping would be better)
-            returns_np = np.zeros_like(rewards_buffer)  # (steps, envs)
-            running_returns = np.zeros(n_envs)
+            print("")
             
-            # Vectorized GAE/Return calculation
-            # We iterate backwards through the buffer
-            # rewards_buffer is list of (n_envs,) arrays -> convert to (steps, n_envs) first
-            rewards_mat = np.stack(rewards_buffer)  # (steps, n_envs)
-            dones_mat = np.stack(dones_buffer)      # (steps, n_envs)
+            # BOOTSTRAPPING & GAE
+            with torch.no_grad():
+                next_states_t = torch.from_numpy(states).float().to(device)
+                next_features = policy.get_features(next_states_t)
+                next_value = value_head(next_features).squeeze().cpu().numpy()
             
+            # Initialize GAE result container
+            # (steps, envs)
+            returns = np.zeros_like(rewards_buffer)
+            advantages = np.zeros_like(rewards_buffer)
+            
+            lastgae = 0
+            
+            # Iterate backwards
             for t in reversed(range(len(rewards_buffer))):
-                running_returns = rewards_mat[t] + gamma * running_returns * (1.0 - dones_mat[t])
-                returns_np[t] = running_returns
+                if t == len(rewards_buffer) - 1:
+                    nextnonterminal = 1.0 - dones # Current done status? No.
+                    # Correctness check: dones_buffer[t] indicates if step t resulted in completion
+                    # If step t was done, next value should be 0.
+                    # But wait, next_value is V(s_{t+1}).
+                    # If done, s_{t+1} is the FIRST step of new episode (reset).
+                    # PPO standard: value of terminal state is 0 (or reward handled).
+                    # Standard GAE implementation:
+                    # delta = r_t + gamma * V(s_{t+1}) * (1-d_t) - V(s_t)
+                    nextvalues = next_value
+                else:
+                    nextvalues = values_buffer[t+1]
                 
-            # Flatten everything for PPO
-            all_states = np.concatenate(states_buffer, axis=0) # (steps*envs, ...)
+                # Check done flag. If done[t] is true, it means s_t -> s_{t+1} was terminal.
+                # So value of future is 0.
+                mask = 1.0 - dones_buffer[t]
+                
+                delta = rewards_buffer[t] + gamma * nextvalues * mask - values_buffer[t]
+                lastgae = delta + gamma * gae_lambda * mask * lastgae
+                advantages[t] = lastgae
+            
+            # Returns = Advantages + Values
+            returns = advantages + np.stack(values_buffer)
+            profiler.tick("GAE Calc")
+
+            
+            # Flatten for update - keep as NumPy arrays (no .tolist()!)
+            all_states = np.concatenate(states_buffer, axis=0)  # (steps*envs, ...)
             all_actions = np.concatenate(actions_buffer, axis=0)
             all_log_probs = np.concatenate(log_probs_buffer, axis=0)
-            # all_rewards not needed for update if we have returns
-            all_dones = np.concatenate(dones_buffer, axis=0)
-            all_returns = returns_np.flatten() # (steps*envs,)
+            all_returns = returns.flatten()
+            all_advantages = advantages.flatten()
+            all_old_values = np.stack(values_buffer).flatten()
             
+            # Normalize advantages
+            all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
+            
+            # PPO UPDATE - pass NumPy arrays directly for efficiency
             losses = _ppo_update(
                 policy, value_head, optimizer,
-                all_states.tolist(), all_actions.tolist(), all_log_probs.tolist(),
-                None, all_dones.tolist(), # Rewards not needed
+                all_states, all_actions, all_log_probs,
                 gamma, eps_clip, k_epochs, device,
                 entropy_coef=entropy_coef, value_coef=value_coef,
-                returns=all_returns.tolist()
+                returns=all_returns,
+                advantages=all_advantages,
+                old_values=all_old_values
             )
+            profiler.tick("PPO Update")
             
             update_count += 1
+
             policy_loss, value_loss, entropy = losses
             
             # Clear buffers
@@ -672,8 +468,8 @@ def train_ppo_vec(
             log_probs_buffer = []
             rewards_buffer = []
             dones_buffer = []
+            values_buffer = []
             
-            # Log update
             if logger:
                 logger.log_update(
                     update_num=update_count,
@@ -684,90 +480,92 @@ def train_ppo_vec(
                     action_probs=action_probs[0].tolist()
                 )
             
-            # Dashboard update
+            
+            # Randomize every update to prevent overfitting
+            new_food = np.random.randint(min_food, max_food + 1)
+            new_poison = np.random.randint(min_poison, max_poison + 1)
+            vec_env.initial_food = new_food
+            vec_env.poison_count = new_poison
+            # Note: This only affects NEW episodes (resets), not currently running ones.
+            # Which is perfect.
+            
             if dashboard:
-                # Calculate mean reward for recent episodes to show learning progress
-                # Note: episode_rewards only contains rewards for *finished* episodes in the buffer,
-                # but we reset done indices. We need to track recent episode rewards.
-                # Actually, episode_rewards array holds current episode rewards.
-                # We need to capture rewards from the *just completed* episodes.
-                
-                # Best approximation: use the average of best_reward (max) and current mean?
-                # No, we want the trend.
-                # In vectorized training, we process many episodes. 
-                # Let's track a running mean of finished episode rewards.
-                
-                # For now, let's use the mean of the batch of finished episodes if any,
-                # otherwise use the last known mean.
-                
                 current_reward = best_reward
                 if logger and hasattr(logger, 'episode_rewards') and len(logger.episode_rewards) > 0:
-                    # Get average of last 10 episodes from logger
                     current_reward = np.mean(logger.episode_rewards[-10:])
+                elif current_reward == float('-inf'):
+                    current_reward = 0.0  # Default to 0 if no episodes finished yet
 
                 dashboard.update(mode, 'ppo', (policy_loss, value_loss, entropy, action_probs[0]))
                 dashboard.update(mode, 'episode', (episode_count, current_reward, 500, 0, vec_env.initial_food))
             
-            # Progress
+            if dashboard:
+                profiler.tick("Dashboard Log")
+
             elapsed = time.perf_counter() - start_time
             sps = total_steps / elapsed
             prob_std = action_probs.std(axis=1).mean()
             print(f"   [{mode}] Step {total_steps:,}: {sps:,.0f} sps | "
                   f"Best R={best_reward:.0f} | ProbStd={prob_std:.3f} | Ent={entropy:.3f}")
+            print(f"   [Profile] {profiler.summary()}")
+            profiler.reset()
+
     
-    # Save final model
     torch.save(policy.state_dict(), output_path)
     elapsed = time.perf_counter() - start_time
     print(f"\n✅ [{mode}] Done! {total_steps:,} steps in {elapsed:.1f}s ({total_steps/elapsed:,.0f} steps/sec)")
     print(f"   Saved: {output_path}")
     
-    # Finalize logging
     if logger:
         logger.finalize(best_efficiency=best_reward, final_model_path=output_path)
-    
-    # Signal dashboard we're done
     if dashboard:
         dashboard.update(mode, 'finished', None)
 
 
-def _ppo_update(policy, value_head, optimizer, states, actions, log_probs, rewards, dones, 
-                gamma, eps_clip, k_epochs, device, entropy_coef=0.001, value_coef=0.5, returns=None):
+def _ppo_update(
+    policy, value_head, optimizer,
+    states: np.ndarray,
+    actions: np.ndarray, 
+    log_probs: np.ndarray,
+    gamma: float,
+    eps_clip: float,
+    k_epochs: int,
+    device: torch.device,
+    entropy_coef: float = 0.001,
+    value_coef: float = 0.5, 
+    returns: np.ndarray = None,
+    advantages: np.ndarray = None,
+    old_values: np.ndarray = None
+):
     """
     Perform PPO update on collected experience.
     
-    Returns:
-        Tuple of (policy_loss, value_loss, entropy) for logging
+    Args:
+        states: Observations, shape (batch, channels, h, w)
+        actions: Action indices, shape (batch,)
+        log_probs: Log probabilities of actions taken, shape (batch,)
+        returns: Computed returns (rewards-to-go), shape (batch,)
+        advantages: GAE advantages, shape (batch,)
+        old_values: Value estimates from collection, shape (batch,)
     """
-    # Convert to tensors
-    old_states = torch.tensor(np.array(states), dtype=torch.float32).to(device)
-    old_actions = torch.tensor(actions, dtype=torch.long).to(device)
-    old_log_probs = torch.tensor(log_probs, dtype=torch.float32).to(device)
+    # Convert NumPy arrays to tensors efficiently (from_numpy is zero-copy when possible)
+    old_states = torch.from_numpy(states).float().to(device)
+    old_actions = torch.from_numpy(actions).long().to(device)
+    old_log_probs = torch.from_numpy(log_probs).float().to(device)
     
-    # Compute returns (rewards-to-go) if not provided
-    if returns is None:
-        returns = []
-        discounted = 0
-        for r, d in zip(reversed(rewards), reversed(dones)):
-            if d:
-                discounted = 0
-            discounted = r + gamma * discounted
-            returns.insert(0, discounted)
+    returns_t = torch.from_numpy(returns).float().to(device)
+    advantages_t = torch.from_numpy(advantages).float().to(device)
     
-    returns = torch.tensor(returns, dtype=torch.float32).to(device)
-    returns = (returns - returns.mean()) / (returns.std() + 1e-7)
-    
-    # Track metrics for last epoch
+    old_values_t = None
+    if old_values is not None:
+        old_values_t = torch.from_numpy(old_values).float().to(device)
+
     final_policy_loss = 0.0
     final_value_loss = 0.0
     final_entropy = 0.0
     
-    # PPO epochs
     for _ in range(k_epochs):
-        # Get policy logits and features
         logits = policy(old_states)
-        
-        # For value, we need to extract features from policy
-        # Use the Brain interface's get_features() method
         features = policy.get_features(old_states)
         values = value_head(features).squeeze()
         
@@ -777,25 +575,31 @@ def _ppo_update(policy, value_head, optimizer, states, actions, log_probs, rewar
         
         # Ratio and clipped surrogate
         ratios = torch.exp(new_log_probs - old_log_probs)
-        advantages = returns - values.detach()
         
-        surr1 = ratios * advantages
-        surr2 = torch.clamp(ratios, 1 - eps_clip, 1 + eps_clip) * advantages
+        surr1 = ratios * advantages_t
+        surr2 = torch.clamp(ratios, 1 - eps_clip, 1 + eps_clip) * advantages_t
         
         policy_loss = -torch.min(surr1, surr2).mean()
-        value_loss = F.mse_loss(values, returns)
+        
+        # Value Loss with Clipping
+        if old_values_t is not None:
+            v_clip = old_values_t + torch.clamp(values - old_values_t, -eps_clip, eps_clip)
+            v_loss1 = F.mse_loss(values, returns_t)
+            v_loss2 = F.mse_loss(v_clip, returns_t)
+            value_loss = torch.max(v_loss1, v_loss2)
+        else:
+            value_loss = F.mse_loss(values, returns_t)
+            
         entropy_bonus = entropy.mean()
         
         loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus
-        # Optimize
+        
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
         torch.nn.utils.clip_grad_norm_(value_head.parameters(), 0.5)
         optimizer.step()
 
-        
-        # Track final epoch metrics
         final_policy_loss = policy_loss.item()
         final_value_loss = value_loss.item()
         final_entropy = entropy_bonus.item()
@@ -803,42 +607,19 @@ def _ppo_update(policy, value_head, optimizer, states, actions, log_probs, rewar
     return final_policy_loss, final_value_loss, final_entropy
 
 
-def _train_mode_wrapper(args_tuple):
-    """Wrapper for multiprocessing - must be at module level for pickle."""
-    mode, brain_type, episodes, visualize, dashboard = args_tuple
-    output_path = f'models/ppo_{mode}.pth'
-    train_ppo(mode=mode, brain_type=brain_type, max_episodes=episodes, 
-              output_path=output_path, visualize=visualize, dashboard=dashboard)
-
-
-def _train_thread_worker(mode: str, brain_type: str, episodes: int, 
-                         dashboard: 'TrainingDashboard', log_to_file: bool = True):
-    """Worker function for background training with dashboard integration."""
-    output_path = f'models/ppo_{mode}.pth'
-    
-    try:
-        train_ppo(
-            mode=mode,
-            brain_type=brain_type,
-            max_episodes=episodes,
-            output_path=output_path,
-            visualize=False,
-            dashboard=dashboard,
-            log_to_file=log_to_file,
-        )
-    except Exception as e:
-        print(f"[{mode}] Training error: {e}")
-    finally:
-        if dashboard:
-            dashboard.update(mode, 'finished', None)
-
-
 if __name__ == '__main__':
     import argparse
-    import multiprocessing as mp
     import threading
     from goodharts.configs.observation_spec import get_all_mode_names
     from goodharts.configs.default_config import get_config
+    
+    # Cleanup stale stop signal
+    if os.path.exists('.training_stop_signal'):
+        try:
+            os.remove('.training_stop_signal')
+            print("🧹 Removed stale stop signal.")
+        except OSError:
+            pass
 
     config = get_config()
     all_modes = get_all_mode_names(config)
@@ -846,43 +627,27 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', default='ground_truth', choices=all_modes + ['all'])
-    parser.add_argument('--brain', default='base_cnn', choices=brain_names,
-                        help='Brain architecture to use')
-    parser.add_argument('--episodes', type=int, default=500)
-    parser.add_argument('--timesteps', type=int, default=100_000,
-                        help='Total timesteps for vectorized training (default: 100k)')
-    parser.add_argument('--entropy', type=float, default=None,
-                        help='Entropy coefficient (default: from config)')
-    parser.add_argument('--visualize', '-v', action='store_true',
-                        help='Show live training visualization (old-style, per-process)')
-    parser.add_argument('--dashboard', '-d', action='store_true',
-                        help='Show unified training dashboard (all runs in one window)')
-    parser.add_argument('--vec', action='store_true',
-                        help='Use vectorized training (10-50x faster)')
-    parser.add_argument('--n-envs', type=int, default=64,
-                        help='Number of parallel environments for --vec mode (default: 64)')
+    parser.add_argument('--brain', default='base_cnn', choices=brain_names)
+    parser.add_argument('--timesteps', type=int, default=100_000)
+    parser.add_argument('--entropy', type=float, default=None)
+    parser.add_argument('--dashboard', '-d', action='store_true')
+    parser.add_argument('--n-envs', type=int, default=64)
     args = parser.parse_args()
     
-    # Determine modes to train
     modes_to_train = all_modes if args.mode == 'all' else [args.mode]
     
-    # Vectorized training with dashboard
-    if args.vec and args.dashboard:
+    if args.dashboard:
         from goodharts.training.train_dashboard import create_dashboard
         from goodharts.behaviors.action_space import num_actions
         
-        print(f"\n🎛️  Vectorized training with dashboard")
-        print(f"   Modes: {', '.join(modes_to_train)}")
-        print(f"   {args.n_envs} parallel environments per mode\n")
-        
+        print(f"\n🎛️  Training with dashboard")
         dashboard = create_dashboard(modes_to_train, n_actions=num_actions(1))
         
-        # Start training threads
         threads = []
         for mode in modes_to_train:
             output_path = f'models/ppo_{mode}.pth'
             t = threading.Thread(
-                target=train_ppo_vec,
+                target=train_ppo,
                 kwargs={
                     'mode': mode,
                     'brain_type': args.brain,
@@ -898,7 +663,6 @@ if __name__ == '__main__':
             threads.append(t)
             t.start()
         
-        # Run dashboard on main thread
         try:
             dashboard.run()
         except KeyboardInterrupt:
@@ -906,19 +670,16 @@ if __name__ == '__main__':
         
         for t in threads:
             t.join(timeout=1.0)
-        
-        print("\n✅ Dashboard closed")
     
-    # Vectorized training without dashboard (sequential or parallel)
-    elif args.vec:
+    else:
+        # Sequential or Parallel without dashboard
         if len(modes_to_train) > 1:
-            # Parallel vectorized training with threads
-            print(f"\n🚀 Parallel vectorized training: {len(modes_to_train)} modes")
+            print(f"\n🚀 Parallel training: {len(modes_to_train)} modes")
             threads = []
             for mode in modes_to_train:
                 output_path = f'models/ppo_{mode}.pth'
                 t = threading.Thread(
-                    target=train_ppo_vec,
+                    target=train_ppo,
                     kwargs={
                         'mode': mode,
                         'brain_type': args.brain,
@@ -934,12 +695,10 @@ if __name__ == '__main__':
             
             for t in threads:
                 t.join()
-            
-            print("\n✅ All modes trained!")
         else:
-            # Single mode vectorized
+            # Single mode
             output_path = f'models/ppo_{modes_to_train[0]}.pth'
-            train_ppo_vec(
+            train_ppo(
                 mode=modes_to_train[0],
                 brain_type=args.brain,
                 n_envs=args.n_envs,
@@ -947,62 +706,3 @@ if __name__ == '__main__':
                 entropy_coef=args.entropy if args.entropy else 0.0,
                 output_path=output_path,
             )
-    
-    # Standard dashboard mode (episode-based)
-    elif args.dashboard:
-        from goodharts.training.train_dashboard import create_dashboard
-        from goodharts.behaviors.action_space import num_actions
-        
-        print(f"\n🎛️  Dashboard mode: {len(modes_to_train)} runs")
-        print(f"   Modes: {', '.join(modes_to_train)}\n")
-        
-        dashboard = create_dashboard(modes_to_train, n_actions=num_actions(1))
-        
-        threads = []
-        for mode in modes_to_train:
-            t = threading.Thread(
-                target=_train_thread_worker,
-                args=(mode, args.brain, args.episodes, dashboard, True),
-                daemon=True
-            )
-            threads.append(t)
-            t.start()
-        
-        try:
-            dashboard.run()
-        except KeyboardInterrupt:
-            print("\n⏹️  Training interrupted")
-        
-        for t in threads:
-            t.join(timeout=1.0)
-        
-        print("\n✅ Dashboard closed")
-        
-    # All modes in parallel (multiprocessing)
-    elif args.mode == 'all':
-        print(f"\n🔄 Training ALL {len(all_modes)} modes in parallel (brain={args.brain})...\n")
-        
-        ctx = mp.get_context('spawn')
-        processes = []
-        for mode in all_modes:
-            p = ctx.Process(target=_train_mode_wrapper, 
-                           args=((mode, args.brain, args.episodes, args.visualize, None),))
-            processes.append(p)
-            p.start()
-        
-        for p in processes:
-            p.join()
-        
-        print("\n✅ All models trained!")
-        for mode in all_modes:
-            print(f"   models/ppo_{mode}.pth")
-    
-    # Single mode training
-    else:
-        train_ppo(
-            mode=args.mode, 
-            brain_type=args.brain, 
-            max_episodes=args.episodes,
-            entropy_coef=args.entropy,
-            visualize=args.visualize
-        )

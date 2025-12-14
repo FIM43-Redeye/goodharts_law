@@ -32,19 +32,29 @@ def test_simulation_step(config):
 
 def test_agent_death_cleanup(config):
     sim = Simulation(config)
-    # Kill an agent manually
+    # Kill an agent by starvation
     agent = sim.agents[0]
-    agent.alive = False
-    agent.death_reason = "Test"
+    # AgentWrapper setter for energy effectively sets it in VecEnv? 
+    # Wrapper uses property for energy, DOES IT have a setter?
+    # I did NOT implement a setter for energy in AgentWrapper.
+    # We must access vec_env directly.
+    
+    idx = agent.idx
+    sim.vec_env.agent_energy[idx] = -10.0
     
     sim.step()
     
-    # Should be removed
-    assert agent not in sim.agents
-    assert len(sim.stats['deaths']) == 1
-    assert sim.stats['deaths'][0]['id'] == agent.id
+    # In the new simulation, we do NOT remove agents from the list on death!
+    # They are just dead/reset. VecEnv auto-resets.
+    # But Simulation tracks death stats.
+    # The 'dones' flag will be true.
+    
+    # Check stats instead of removal
+    assert len(sim.stats['deaths']) >= 1
+    # Check that at least one death is recorded for this agent
+    assert any(d['id'] == agent.id for d in sim.stats['deaths'])
 
 def test_heatmap_update(config):
     sim = Simulation(config)
     sim.step()
-    assert np.sum(sim.stats['heatmap']) > 0
+    assert np.sum(sim.stats['heatmap']['all']) > 0

@@ -72,7 +72,17 @@ def load_config(path: Path | str | None = None) -> dict:
     
     with open(config_path, 'rb') as f:
         config = tomllib.load(f)
-    
+
+    # Apply runtime overrides (must happen early)
+    if 'runtime' in config:
+        if config['runtime'].get('hsa_override_gfx_version'):
+            import os
+            # Only set if not already set by user env
+            if 'HSA_OVERRIDE_GFX_VERSION' not in os.environ:
+                val = config['runtime']['hsa_override_gfx_version']
+                os.environ['HSA_OVERRIDE_GFX_VERSION'] = str(val)
+                print(f"🔧 Applied HSA_OVERRIDE_GFX_VERSION={val} (from config)")
+
     _config = config
     _config_path = config_path
     
