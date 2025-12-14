@@ -81,6 +81,9 @@ freeze_energy = true # If true, agent energy stays constant (for visualization)
 #                      # Leave commented for auto-detection (CUDA > CPU)
 #                      # Can also use GOODHARTS_DEVICE env var
 
+# hsa_override_gfx_version = "11.0.0" # Override for ROCm iGPU support (e.g. gfx1103 -> 11.0.0)
+
+
 # =============================================================================
 # TRAINING (for train_ppo.py and other training scripts)
 # =============================================================================
@@ -90,8 +93,11 @@ initial_food = 200          # Start sparse (was 500)
 final_food = 50             # End very sparse (was 200)
 curriculum_fraction = 0.7   # Fraction of episodes for curriculum
 
-# Environment
-poison_count = 50           # Fixed poison count during training
+# Environment density ranges (randomized each update for robustness)
+min_food = 50               # Minimum food count during training
+max_food = 200              # Maximum food count during training  
+min_poison = 20             # Minimum poison count during training
+max_poison = 100            # Maximum poison count during training
 steps_per_episode = 500     # Max steps per episode
 
 # PPO hyperparameters

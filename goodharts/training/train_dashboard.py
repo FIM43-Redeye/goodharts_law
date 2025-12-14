@@ -1,24 +1,22 @@
 """
-Unified Training Dashboard.
+Unified Training Dashboard (Graph Only).
 
 Single matplotlib window showing:
-- Agent's view (world around agent)
-- CNN input channels (what the network sees)
-- Action probabilities
-- Training graphs (reward, loss, entropy)
+- Reward History
+- Losses (Policy, Value)
+- Entropy
 
-Supports multiple concurrent training runs in a tiled layout.
-Main thread runs matplotlib, training runs in background threads.
+Optimized for fast vectorized training (no image rendering).
 """
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.widgets import Button
 from matplotlib.animation import FuncAnimation
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
-import threading
 import queue
 import time
 
@@ -36,15 +34,11 @@ class RunState:
     food_eaten: int = 0
     food_density: int = 0
     
-    # Current step data
-    agent_view: np.ndarray | None = None  # Shape: (channels, H, W)
-    action_probs: np.ndarray = field(default_factory=lambda: np.ones(8) / 8)
-    
-    # Metrics history
-    rewards: deque = field(default_factory=lambda: deque(maxlen=200))
-    policy_losses: deque = field(default_factory=lambda: deque(maxlen=200))
-    value_losses: deque = field(default_factory=lambda: deque(maxlen=200))
-    entropies: deque = field(default_factory=lambda: deque(maxlen=200))
+    # Metrics history (keep more history for graphs)
+    rewards: deque = field(default_factory=lambda: deque(maxlen=1000))
+    policy_losses: deque = field(default_factory=lambda: deque(maxlen=1000))
+    value_losses: deque = field(default_factory=lambda: deque(maxlen=1000))
+    entropies: deque = field(default_factory=lambda: deque(maxlen=1000))
     
     # Status
     is_running: bool = True
@@ -59,19 +53,9 @@ class RunState:
 class TrainingDashboard:
     """
     Unified visualization dashboard for training runs.
-    
-    Runs matplotlib on main thread with training in background.
-    Supports multiple concurrent runs in a tiled layout.
     """
     
     def __init__(self, modes: list[str], n_actions: int = 8):
-        """
-        Initialize dashboard.
-        
-        Args:
-            modes: List of training mode names (determines grid layout)
-            n_actions: Number of possible actions
-        """
         self.modes = modes
         self.n_actions = n_actions
         self.n_runs = len(modes)
@@ -82,39 +66,31 @@ class TrainingDashboard:
             for mode in modes
         }
         
-        # Thread-safe update queue: (mode, update_type, data)
+        # Thread-safe update queue
         self.update_queue: queue.Queue = queue.Queue()
         
         # Speed control
-        self.speed_mode = 'normal'  # 'fast', 'normal', 'pause'
+        self.speed_mode = 'normal'
         self.paused = False
         
         # Matplotlib state
         self.fig = None
         self.axes: dict[str, dict[str, Any]] = {}  # mode -> {axis_name: axis}
-        self.run_panels: dict[str, dict[str, Any]] = {}  # mode -> {name: artist}
+        self.line_artists: dict[str, dict[str, Any]] = {}  # mode -> {name: Line2D}
         
-        # Control
         self.running = True
     
     def update(self, mode: str, update_type: str, data: Any):
-        """
-        Queue an update from a training thread (thread-safe).
-        
-        Args:
-            mode: Training mode name
-            update_type: 'step', 'episode', 'ppo', 'finished'
-            data: Update data (varies by type)
-        """
+        """Queue an update from a training thread."""
         try:
             self.update_queue.put_nowait((mode, update_type, data))
         except queue.Full:
-            pass  # Drop updates if queue is full
+            pass
     
     def _process_updates(self):
-        """Process all pending updates from training threads."""
+        """Process all pending updates."""
         updates_processed = 0
-        max_updates = 100  # Limit to avoid blocking
+        max_updates = 200
         
         while not self.update_queue.empty() and updates_processed < max_updates:
             try:
@@ -126,9 +102,7 @@ class TrainingDashboard:
                 run.last_update = time.time()
                 
                 if update_type == 'step':
-                    # data: (agent_view, action_probs, total_steps)
-                    run.agent_view = data[0]
-                    run.action_probs = data[1]
+                    # data: (agent_view, action_probs, total_steps) -> IGNORE view/probs
                     run.total_steps = data[2]
                 
                 elif update_type == 'episode':
@@ -136,8 +110,6 @@ class TrainingDashboard:
                     run.episode = data[0]
                     run.episode_reward = data[1]
                     run.episode_length = data[2]
-                    run.food_eaten = data[3]
-                    run.food_density = data[4]
                     run.rewards.append(data[1])
                 
                 elif update_type == 'ppo':
@@ -145,7 +117,6 @@ class TrainingDashboard:
                     run.policy_losses.append(data[0])
                     run.value_losses.append(data[1])
                     run.entropies.append(data[2])
-                    run.action_probs = data[3]
                 
                 elif update_type == 'finished':
                     run.is_finished = True
@@ -156,251 +127,209 @@ class TrainingDashboard:
             except queue.Empty:
                 break
     
+    def _smooth(self, data: list[float], alpha: float = 0.9) -> list[float]:
+        """Apply exponential moving average smoothing."""
+        if not data:
+            return []
+        smoothed = []
+        last = data[0]
+        for val in data:
+            # Simple EMA
+            last = last * alpha + val * (1 - alpha)
+            smoothed.append(last)
+        return smoothed
+
     def _create_figure(self):
-        """Create the matplotlib figure with grid layout."""
-        # Determine grid size based on number of runs
-        if self.n_runs == 1:
-            rows, cols = 1, 1
-        elif self.n_runs == 2:
-            rows, cols = 1, 2
-        elif self.n_runs <= 4:
-            rows, cols = 2, 2
-        else:
-            rows, cols = 2, 3
+        """Create the matplotlib figure with concise layout."""
+        # Clean styling
+        plt.style.use('dark_background')
         
-        # Create figure
-        fig_width = 6 * cols
-        fig_height = 8 * rows
-        self.fig = plt.figure(figsize=(fig_width, min(fig_height, 12)))
-        self.fig.suptitle("🧠 Training Dashboard", fontsize=14, fontweight='bold')
+        # Layout: 1 row per run
+        rows = self.n_runs
+        cols = 3 # Reward, Loss, Entropy
         
-        # Create outer grid for runs
-        outer_gs = gridspec.GridSpec(rows, cols, figure=self.fig, hspace=0.3, wspace=0.2)
+        # Adjust height based on rows
+        fig_height = 3 * rows + 1
+        self.fig = plt.figure(figsize=(14, fig_height))
+        self.fig.suptitle("🧠 Training Dashboard", fontsize=14, fontweight='bold', color='white')
         
-        # Create each run's panel
+        # Grid
+        gs = gridspec.GridSpec(rows, cols, figure=self.fig, 
+                               hspace=0.4, wspace=0.25, 
+                               left=0.05, right=0.95, top=0.9, bottom=0.1)
+        
         for i, mode in enumerate(self.modes):
-            row, col = i // cols, i % cols
-            self._create_run_panel(outer_gs[row, col], mode)
+            self._create_run_row(gs, i, mode)
         
-        # Add speed control buttons at bottom
         self._create_controls()
     
-    def _create_run_panel(self, outer_spec, mode: str):
-        """Create visualization panel for a single run."""
-        # Inner grid: 3 rows
-        # Row 0: Agent View | Action Probs
-        # Row 1: Reward graph
-        # Row 2: Loss/Entropy graphs
-        inner_gs = gridspec.GridSpecFromSubplotSpec(
-            3, 2, subplot_spec=outer_spec, height_ratios=[1.5, 1, 1],
-            hspace=0.3, wspace=0.2
-        )
-        
+    def _create_run_row(self, gs, row_idx: int, mode: str):
+        """Create a row of graphs for one run."""
         self.axes[mode] = {}
-        self.run_panels[mode] = {}
+        self.line_artists[mode] = {}
         
-        # Agent view (left top)
-        ax = self.fig.add_subplot(inner_gs[0, 0])
-        ax.set_title(f"{mode}", fontsize=10, fontweight='bold')
-        ax.axis('off')
-        self.axes[mode]['view'] = ax
+        # 1. Reward
+        ax_rew = self.fig.add_subplot(gs[row_idx, 0])
+        ax_rew.set_title(f"{mode}: Rewards", fontsize=10, fontweight='bold', color='yellow')
+        ax_rew.grid(True, alpha=0.15)
+        # Force integer x-axis ticks
+        ax_rew.xaxis.set_major_locator(MaxNLocator(integer=True))
         
-        # Placeholder image for agent view
-        dummy = np.zeros((11, 11, 3))
-        img = ax.imshow(dummy, interpolation='nearest')
-        self.run_panels[mode]['view_img'] = img
+        line_rew, = ax_rew.plot([], [], 'c-', linewidth=1.5, alpha=0.9)
+        self.axes[mode]['reward'] = ax_rew
+        self.line_artists[mode]['reward'] = line_rew
         
-        # Action probabilities (right top)
-        ax = self.fig.add_subplot(inner_gs[0, 1])
-        ax.set_title("Actions", fontsize=9)
-        ax.set_ylim(0, 0.5)
-        labels = ['↑', '↓', '←', '→', '↖', '↗', '↙', '↘'][:self.n_actions]
-        x = np.arange(self.n_actions)
-        bars = ax.bar(x, np.ones(self.n_actions) / self.n_actions, color='#00d9ff')
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, fontsize=8)
-        ax.axhline(y=1/self.n_actions, color='red', linestyle='--', alpha=0.5)
-        self.axes[mode]['actions'] = ax
-        self.run_panels[mode]['action_bars'] = bars
+        # 2. Losses
+        ax_loss = self.fig.add_subplot(gs[row_idx, 1])
+        ax_loss.set_title("Losses", fontsize=10, color='silver')
+        ax_loss.grid(True, alpha=0.15)
+        ax_loss.xaxis.set_major_locator(MaxNLocator(integer=True))
         
-        # Reward graph (middle row, spans both columns)
-        ax = self.fig.add_subplot(inner_gs[1, :])
-        ax.set_title("Episode Reward", fontsize=9)
-        ax.grid(True, alpha=0.3)
-        line, = ax.plot([], [], 'b-', linewidth=1)
-        self.axes[mode]['reward'] = ax
-        self.run_panels[mode]['reward_line'] = line
+        l_pol, = ax_loss.plot([], [], 'r-', linewidth=1, label='Policy', alpha=0.8)
+        l_val, = ax_loss.plot([], [], 'g-', linewidth=1, label='Value', alpha=0.8)
+        ax_loss.legend(fontsize=7, loc='upper right', framealpha=0.3)
         
-        # Loss graph (bottom left)
-        ax = self.fig.add_subplot(inner_gs[2, 0])
-        ax.set_title("Losses", fontsize=9)
-        ax.grid(True, alpha=0.3)
-        pol_line, = ax.plot([], [], 'r-', linewidth=1, label='policy')
-        val_line, = ax.plot([], [], 'm-', linewidth=1, label='value')
-        ax.legend(fontsize=7, loc='upper right')
-        self.axes[mode]['loss'] = ax
-        self.run_panels[mode]['policy_line'] = pol_line
-        self.run_panels[mode]['value_line'] = val_line
+        self.axes[mode]['loss'] = ax_loss
+        self.line_artists[mode]['policy'] = l_pol
+        self.line_artists[mode]['value'] = l_val
         
-        # Entropy graph (bottom right)
-        ax = self.fig.add_subplot(inner_gs[2, 1])
-        ax.set_title("Entropy", fontsize=9)
-        ax.grid(True, alpha=0.3)
-        ax.axhline(y=np.log(self.n_actions), color='red', linestyle='--', alpha=0.5)
-        line, = ax.plot([], [], 'c-', linewidth=1)
-        self.axes[mode]['entropy'] = ax
-        self.run_panels[mode]['entropy_line'] = line
-    
+        # 3. Entropy
+        ax_ent = self.fig.add_subplot(gs[row_idx, 2])
+        ax_ent.set_title("Entropy", fontsize=10, color='silver')
+        ax_ent.grid(True, alpha=0.15)
+        ax_ent.xaxis.set_major_locator(MaxNLocator(integer=True))
+        
+        # Target entropy reference
+        max_ent = np.log(self.n_actions)
+        ax_ent.axhline(y=max_ent, color='gray', linestyle='--', alpha=0.3)
+        ax_ent.set_ylim(0, max_ent * 1.1)
+        
+        l_ent, = ax_ent.plot([], [], 'm-', linewidth=1.5, alpha=0.9)
+        
+        self.axes[mode]['entropy'] = ax_ent
+        self.line_artists[mode]['entropy'] = l_ent
+
     def _create_controls(self):
-        """Create speed control buttons."""
-        # Button axes at the bottom
-        ax_fast = self.fig.add_axes([0.2, 0.01, 0.15, 0.03])
-        ax_normal = self.fig.add_axes([0.4, 0.01, 0.15, 0.03])
-        ax_pause = self.fig.add_axes([0.6, 0.01, 0.15, 0.03])
+        """Create simple control buttons."""
+        # Place buttons at very bottom
+        ax_pause = self.fig.add_axes([0.35, 0.02, 0.1, 0.04])
+        self.btn_pause = Button(ax_pause, '⏸ Pause', color='#333333', hovercolor='#555555')
+        self.btn_pause.label.set_color('white')
         
-        self.btn_fast = Button(ax_fast, '⏩ Fast')
-        self.btn_normal = Button(ax_normal, '▶ Normal')
-        self.btn_pause = Button(ax_pause, '⏸ Pause')
+        ax_finish = self.fig.add_axes([0.55, 0.02, 0.1, 0.04])
+        self.btn_finish = Button(ax_finish, '🏁 Finish', color='#333333', hovercolor='#555555')
+        self.btn_finish.label.set_color('white')
         
-        self.btn_fast.on_clicked(lambda e: self._set_speed('fast'))
-        self.btn_normal.on_clicked(lambda e: self._set_speed('normal'))
-        self.btn_pause.on_clicked(lambda e: self._set_speed('pause'))
-    
-    def _set_speed(self, mode: str):
-        """Set speed mode."""
-        self.speed_mode = mode
-        self.paused = (mode == 'pause')
-        print(f"Dashboard: Speed set to {mode}")
-    
-    def _view_to_rgb(self, view: np.ndarray) -> np.ndarray:
-        """Convert multi-channel view to RGB image for display."""
-        if view is None:
-            return np.zeros((11, 11, 3))
+        def toggle_pause(event):
+            self.paused = not self.paused
+            self.btn_pause.label.set_text('▶ Resume' if self.paused else '⏸ Pause')
+            
+        def finish_training(event):
+            self.finish_requested = True
+            self.btn_finish.label.set_text('Stopping...')
+            # Queue finish for all runs? Or just signal globally.
+            # We'll set a flag that the trainer checks.
+            # Note: Trainer runs in separate process. Dashboard update queue is one-way.
+            # Actually, typically trainer pushes to dashboard. Dashboard can't easily push back
+            # without a shared flag or file.
+            # User is running single process with threads? "python -m ... --mode all"
+            # It likely uses multiprocessing.
+            # If multiprocessing, we can't easily stop them from here unless they listen for a file or shared value.
+            # Simplest hack: Create a 'training.stop' file.
+            import os
+            with open('.training_stop_signal', 'w') as f:
+                f.write('stop')
+            print("\n🛑 Stop signal sent (file created). Waiting for trainers...")
+            
+        self.btn_pause.on_clicked(toggle_pause)
+        self.btn_finish.on_clicked(finish_training)
         
-        # view shape: (channels, H, W)
-        h, w = view.shape[1], view.shape[2]
-        rgb = np.zeros((h, w, 3))
-        
-        # Color mapping by channel (assuming order: EMPTY, WALL, FOOD, POISON, ...)
-        colors = [
-            (0.1, 0.1, 0.2),  # EMPTY - dark blue
-            (0.5, 0.5, 0.5),  # WALL - gray
-            (0.2, 0.8, 0.5),  # FOOD - green
-            (0.9, 0.3, 0.3),  # POISON - red
-            (0.0, 0.8, 0.8),  # PREY - cyan
-            (1.0, 0.2, 0.2),  # PREDATOR - bright red
-        ]
-        
-        for c in range(min(view.shape[0], len(colors))):
-            mask = view[c] > 0
-            rgb[mask] = colors[c]
-        
-        # Mark center (agent position)
-        center_y, center_x = h // 2, w // 2
-        rgb[center_y, center_x] = (1.0, 1.0, 0.0)  # Yellow for agent
-        
-        return rgb
-    
     def _update_frame(self, frame):
-        """Update all visualizations (called by FuncAnimation)."""
+        """Update graphs."""
+        if self.paused:
+            return []
+            
         self._process_updates()
         
-        # Skip visualization updates in fast mode
-        skip_viz = (self.speed_mode == 'fast')
-        
         for mode, run in self.runs.items():
-            panels = self.run_panels[mode]
+            artists = self.line_artists[mode]
             axes = self.axes[mode]
             
-            # Status in title
-            status = "✓ Done" if run.is_finished else f"Ep {run.episode}"
-            axes['view'].set_title(f"{mode} - {status}", fontsize=10, fontweight='bold')
+            # --- Update Data ---
             
-            if not skip_viz:
-                # Agent view
-                if run.agent_view is not None:
-                    rgb = self._view_to_rgb(run.agent_view)
-                    panels['view_img'].set_array(rgb)
+            # REWARDS
+            if len(run.rewards) > 1:
+                # X-axis is simply local index for now, could be episodes
+                raw_y = list(run.rewards)
+                smooth_y = self._smooth(raw_y, alpha=0.9)
                 
-                # Action probabilities
-                for bar, prob in zip(panels['action_bars'], run.action_probs):
-                    bar.set_height(prob)
-                    # Color by deviation from uniform
-                    uniform = 1 / self.n_actions
-                    if prob > uniform * 1.5:
-                        bar.set_color('#ff6b6b')
-                    elif prob < uniform * 0.5:
-                        bar.set_color('#4ecdc4')
-                    else:
-                        bar.set_color('#00d9ff')
-            
-            # Graphs always update (even in fast mode)
-            if run.rewards:
-                x = list(range(len(run.rewards)))
-                panels['reward_line'].set_data(x, list(run.rewards))
-                axes['reward'].relim()
-                axes['reward'].autoscale_view()
-            
-            if run.policy_losses:
-                x = list(range(len(run.policy_losses)))
-                panels['policy_line'].set_data(x, list(run.policy_losses))
-                panels['value_line'].set_data(x, list(run.value_losses))
-                axes['loss'].relim()
-                axes['loss'].autoscale_view()
-            
-            if run.entropies:
-                x = list(range(len(run.entropies)))
-                panels['entropy_line'].set_data(x, list(run.entropies))
-                axes['entropy'].relim()
-                axes['entropy'].autoscale_view()
-        
+                x_data = list(range(len(raw_y)))
+                artists['reward'].set_data(x_data, smooth_y)
+                
+                axes['reward'].set_xlim(0, len(raw_y) + 5)
+                # Dynamic Y-limits with padding (based on smoothed data for stability)
+                min_y, max_y = min(smooth_y), max(smooth_y)
+                rng = max_y - min_y if max_y != min_y else 1.0
+                axes['reward'].set_ylim(min_y - rng*0.1, max_y + rng*0.1)
+
+            # LOSSES
+            if len(run.policy_losses) > 1:
+                x_data = list(range(len(run.policy_losses)))
+                
+                p_loss = self._smooth(list(run.policy_losses), alpha=0.9)
+                v_loss = self._smooth(list(run.value_losses), alpha=0.9)
+                
+                artists['policy'].set_data(x_data, p_loss)
+                artists['value'].set_data(x_data, v_loss)
+                
+                axes['loss'].set_xlim(0, len(x_data) + 5)
+                
+                # Combine limits
+                all_vals = p_loss + v_loss
+                min_y, max_y = min(all_vals), max(all_vals)
+                rng = max_y - min_y if max_y != min_y else 1.0
+                axes['loss'].set_ylim(min_y - rng*0.1, max_y + rng*0.1)
+
+            # ENTROPY
+            if len(run.entropies) > 1:
+                y_data = list(run.entropies) # Entropy usually doesn't need much smoothing, but consistency is good
+                # smooth_y = self._smooth(y_data, alpha=0.9) 
+                # Keep entropy raw as it's less noisy and good for debugging collapse
+                
+                x_data = list(range(len(y_data)))
+                artists['entropy'].set_data(x_data, y_data)
+                
+                axes['entropy'].set_xlim(0, len(x_data) + 5)
+                # Entropy Y is fixed 0..log(N) usually, but let's autoscale bottom slightly
+                axes['entropy'].set_ylim(0, np.log(self.n_actions)*1.1)
+                
         return []
-    
+
     def run(self):
-        """Start the dashboard (blocking - call from main thread)."""
+        """Start the dashboard (blocking)."""
         self._create_figure()
         
         # Handle window close
         def on_close(event):
             self.running = False
-        
         self.fig.canvas.mpl_connect('close_event', on_close)
         
-        # Animation - match main.py speed (50ms)
-        # Fast mode uses 200ms and skips viz updates for performance
-        interval = 50 if self.speed_mode != 'fast' else 200
         self.ani = FuncAnimation(
             self.fig,
             self._update_frame,
-            interval=interval,
+            interval=100, # 10fps is plenty for graphs
             blit=False,
             cache_frame_data=False
         )
         
         plt.show(block=True)
-    
+
     def stop(self):
-        """Signal dashboard to stop."""
         self.running = False
         try:
             plt.close(self.fig)
         except Exception:
-            pass
-    
-    def is_paused(self) -> bool:
-        """Check if training should pause."""
-        return self.paused
-
+            pass 
 
 def create_dashboard(modes: list[str], n_actions: int = 8) -> TrainingDashboard:
-    """
-    Factory function to create a training dashboard.
-    
-    Args:
-        modes: List of training mode names
-        n_actions: Number of actions
-    
-    Returns:
-        TrainingDashboard instance (not yet running)
-    """
     return TrainingDashboard(modes, n_actions)

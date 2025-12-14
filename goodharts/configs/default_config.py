@@ -130,7 +130,11 @@ TRAINING_DEFAULTS = {
     'initial_food': 200,
     'final_food': 50,
     'curriculum_fraction': 0.7,
-    'poison_count': 30,
+    # Density ranges for curriculum randomization
+    'min_food': 50,
+    'max_food': 200,
+    'min_poison': 20,
+    'max_poison': 100,
     'steps_per_episode': 500,
     'learning_rate': 0.001,
     'gamma': 0.99,

@@ -27,12 +27,12 @@ goodharts_law/
 ├── requirements.txt            # Python dependencies
 │
 ├── goodharts/                  # Main package
-│   ├── simulation.py           # Core simulation loop & statistics tracking
+│   ├── simulation.py           # Core simulation loop (wraps VecEnv)
 │   ├── config.py               # TOML config loader with caching
 │   ├── visualization.py        # Matplotlib visualization functions
 │   │
 │   ├── agents/
-│   │   └── organism.py         # Agent class: movement, eating, energy, death
+│   │   └── (Agent logic moved to VecEnv)
 │   │
 │   ├── behaviors/
 │   │   ├── base.py             # BehaviorStrategy base class + ROLE_COLORS
@@ -47,12 +47,11 @@ goodharts_law/
 │   │
 │   ├── environments/
 │   │   ├── base.py             # Environment abstract base class
-│   │   └── world.py            # World: grid with ground_truth + proxy_metric
+│   │   └── vec_env.py          # VecEnv: High-performance vectorized environment
 │   │
 │   ├── training/
 │   │   ├── train.py            # Behavior cloning training loop
-│   │   ├── train_rl.py         # Reinforcement learning training
-│   │   ├── train_ppo.py        # PPO algorithm implementation
+│   │   ├── train_ppo.py        # PPO algorithm implementation (Vectorized)
 │   │   ├── collect.py          # Expert demonstration collection
 │   │   ├── dataset.py          # Dataset utilities for training
 │   │   ├── verification/       # Model fitness testing suite
@@ -267,17 +266,17 @@ python -m goodharts.training.train_ppo --mode all --dashboard
 
 ### Vectorized Training (Fast!)
 
-For rapid iteration, use vectorized training which runs 64 parallel environments:
+Training uses vectorized environments (64 parallel by default) for high throughput:
 
 ```bash
-# Fast vectorized training (~6,000 steps/sec, 50k steps in ~8 seconds)
-python -m goodharts.training.train_ppo --vec --mode ground_truth --timesteps 100000
+# Fast vectorized training (~6,000+ steps/sec)
+python -m goodharts.training.train_ppo --mode ground_truth --timesteps 100000
 
 # With more parallel environments
-python -m goodharts.training.train_ppo --vec --n-envs 128 --timesteps 200000
+python -m goodharts.training.train_ppo --n-envs 128 --timesteps 200000
 
-# Train all modes sequentially with vectorized envs
-python -m goodharts.training.train_ppo --vec --mode all --timesteps 100000
+# Train all modes in parallel
+python -m goodharts.training.train_ppo --mode all --timesteps 100000
 ```
 
 ### Training Visualization
@@ -296,13 +295,16 @@ This helps diagnose training problems like:
 Training configuration is in `config.default.toml` under `[training]`:
 ```toml
 [training]
-initial_food = 500      # Curriculum: start moderate
-final_food = 200        # Curriculum: end sparse but learnable
+initial_food = 200      # Curriculum: start sparse
+final_food = 50         # Curriculum: end very sparse
 curriculum_fraction = 0.7
-poison_count = 30
+min_food = 50           # Randomization range for robustness
+max_food = 200
+min_poison = 20
+max_poison = 100
 steps_per_episode = 500
-reward_scale = 10.0     # Amplify reward signal
-entropy_coef = 0.0      # Allow policy specialization
+reward_scale = 0.1      # Normalized reward scale
+entropy_coef = 0.02     # Allow exploration
 ```
 
 ### Verify Models
@@ -345,6 +347,7 @@ python main.py --brain-view --agent LearnedGroundTruth --model models/ground_tru
 - [x] **Model verification suite** — `training/verification/`
 
 ### ✅ Phase 2.5: Code Quality Refactoring
+- [x] **Vectorized Environment** — Replaced Python loops with NumPy vectorization (6000+ steps/sec)
 - [x] **Behavior auto-discovery registry** — no manual registration
 - [x] **CellType enhancements** — color, channel_index properties
 - [x] **D1 rendering** — grid + agent overlay with behavior.color
@@ -373,7 +376,7 @@ This simulation is a **toy model** for understanding real AI alignment failures:
 
 ## Disclosure
 
-This project was developed almost entirely using Google's experimental Antigravity agentic IDE, with the gracious assistance of Claude 4.5 Opus. I acted as an architect and systems lead, manually writing some code where relevant, but I credit Opus for the vast majority of the actual implementation and documentation writing. This project would not have been possible without Google's free Gemini Pro subscription for students and the extremely high usage limits currently available in Antigravity.
+This project was developed almost entirely using Google's experimental Antigravity agentic IDE, with the gracious assistance of Claude 4.5 Opus and Gemini 3 Pro. I acted as an architect and systems lead, manually writing some code where relevant, but I credit Opus for the vast majority of the actual implementation and documentation writing. This project would not have been possible without Google's free Gemini Pro subscription for students and the extremely high usage limits currently available in Antigravity.
 
 I am grateful to Google and Anthropic for making this project possible.
 

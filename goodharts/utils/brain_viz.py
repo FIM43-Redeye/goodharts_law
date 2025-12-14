@@ -157,13 +157,26 @@ class BrainVisualizer:
     
     def _linear_to_display(self, act: torch.Tensor) -> np.ndarray:
         """
-        Convert linear activation to horizontal bar-like display.
+        Convert linear activation to 2D square-ish tile.
         
-        Returns shape (1, N) for consistent imshow.
+        Previous 1xN strip was too hard to read.
+        Now reshapes to (S, S) with padding.
         """
         flat = act.view(-1).numpy()
-        # Return as 2D for imshow compatibility
-        return flat.reshape(1, -1)
+        n = len(flat)
+        
+        # Try to find semi-matching factors for cleaner rectangle?
+        # For now, generic square is robust.
+        side = int(np.ceil(np.sqrt(n)))
+        
+        # If perfect square, just reshape
+        if side * side == n:
+            return flat.reshape(side, side)
+            
+        # Else pad
+        padded = np.zeros(side * side)
+        padded[:n] = flat
+        return padded.reshape(side, side)
     
     def _generic_to_display(self, act: torch.Tensor) -> np.ndarray:
         """Fallback for unknown layer types."""

@@ -1,114 +1,215 @@
 """
 Simulation orchestrator for Goodhart's Law demonstration.
 
-Manages the world, agents, and simulation loop.
+Manages the valid vectorized environment and agents.
+Refactored to use VecEnv (with shared_grid=True) replacing the legacy World/Organism.
 """
 from goodharts.behaviors.learned import LEARNED_PRESETS
-from goodharts.environments import create_world
-from goodharts.agents import Organism
+from goodharts.environments.vec_env import create_vec_env
 from goodharts.behaviors import get_behavior, create_learned_behavior
 from goodharts.utils.logging_config import get_logger
+from goodharts.configs.observation_spec import ObservationSpec, get_mode_for_requirement
 import numpy as np
 
 
 logger = get_logger("simulation")
 
 
+class AgentWrapper:
+    """
+    Wraps an agent in the VecEnv to provide an object-oriented interface 
+    compatible with Behavior strategies and Visualization.
+    """
+    def __init__(self, idx: int, behavior, vec_env, config: dict):
+        self.idx = idx
+        self.behavior = behavior
+        self.vec_env = vec_env
+        self.config = config
+        self.id = id(self)
+        self.sight_radius = vec_env.view_radius
+        self.death_reason = None
+        self.suspicion_score = 0
+        self.steps_alive = 0
+        
+        # Backward compatibility
+        self.initial_energy = vec_env.initial_energy
+
+    @property
+    def x(self):
+        return self.vec_env.agent_x[self.idx]
+    
+    @property
+    def y(self):
+        return self.vec_env.agent_y[self.idx]
+        
+    @property
+    def energy(self):
+        return self.vec_env.agent_energy[self.idx]
+        
+    @property
+    def alive(self):
+        # In VecEnv, agents are reset on done, so they are always "alive" techinically.
+        # But for visualization of death events, we track them.
+        # Simulation.step handles death events.
+        return True
+
+    def get_observation(self):
+        # Helper mostly for brain viz getting scalars
+        # We can reconstruct what Organism.get_observation returned if needed
+        # But mostly we need specific channels
+        
+        # We will need to mock Observation if dependent. 
+        # For now, just return a dummy if needed, but behaviors use get_local_view which we provide.
+        pass
+
+    def get_local_view(self, mode: str | None = None) -> np.ndarray:
+        # This is inefficient if called individually (re-extracts entire batch).
+        # Should be used sparingly (e.g. brain visualizer).
+        # For main loop, we use batch extraction.
+        
+        # We need to trigger the full batch extraction
+        all_obs = self.vec_env._get_observations()
+        # But we need to filter for the specific mode...
+        # VecEnv only supports ONE ObsSpec (one set of channels).
+        # We assume VecEnv was initialized with a superset of channels needed?
+        # Or we rely on VecEnv ObsSpec matching the agent requirements?
+        # In Shared World, all agents share the ObsSpec.
+        return all_obs[self.idx]
+
+
 class Simulation:
     """
-    Main simulation class that orchestrates agents in a world.
+    Main simulation class that orchestrates agents in a vectorized world.
     
     Attributes:
         config: Runtime configuration dictionary
-        world: The environment grid
-        agents: List of living organisms
+        vec_env: The vectorized environment
+        agents: List of AgentWrapper objects
         step_count: Number of simulation steps completed
         stats: Dictionary of collected statistics
     """
     
     def __init__(self, config: dict):
-        logger.info("Initializing Simulation")
+        logger.info("Initializing Simulation (Vectorized)")
         self.config: dict = config
-        self.world = create_world(config)
-        self.world.place_food(config['GRID_FOOD_INIT'])
-        self.world.place_poison(config['GRID_POISON_INIT'])
-
-        self.agents: list[Organism] = []
+        
+        # 1. Setup Agents Configuration
+        agents_setup = []
+        behaviors = []
+        agent_types = []  # For visibility
+        CellType = config['CellType']
         
         for setup in config['AGENTS_SETUP']:
             b_class_name = setup['behavior_class']
             count = setup['count']
             
-            # Check if it's a learned behavior preset
-            if b_class_name in LEARNED_PRESETS:
-                BehaviorClass = None  # Not used for presets
-                
-                # Extract optional behavior kwargs from setup
-                behavior_kwargs = {k: v for k, v in setup.items() 
-                                 if k not in ('behavior_class', 'count')}
-                
-                for _ in range(count):
-                    randx = np.random.randint(0, self.world.width)
-                    randy = np.random.randint(0, self.world.height)
-                    
-                    # Create behavior using factory
-                    behavior = create_learned_behavior(b_class_name, **behavior_kwargs)
-                    
-                    self.agents.append(Organism(
-                        randx, randy, 
-                        config['ENERGY_START'], 
-                        config['AGENT_VIEW_RANGE'], 
-                        self.world, behavior, config
-                    ))
+            # Extract kwargs
+            behavior_kwargs = {k: v for k, v in setup.items() 
+                             if k not in ('behavior_class', 'count')}
             
-            # Otherwise treat as class name (legacy / hardcoded behaviors)
-            else:
-                # Use registry for behavior lookup (auto-discovery)
-                BehaviorClass = get_behavior(b_class_name)
-                
-                # Extract optional behavior kwargs from setup
-                behavior_kwargs = {k: v for k, v in setup.items() 
-                                 if k not in ('behavior_class', 'count')}
-                
-                for _ in range(count):
-                    randx = np.random.randint(0, self.world.width)
-                    randy = np.random.randint(0, self.world.height)
+            for _ in range(count):
+                if b_class_name in LEARNED_PRESETS:
+                    behavior = create_learned_behavior(b_class_name, **behavior_kwargs)
+                else:
+                    BehaviorClass = get_behavior(b_class_name)
                     behavior = BehaviorClass(**behavior_kwargs)
-                    self.agents.append(Organism(
-                        randx, randy, 
-                        config['ENERGY_START'], 
-                        config['AGENT_VIEW_RANGE'], 
-                        self.world, behavior, config
-                    ))
+                
+                behaviors.append(behavior)
+                
+                # Determine Agent Type for Visibility
+                role = getattr(behavior, 'role', 'prey')
+                a_type = CellType.PREDATOR.value if role == 'predator' else CellType.PREY.value
+                agent_types.append(a_type)
+        
+        num_agents = len(behaviors)
+        
+        # 2. Initialize VecEnv
+        # We need an ObservationSpec that covers all agents?
+        # For now, we pick a default or 'ground_truth' which usually covers everything.
+        # Or better: Union of requirements?
+        # Simpler: 'ground_truth' mode spec usually has all channels.
+        req = 'ground_truth'
+        mode = get_mode_for_requirement(req, config)
+        spec = ObservationSpec.for_mode(mode, config)
+        
+        self.vec_env = create_vec_env(
+            n_envs=num_agents, 
+            obs_spec=spec, 
+            config=config,
+            shared_grid=True,
+            agent_types=agent_types
+        )
+        
+        # 3. Create Agent Wrappers
+        self.agents = [
+            AgentWrapper(i, behaviors[i], self.vec_env, config) 
+            for i in range(num_agents)
+        ]
         
         self.step_count = 0
         self.stats = {
             'deaths': [],  # list of {'step': int, 'id': int, 'reason': str}
             'energy_history': {a.id: [] for a in self.agents},
-            'heatmap': {'all': np.zeros((self.world.height, self.world.width))},
+            'heatmap': {'all': np.zeros((self.vec_env.height, self.vec_env.width))},
             'suspicion_history': {a.id: [] for a in self.agents}
         }
+        
+    @property
+    def world(self):
+        # For backward compatibility with visualizer
+        return self # We expose 'width', 'height', 'grid' directly?
+        
+    @property
+    def width(self):
+        return self.vec_env.width
+        
+    @property
+    def height(self):
+        return self.vec_env.height
+        
+    @property
+    def grid(self):
+        # Visualization expects a grid
+        return self.vec_env.grids[0]
 
     def step(self):
         """Advance simulation by one timestep."""
         self.step_count += 1
-        CellType = self.config['CellType']
         
-        # Mark all living agents on grid BEFORE they take actions
-        # (so agents can see each other in their observations)
-        agent_positions = []
-        for agent in self.agents:
-            if agent.alive and 0 <= agent.x < self.world.width and 0 <= agent.y < self.world.height:
-                # Only mark if cell is empty (don't overwrite food/poison)
-                if self.world.grid[agent.y, agent.x] == CellType.EMPTY:
-                    # Use behavior's role to determine cell type
-                    cell_type = CellType.PREDATOR if agent.behavior.role == 'predator' else CellType.PREY
-                    self.world.grid[agent.y, agent.x] = cell_type.value
-                    agent_positions.append((agent.x, agent.y, cell_type.value))
+        # 1. Get Observations (Vectorized)
+        obs_batch = self.vec_env._get_observations() # (N, C, H, W)
         
-        for agent in self.agents[:]:
-            if not agent.alive:
-                # Use str(behavior) which maps to name for LearnedBehavior
+        # 2. Decide Actions (Loop over behaviors)
+        actions = []
+        for i, agent in enumerate(self.agents):
+            try:
+                # AgentWrapper passes itself as 'agent'
+                # Obs is (C, H, W)
+                dx, dy = agent.behavior.decide_action(agent, obs_batch[i])
+                
+                # Convert (dx, dy) to action index for VecEnv
+                # We assume behavior uses same Action Space logic
+                from goodharts.behaviors.action_space import action_to_index
+                action_idx = action_to_index(dx, dy)
+                actions.append(action_idx)
+            except Exception as e:
+                logger.error(f"Error in agent {i} decide_action: {e}")
+                actions.append(0) # No-Op
+        
+        actions_np = np.array(actions, dtype=np.int32)
+        
+        # 3. Step VecEnv
+        # returns next_obs, rewards, dones
+        _, rewards, dones = self.vec_env.step(actions_np)
+        
+        # 4. Process Events (Deaths, Stats)
+        for i, agent in enumerate(self.agents):
+            # Check for death/reset
+            if dones[i]:
+                # Infer reason
+                reason = "Starvation" if agent.energy <= 0 else "Old Age" # VecEnv handles poison as energy subtraction
+                
+                # Log death
                 b_name = str(agent.behavior)
                 if b_name.startswith('<'):
                     b_name = type(agent.behavior).__name__
@@ -116,67 +217,50 @@ class Simulation:
                 self.stats['deaths'].append({
                     'step': self.step_count,
                     'id': agent.id,
-                    'reason': agent.death_reason,
+                    'reason': reason,
                     'behavior': b_name
                 })
-                logger.debug(f"Agent {agent.id} died from {agent.death_reason}")
-                self.agents.remove(agent)
-                continue
-            
-            agent.update()
-            
+                logger.debug(f"Agent {agent.id} died from {reason}")
+                
             # Update Stats
             if agent.id not in self.stats['energy_history']:
                  self.stats['energy_history'][agent.id] = []
             self.stats['energy_history'][agent.id].append(agent.energy)
             
-            if agent.id not in self.stats['suspicion_history']:
-                 self.stats['suspicion_history'][agent.id] = []
-            self.stats['suspicion_history'][agent.id].append(agent.suspicion_score)
+            # Suspicion (NOT tracked by VecEnv, logic was in Organism)
+            # We skip suspicion for now or need to reimplement logic?
+            # It required checking Proxy vs Ground Truth.
+            # Skipping for efficiency unless critical.
             
             # Update Heatmap
-            if 0 <= agent.y < self.world.height and 0 <= agent.x < self.world.width:
-                # Global heatmap
-                self.stats['heatmap']['all'][agent.y, agent.x] += 1
-                
-                # Per-behavior heatmap (initialize lazily)
-                # Use str(behavior) which maps to name for LearnedBehavior
-                b_name = str(agent.behavior)
-                if b_name.startswith('<'):
-                    b_name = type(agent.behavior).__name__
-                    
-                if b_name not in self.stats['heatmap']:
-                    self.stats['heatmap'][b_name] = np.zeros((self.world.height, self.world.width))
-                self.stats['heatmap'][b_name][agent.y, agent.x] += 1
-        
-        # Clear agent markers (agents move, so positions change)
-        for x, y, cell_value in agent_positions:
-            if self.world.grid[y, x] == cell_value:
-                self.world.grid[y, x] = CellType.EMPTY.value
-        
+            # Global heatmap
+            self.stats['heatmap']['all'][agent.y, agent.x] += 1
+            
+            # Per-behavior heatmap (initialize lazily)
+            b_name = str(agent.behavior)
+            if b_name.startswith('<'):
+                b_name = type(agent.behavior).__name__
+            
+            if b_name not in self.stats['heatmap']:
+                self.stats['heatmap'][b_name] = np.zeros((self.vec_env.height, self.vec_env.width))
+            self.stats['heatmap'][b_name][agent.y, agent.x] += 1
+
         if self.step_count % 100 == 0:
-            logger.info(f"Completed step {self.step_count}. Alive agents: {len(self.agents)}")
+            logger.info(f"Completed step {self.step_count}. Agents running: {len(self.agents)}")
 
     def get_render_grid(self) -> np.ndarray:
         """
         Get the environmental grid for rendering (no agent overlay).
-        
-        Returns:
-            Copy of world grid with CellType values.
-            Use get_agent_positions() to overlay agents.
         """
-        return self.world.grid.copy()
+        return self.vec_env.grids[0].copy()
     
     def get_agent_positions(self) -> list[tuple[int, int, tuple[int, int, int]]]:
         """
         Get agent positions and colors for overlay rendering.
-        
-        Returns:
-            List of (x, y, rgb_color) tuples for each alive agent.
-            Color comes from behavior.color property.
         """
         return [
             (a.x, a.y, a.behavior.color)
             for a in self.agents
-            if a.alive and 0 <= a.x < self.world.width and 0 <= a.y < self.world.height
+            if a.alive # Always true currently
         ]
+

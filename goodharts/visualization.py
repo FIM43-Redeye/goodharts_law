@@ -312,46 +312,43 @@ def update_brain_frame(frame, sim, viz, args):
     # -------------------------------------------------------------------------
     # 1. Get Agent Observation & Reconstruct RGB
     # -------------------------------------------------------------------------
-    # Get observation structure directly to access channels
-    full_obs = agent.get_observation()
+    # In vectorized sim, get_local_view returns ndarray (C, H, W)
+    # We use agent.get_local_view('ground_truth') to ensure we get all channels
+    # But wait, VecEnv outputs one specific spec.
+    # We assume VecEnv uses ground_truth spec (or superset).
+    obs = agent.get_local_view(mode='ground_truth') # returns (C, H, W)
     
-    # Determine which channels are active in get_local_view
-    # We'll just look at what's in full_obs for visualization to be accurate to what's available
-    # But ideally we visualized the *input* to the network.
-    # Let's visualize the "Ground Truth" channels available to the agent.
+    # We need to know which channel is which
+    channel_names = sim.vec_env.channel_names
     
-    obs_channels = full_obs.grids
-    
-    # Initialize RGB image (White background for empty)
-    # Use ground_truth_raw for shape
-    raw_shape = obs_channels['ground_truth_raw'].shape
-    h, w = raw_shape
-    rgb_img = np.full((h, w, 3), 0, dtype=np.uint8) # Black background
+    # Initialize RGB image (White background for empty? No, black typically)
+    c, h, w = obs.shape
+    rgb_img = np.full((h, w, 3), 0, dtype=np.uint8) 
     
     # Dynamic Legend tracking
     legend_elements = []
     seen_types = set()
     
     # Iterate CellTypes to overlay colors
-    # Order: Wall, Food, Poison, Predator, Prey (Agents on top)
     CellType = sim.config['CellType']
     render_order = [CellType.WALL, CellType.FOOD, CellType.POISON, CellType.PREDATOR, CellType.PREY]
     
     for c_type in render_order:
+        # Find explicit channel index for this type
+        # Naming convention provided by vec_env: "cell_{name}"
         channel_name = f"cell_{c_type.name.lower()}"
-        if channel_name in obs_channels:
-            mask = obs_channels[channel_name] > 0.5
+        
+        if channel_name in channel_names:
+            idx = channel_names.index(channel_name)
+            mask = obs[idx] > 0.5
             if mask.any():
-                # Apply color
                 rgb_img[mask] = c_type.color
                 
-                # Add to legend
                 if c_type.name not in seen_types:
                     seen_types.add(c_type.name)
                     legend_elements.append(Patch(facecolor='#%02x%02x%02x' % c_type.color, label=f"{c_type.name}"))
-    
+                    
     # Paint Self (Center)
-    # Agent is always at center of its view
     cx, cy = h // 2, w // 2
     rgb_img[cx, cy] = agent.behavior.color
     legend_elements.append(Patch(facecolor='#%02x%02x%02x' % agent.behavior.color, label="Self"))
@@ -366,7 +363,8 @@ def update_brain_frame(frame, sim, viz, args):
     # -------------------------------------------------------------------------
     # 2. Network Inference
     # -------------------------------------------------------------------------
-    obs = agent.get_local_view(mode='ground_truth') # For network input
+    # obs is already the right input for network (C, H, W)
+
 
     
     # Forward pass through model to trigger hooks
