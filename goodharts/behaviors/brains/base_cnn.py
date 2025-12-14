@@ -1,7 +1,7 @@
 """
 Neural network architectures for learned behaviors.
 
-TinyCNN is a flexible architecture that supports:
+BaseCNN is a flexible architecture that supports:
 - Arbitrary input shapes and channel counts
 - Optional auxiliary scalar inputs (energy, step count, etc.)
 - Both discrete and continuous action outputs
@@ -12,9 +12,9 @@ import torch.nn.functional as F
 import numpy as np
 
 
-class TinyCNN(nn.Module):
+class BaseCNN(nn.Module):
     """
-    A small Convolutional Neural Network for agent decision-making.
+    A robust Convolutional Neural Network for agent decision-making.
     
     Takes a local view of the world (like an image) and outputs
     either discrete action logits or continuous action values.
@@ -30,7 +30,7 @@ class TinyCNN(nn.Module):
         output_size: int = 8,
         num_aux_inputs: int = 0,
         action_mode: str = 'discrete',
-        hidden_size: int = 64,
+        hidden_size: int = 512,  # Increased from 64
     ):
         """
         Args:
@@ -41,7 +41,7 @@ class TinyCNN(nn.Module):
             action_mode: 'discrete' for classification, 'continuous' for dx/dy regression
             hidden_size: Size of hidden fully-connected layer
         """
-        super(TinyCNN, self).__init__()
+        super(BaseCNN, self).__init__()
         
         self.input_shape = input_shape
         self.input_channels = input_channels
@@ -52,12 +52,13 @@ class TinyCNN(nn.Module):
         
         # Convolutional layers
         # Using padding=1 with kernel_size=3 preserves spatial dimensions
-        self.conv1 = nn.Conv2d(in_channels=input_channels, out_channels=16, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels=input_channels, out_channels=32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding=1)
         
         # Calculate flattened size after convolutions
         # With padding=1, kernel=3, stride=1: output_size = input_size
-        conv_output_size = 32 * input_shape[0] * input_shape[1]
+        conv_output_size = 64 * input_shape[0] * input_shape[1]
         
         # Fully connected layers
         # Input: CNN features + auxiliary scalars
@@ -74,9 +75,9 @@ class TinyCNN(nn.Module):
             raise ValueError(f"Unknown action_mode: {action_mode}")
 
     @classmethod
-    def from_spec(cls, spec: 'ObservationSpec', output_size: int, **kwargs) -> 'TinyCNN':
+    def from_spec(cls, spec: 'ObservationSpec', output_size: int, **kwargs) -> 'BaseCNN':
         """
-        Factory: create TinyCNN from an ObservationSpec.
+        Factory: create BaseCNN from an ObservationSpec.
         
         This ensures model architecture is derived from the centralized spec,
         not hardcoded values. Any changes to observation format will
@@ -85,14 +86,14 @@ class TinyCNN(nn.Module):
         Args:
             spec: ObservationSpec defining input dimensions
             output_size: Number of output actions
-            **kwargs: Additional args passed to TinyCNN.__init__
+            **kwargs: Additional args passed to BaseCNN.__init__
         
         Returns:
-            TinyCNN configured for the spec
+            BaseCNN configured for the spec
         
         Example:
             spec = config['get_observation_spec']('ground_truth')
-            model = TinyCNN.from_spec(spec, output_size=8)
+            model = BaseCNN.from_spec(spec, output_size=8)
         """
         return cls(
             input_shape=spec.input_shape,
@@ -118,6 +119,7 @@ class TinyCNN(nn.Module):
         # Convolutional feature extraction
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
         
         # Flatten
         x = x.view(x.size(0), -1)
@@ -202,7 +204,7 @@ class TinyCNN(nn.Module):
         return (0, 0)
 
 
-class TinyCNNWithMemory(nn.Module):
+class BaseCNNWithMemory(nn.Module):
     """
     CNN with LSTM for temporal memory.
     
@@ -219,4 +221,4 @@ class TinyCNNWithMemory(nn.Module):
         memory_size: int = 16,
     ):
         super().__init__()
-        raise NotImplementedError("TinyCNNWithMemory is a Phase 3 stub")
+        raise NotImplementedError("BaseCNNWithMemory is a Phase 3 stub")

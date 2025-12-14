@@ -2,7 +2,7 @@
 Centralized action space definitions.
 
 This is the SINGLE SOURCE OF TRUTH for action indexing.
-All components (LearnedBehavior, data collection, TinyCNN, etc.) 
+All components (LearnedBehavior, data collection, BaseCNN, etc.) 
 should import from here to avoid mismatches.
 """
 from functools import lru_cache

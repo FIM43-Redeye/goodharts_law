@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Callable
 
-from goodharts.behaviors.brains.tiny_cnn import TinyCNN
+from goodharts.behaviors.brains.base_cnn import BaseCNN
 from goodharts.behaviors import LearnedBehavior
 from goodharts.utils.device import get_device
 
@@ -303,7 +303,7 @@ def compare_models_saliency(
 
 def load_model_from_path(model_path: str, device: torch.device = None) -> tuple[torch.nn.Module, dict]:
     """
-    Load a TinyCNN model, inferring architecture from the saved weights.
+    Load a BaseCNN model, inferring architecture from the saved weights.
     
     Returns:
         (model, metadata) where metadata contains inferred architecture info
@@ -342,7 +342,7 @@ def load_model_from_path(model_path: str, device: torch.device = None) -> tuple[
     
     print(f"📐 Inferred architecture: {input_channels}ch × {side}×{side} → hidden={hidden_size} → {output_size} actions")
     
-    model = TinyCNN(
+    model = BaseCNN(
         input_shape=input_shape,
         input_channels=input_channels,
         output_size=output_size,

@@ -15,7 +15,7 @@ import os
 import argparse
 from pathlib import Path
 
-from goodharts.behaviors.brains.tiny_cnn import TinyCNN
+from goodharts.behaviors.brains.base_cnn import BaseCNN
 from goodharts.behaviors import LearnedBehavior
 from goodharts.training.dataset import ReplayBuffer, SimulationDataset
 from goodharts.training.collect import collect_from_expert, collect_experiences
@@ -37,7 +37,7 @@ def train_behavior_cloning(
     output_path: str = 'models/model.pth',
     use_reward_weighting: bool = True,
     device: torch.device | None = None,
-) -> TinyCNN:
+) -> BaseCNN:
     """
     Train a behavior via behavior cloning from expert demonstrations.
     
@@ -54,7 +54,7 @@ def train_behavior_cloning(
         device: Torch device (auto-detected if None)
         
     Returns:
-        Trained TinyCNN model
+        Trained BaseCNN model
     """
     if device is None:
         device = get_device()
@@ -117,7 +117,7 @@ def train_behavior_cloning(
     # Determine output size based on action space (8-directional for max_move_distance=1)
     num_actions = 8
     
-    model = TinyCNN(
+    model = BaseCNN(
         input_shape=input_shape,
         input_channels=input_channels,
         output_size=num_actions
@@ -223,7 +223,7 @@ def train_policy_gradient(
     mode: str = 'ground_truth',
     episodes: int = 100,
     output_path: str = 'models/pg_model.pth',
-) -> TinyCNN:
+) -> BaseCNN:
     """
     Train using REINFORCE policy gradient.
     
@@ -243,7 +243,7 @@ def train_dqn(
     mode: str = 'ground_truth',
     episodes: int = 100,
     output_path: str = 'models/dqn_model.pth',
-) -> TinyCNN:
+) -> BaseCNN:
     """
     Train using DQN (Deep Q-Network).
     

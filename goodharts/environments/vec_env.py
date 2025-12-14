@@ -56,9 +56,9 @@ class VecEnv:
         train_cfg = get_training_config()
         
         # Dimensions from config
-        world_cfg = config.get('world', {})
-        self.width = world_cfg.get('width', 100)
-        self.height = world_cfg.get('height', 100)
+        self.width = config.get('GRID_WIDTH', 100)
+        self.height = config.get('GRID_HEIGHT', 100)
+        self.loop = config.get('WORLD_LOOP', False)
         
         # View settings from obs_spec
         self.view_radius = obs_spec.view_size // 2
@@ -66,14 +66,14 @@ class VecEnv:
         self.n_channels = obs_spec.num_channels
         self.channel_names = obs_spec.channel_names
         
-        # Agent settings from config
-        agent_cfg = config.get('agent', {})
-        self.initial_energy = agent_cfg.get('starting_energy', 100.0)
-        self.energy_move_cost = agent_cfg.get('move_cost', 0.1)
+        # Agent settings from config (legacy keys)
+        self.initial_energy = config.get('ENERGY_START', 50.0)
+        self.energy_move_cost = config.get('ENERGY_MOVE_COST', 0.1)
         
         # Training settings
-        self.initial_food = train_cfg.get('initial_food', 500)
-        self.poison_count = train_cfg.get('poison_count', 30)
+        self.initial_food = config.get('GRID_FOOD_INIT', 500)
+        self.poison_count = config.get('GRID_POISON_INIT', 30)
+        self.max_steps = train_cfg.get('steps_per_episode', 500)
         
         # Get CellType for rewards
         self.CellType = config['CellType']
@@ -88,6 +88,7 @@ class VecEnv:
         self.agent_x = np.zeros(n_envs, dtype=np.int32)
         self.agent_y = np.zeros(n_envs, dtype=np.int32)
         self.agent_energy = np.ones(n_envs, dtype=np.float32) * self.initial_energy
+        self.agent_steps = np.zeros(n_envs, dtype=np.int32)
         
         # Pre-allocated view buffer
         self._view_buffer = np.zeros(
@@ -97,6 +98,10 @@ class VecEnv:
         
         # Done states
         self.dones = np.zeros(n_envs, dtype=bool)
+        
+        # Stats tracking
+        self.current_episode_food = np.zeros(n_envs, dtype=np.int32)
+        self.last_episode_food = np.zeros(n_envs, dtype=np.int32)
         
         # Reset all environments
         self.reset()
@@ -115,6 +120,10 @@ class VecEnv:
         """Reset a single environment."""
         CellType = self.CellType
         
+        # Save stats before reset
+        self.last_episode_food[env_id] = self.current_episode_food[env_id]
+        self.current_episode_food[env_id] = 0
+        
         # Clear grid
         self.grids[env_id] = CellType.EMPTY.value
         
@@ -128,6 +137,7 @@ class VecEnv:
         self.agent_x[env_id] = np.random.randint(0, self.width)
         self.agent_y[env_id] = np.random.randint(0, self.height)
         self.agent_energy[env_id] = self.initial_energy
+        self.agent_steps[env_id] = 0
         self.dones[env_id] = False
     
     def _place_items(self, env_id: int, cell_type: int, count: int):
@@ -150,9 +160,15 @@ class VecEnv:
         dx = self.action_deltas[actions, 0]
         dy = self.action_deltas[actions, 1]
         
-        # Move agents (bounded)
-        self.agent_x = np.clip(self.agent_x + dx, 0, self.width - 1)
-        self.agent_y = np.clip(self.agent_y + dy, 0, self.height - 1)
+        # Move agents
+        if self.loop:
+            # Toroidal wrap
+            self.agent_x = (self.agent_x + dx) % self.width
+            self.agent_y = (self.agent_y + dy) % self.height
+        else:
+            # Bounded clip
+            self.agent_x = np.clip(self.agent_x + dx, 0, self.width - 1)
+            self.agent_y = np.clip(self.agent_y + dy, 0, self.height - 1)
         
         # Apply movement cost
         self.agent_energy -= self.energy_move_cost
@@ -160,8 +176,11 @@ class VecEnv:
         # Batched eating
         rewards = self._eat_batch()
         
-        # Check done
-        self.dones = self.agent_energy <= 0
+        # Increment steps
+        self.agent_steps += 1
+        
+        # Check done (energy <= 0 or max steps reached)
+        self.dones = (self.agent_energy <= 0) | (self.agent_steps >= self.max_steps)
         
         # Death penalty
         rewards = np.where(self.dones, rewards - 10.0, rewards)
@@ -179,6 +198,7 @@ class VecEnv:
         food_mask = cells == CellType.FOOD.value
         rewards[food_mask] = self.food_reward
         self.agent_energy[food_mask] += self.food_reward
+        self.current_episode_food[food_mask] += 1
         
         # Poison
         poison_mask = cells == CellType.POISON.value
@@ -208,13 +228,16 @@ class VecEnv:
         r = self.view_radius
         CellType = self.CellType
         
-        # Pad all grids with WALL value for boundary handling
+        # Pad all grids
         # Shape: (n_envs, H + 2r, W + 2r)
+        pad_mode = 'wrap' if self.loop else 'constant'
+        pad_kwargs = {'constant_values': CellType.WALL.value} if not self.loop else {}
+        
         padded_grids = np.pad(
             self.grids,
             ((0, 0), (r, r), (r, r)),
-            mode='constant',
-            constant_values=CellType.WALL.value
+            mode=pad_mode,
+            **pad_kwargs
         )
         
         # Compute extraction indices for each environment

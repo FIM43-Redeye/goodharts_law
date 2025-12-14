@@ -43,7 +43,7 @@ goodharts_law/
 │   │   │   ├── omniscient.py   # OmniscientSeeker: sees true cell types
 │   │   │   └── proxy_seeker.py # ProxySeeker: only sees proxy signal
 │   │   └── brains/
-│   │       └── tiny_cnn.py     # TinyCNN model for learned behaviors
+│   │       └── base_cnn.py     # BaseCNN model for learned behaviors
 │   │
 │   ├── environments/
 │   │   ├── base.py             # Environment abstract base class
@@ -128,6 +128,8 @@ Key config sections:
 - `[[agents]]` — Which behaviors to spawn
 
 ### Device Configuration
+> [!NOTE]
+> **Architecture Note**: This project originally used a "TinyCNN" (2 layers, 64 hidden units). It failed to learn spatial navigation effectively, wasting significant development time. The default architecture is now `BaseCNN` (3 layers, 512 hidden units), which provides the necessary capacity for the 11x11x6 observation space. The incredible power of Replace In Files has obsoleted the TinyCNN.
 
 PyTorch device selection is centralized. Control it via:
 
@@ -334,7 +336,7 @@ python main.py --brain-view --agent LearnedGroundTruth --model models/ground_tru
 - [x] "Suspicion" metric
 
 ### ✅ Phase 2: Learned Behaviors (CNN)
-- [x] **TinyCNN architecture** — dynamic channel input, configurable action output
+- [x] **BaseCNN architecture** — dynamic channel input, configurable action output
 - [x] **Training pipeline** — behavior cloning + PPO with curriculum
 - [x] **One-hot observation encoding** — ground-truth vs proxy modes
 - [x] **Centralized action space** — `behaviors/action_space.py`

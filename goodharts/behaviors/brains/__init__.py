@@ -79,12 +79,12 @@ def _get_brain_registry() -> dict[str, type]:
     
     Add new brain architectures here:
     """
-    from .tiny_cnn import TinyCNN
+    from .base_cnn import BaseCNN
     # Future: from .mlp import MLP
     # Future: from .transformer import TransformerBrain
     
     return {
-        'tiny_cnn': TinyCNN,
+        'base_cnn': BaseCNN,
         # 'mlp': MLP,
         # 'transformer': TransformerBrain,
     }
@@ -100,7 +100,7 @@ def create_brain(name: str, spec: 'ObservationSpec', output_size: int, **kwargs)
     Factory: create a brain by name.
     
     Args:
-        name: Brain architecture name (e.g., 'tiny_cnn')
+        name: Brain architecture name (e.g., 'base_cnn')
         spec: ObservationSpec for input dimensions
         output_size: Number of output actions
         **kwargs: Architecture-specific parameters
@@ -112,7 +112,7 @@ def create_brain(name: str, spec: 'ObservationSpec', output_size: int, **kwargs)
         ValueError: If brain name not found in registry
     
     Example:
-        brain = create_brain('tiny_cnn', spec, output_size=8)
+        brain = create_brain('base_cnn', spec, output_size=8)
     """
     registry = _get_brain_registry()
     
