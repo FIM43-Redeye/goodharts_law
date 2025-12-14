@@ -85,6 +85,7 @@ class TrainingLogger:
         self.update_count = 0
         self.start_time = datetime.now()
         self.hyperparams: dict[str, Any] = {}
+        self.episode_rewards: list[float] = []  # Track rewards in memory for dashboard
         
         # Initialize CSV files with headers
         self._init_csv(self.episodes_path, EpisodeLog)
@@ -126,7 +127,9 @@ class TrainingLogger:
         )
         
         row = asdict(log)
+        row = asdict(log)
         self._append_csv(self.episodes_path, row)
+        self.episode_rewards.append(reward)
     
     def log_update(self, update_num: int, total_steps: int,
                    policy_loss: float, value_loss: float, 

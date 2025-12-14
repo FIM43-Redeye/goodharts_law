@@ -19,7 +19,7 @@ from goodharts.configs.default_config import get_config
 from goodharts.environments.world import World
 from goodharts.agents.organism import Organism
 from goodharts.behaviors.learned import LearnedBehavior
-from goodharts.behaviors.brains.tiny_cnn import TinyCNN
+from goodharts.behaviors.brains.base_cnn import BaseCNN
 from goodharts.behaviors.action_space import build_action_space, num_actions
 from goodharts.utils.logging_config import get_logger
 from goodharts.utils.device import get_device
@@ -38,7 +38,7 @@ class Episode(NamedTuple):
 
 
 def collect_episode(
-    model: TinyCNN,
+    model: BaseCNN,
     config: dict,
     mode: str = 'ground_truth',
     temperature: float = 1.0,
@@ -158,7 +158,7 @@ def train_reinforce(
     output_path: str = 'models/rl_agent.pth',
     log_interval: int = 50,
     device: torch.device | None = None,
-) -> TinyCNN:
+) -> BaseCNN:
     """
     Train an agent using REINFORCE (policy gradient).
     
@@ -177,7 +177,7 @@ def train_reinforce(
         device: Torch device
         
     Returns:
-        Trained TinyCNN model
+        Trained BaseCNN model
     """
     if config is None:
         config = get_config()
@@ -199,7 +199,7 @@ def train_reinforce(
     obs_spec = training_config['get_observation_spec'](mode)
     
     # Initialize model
-    model = TinyCNN(
+    model = BaseCNN(
         input_shape=obs_spec.input_shape,
         input_channels=obs_spec.num_channels,
         output_size=num_actions(1)

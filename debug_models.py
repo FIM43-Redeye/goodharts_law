@@ -12,14 +12,14 @@ from goodharts.configs.default_config import get_config
 from goodharts.environments.world import World
 from goodharts.agents.organism import Organism
 from goodharts.behaviors import LearnedBehavior, LearnedGroundTruth, LearnedProxy, OmniscientSeeker
-from goodharts.behaviors.brains.tiny_cnn import TinyCNN
+from goodharts.behaviors.brains.base_cnn import BaseCNN
 from goodharts.behaviors.action_space import build_action_space, index_to_action, ACTION_LABELS_8
 
 
-def load_model(path: str, input_shape=(4, 11, 11)) -> TinyCNN:
+def load_model(path: str, input_shape=(4, 11, 11)) -> BaseCNN:
     """Load a trained model."""
     channels, h, w = input_shape
-    model = TinyCNN(input_shape=(h, w), input_channels=channels, output_size=8)
+    model = BaseCNN(input_shape=(h, w), input_channels=channels, output_size=8)
     model.load_state_dict(torch.load(path, map_location='cpu', weights_only=True))
     model.eval()
     return model

@@ -31,7 +31,7 @@ Agents see a **4-channel** view of their surroundings:
 
 In proxy mode, all channels contain the same interestingness values - the agent **cannot distinguish food from poison**.
 
-### CNN Architecture (TinyCNN)
+### CNN Architecture (BaseCNN)
 ```
 Input: (4, 11, 11) - 4 channels, 11×11 view
   ↓
@@ -107,7 +107,7 @@ Current training uses small batch sizes and models - may actually be **CPU-bound
 |------|---------|
 | `goodharts/behaviors/action_space.py` | Single source of truth for action indices |
 | `goodharts/behaviors/learned.py` | LearnedBehavior with temperature sampling |
-| `goodharts/behaviors/brains/tiny_cnn.py` | CNN architecture |
+| `goodharts/behaviors/brains/base_cnn.py` | CNN architecture |
 | `goodharts/agents/organism.py` | One-hot observation encoding |
 | `goodharts/training/train.py` | Behavior cloning training loop |
 | `goodharts/training/train_rl.py` | Reinforcement learning training |

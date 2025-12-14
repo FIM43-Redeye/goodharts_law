@@ -7,14 +7,14 @@ enabling empirical demonstration of Goodhart's Law.
 import torch
 import numpy as np
 from goodharts.behaviors import BehaviorStrategy
-from goodharts.behaviors.brains.tiny_cnn import TinyCNN
+from goodharts.behaviors.brains.base_cnn import BaseCNN
 from goodharts.behaviors.action_space import build_action_space, action_to_index, index_to_action, num_actions
 from goodharts.utils.device import get_device
 
 
 class LearnedBehavior(BehaviorStrategy):
     """
-    A behavior strategy that uses a neural network (TinyCNN) to decide actions.
+    A behavior strategy that uses a neural network (BaseCNN) to decide actions.
     
     Supports two modes:
     - 'ground_truth': Agent sees real cell types (like OmniscientSeeker)
@@ -46,7 +46,7 @@ class LearnedBehavior(BehaviorStrategy):
         self.max_move_distance = max_move_distance
         self.temperature = temperature
         
-        self.brain: TinyCNN | None = None
+        self.brain: BaseCNN | None = None
         self.device = get_device(verbose=False)
         
         # Get action space from centralized module
@@ -75,13 +75,13 @@ class LearnedBehavior(BehaviorStrategy):
         """
         Lazy initialization of the brain based on actual view shape.
         
-        Supports loading both TinyCNN and ActorCritic (PPO) models.
+        Supports loading both BaseCNN and ActorCritic (PPO) models.
         
         Args:
             input_shape: (num_channels, height, width) from observation
         """
         num_channels, height, width = input_shape
-        self.brain = TinyCNN(
+        self.brain = BaseCNN(
             input_shape=(height, width), 
             input_channels=num_channels, 
             output_size=self.num_actions
@@ -93,9 +93,9 @@ class LearnedBehavior(BehaviorStrategy):
                 
                 # Detect if this is an ActorCritic model (has 'actor' keys)
                 if any('actor' in k for k in state_dict.keys()):
-                    # Map ActorCritic keys to TinyCNN keys
+                    # Map ActorCritic keys to BaseCNN keys
                     # ActorCritic: conv1, conv2, fc_shared (64), actor, critic
-                    # TinyCNN: conv1, conv2, fc1 (64), fc_out (output)
+                    # BaseCNN: conv1, conv2, fc1 (64), fc_out (output)
                     new_state_dict = {}
                     for k, v in state_dict.items():
                         if k.startswith('conv1') or k.startswith('conv2'):
@@ -113,9 +113,9 @@ class LearnedBehavior(BehaviorStrategy):
                     self.brain.load_state_dict(new_state_dict)
                     print(f"[LearnedBehavior] Loaded PPO ActorCritic model from {self.model_path}")
                 else:
-                    # Standard TinyCNN model
+                    # Standard BaseCNN model
                     self.brain.load_state_dict(state_dict)
-                    print(f"[LearnedBehavior] Loaded TinyCNN model from {self.model_path}")
+                    print(f"[LearnedBehavior] Loaded BaseCNN model from {self.model_path}")
                     
             except FileNotFoundError:
                 print(f"[LearnedBehavior] Model not found at {self.model_path}, using random weights")
@@ -196,7 +196,7 @@ class LearnedBehavior(BehaviorStrategy):
             else:
                 self.brain.eval()
 
-    def get_brain(self) -> TinyCNN | None:
+    def get_brain(self) -> BaseCNN | None:
         """Access the underlying neural network for training."""
         return self.brain
     

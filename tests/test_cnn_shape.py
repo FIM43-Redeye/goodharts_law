@@ -2,12 +2,12 @@
 import torch
 
 from goodharts.configs.default_config import get_config
-from goodharts.behaviors.brains.tiny_cnn import TinyCNN
+from goodharts.behaviors.brains.base_cnn import BaseCNN
 from goodharts.behaviors.action_space import num_actions
 
 
 def test_shapes():
-    """Test that TinyCNN works with various input shapes."""
+    """Test that BaseCNN works with various input shapes."""
     config = get_config()
     obs_spec = config['get_observation_spec']('ground_truth')
     
@@ -19,7 +19,7 @@ def test_shapes():
     
     for shape in shapes:
         print(f"Testing input shape: {shape} with {n_channels} channels")
-        model = TinyCNN(input_shape=shape, input_channels=n_channels, output_size=n_actions)
+        model = BaseCNN(input_shape=shape, input_channels=n_channels, output_size=n_actions)
         
         # Create dummy input (Batch=1, Channels=n_channels, H, W)
         x = torch.randn(1, n_channels, *shape)

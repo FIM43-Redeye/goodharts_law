@@ -6,7 +6,7 @@ Tests whether models correctly move toward food placed in different directions.
 import torch
 
 from goodharts.configs.default_config import get_config, CellType
-from goodharts.behaviors.brains.tiny_cnn import TinyCNN
+from goodharts.behaviors.brains.base_cnn import BaseCNN
 
 
 def test_directional_accuracy(model_path: str, model_name: str) -> float:
@@ -34,7 +34,7 @@ def test_directional_accuracy(model_path: str, model_name: str) -> float:
     center = view_size // 2
     
     try:
-        model = TinyCNN(
+        model = BaseCNN(
             input_shape=obs_spec.input_shape,
             input_channels=num_channels,
             output_size=8

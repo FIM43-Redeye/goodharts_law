@@ -1,7 +1,7 @@
 """
 PPO (Proximal Policy Optimization) training with Curriculum Learning.
 
-Uses TinyCNN for the policy network (compatible with LearnedBehavior).
+Uses BaseCNN for the policy network (compatible with LearnedBehavior).
 Adds a separate value head for the critic.
 
 Features:
@@ -27,7 +27,7 @@ from goodharts.behaviors.action_space import build_action_space, num_actions
 
 
 class ValueHead(nn.Module):
-    """Simple value head that attaches to TinyCNN features."""
+    """Simple value head that attaches to BaseCNN features."""
     def __init__(self, input_size: int):
         super().__init__()
         self.fc = nn.Linear(input_size, 1)
@@ -38,7 +38,7 @@ class ValueHead(nn.Module):
 
 def train_ppo(
     mode: str = 'ground_truth',
-    brain_type: str = 'tiny_cnn',
+    brain_type: str = 'base_cnn',
     max_episodes: int = 500,
     lr: float = None,  # Read from config if None
     gamma: float = 0.99,
@@ -82,6 +82,14 @@ def train_ppo(
         device = get_device()
     
     print(f"\n🚀 PPO Training: {mode} on {device}", flush=True)
+    
+    # Ensure seeding is effectively random unless specified otherwise
+    # (PPO is stochastic, but we want to ensure environment randomization isn't locked)
+    import time
+    seed = int(time.time())
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    print(f"   Random Seed: {seed}", flush=True)
     
     # Setup visualization
     viz = visualizer
@@ -287,6 +295,30 @@ def train_ppo(
                     agent_pos_after=view_center,
                     targets=shaping_targets
                 )
+                
+                # Compensate for "disappearing attractor":
+                # When food is eaten, it disappears from view, causing a large drop in shaping score.
+                # We add back the potential of the eaten item to neutralize this drop.
+                if consumed and consumed[0] == 'FOOD':
+                    # Find food target weight
+                    food_weight = 0.0
+                    for t in shaping_targets:
+                        if t.cell_type.name == 'Food':
+                            food_weight = t.weight
+                            break
+                    
+                    if food_weight > 0:
+                        # Add max potential (as if at distance 1)
+                        # We use 1.0 because distance is at least 1 (or 0.1 in formula)
+                        # Actually formula uses 1/dist. If we are on top of it, dist is small.
+                        # However, previous view had it at dist ~0 or 1.
+                        # Let's use a fixed compensation that roughly matches the drop.
+                        # Better yet: calculating the exact score contribution of a food at dist 0.
+                        # In compute_shaping_score, dist is max(real_dist, 0.1).
+                        # If we just ate it, we were at distance 0 (clamped to 0.1).
+                        # So contribution was weight * (1 / 0.1) = 10 * weight.
+                        shaping_reward += food_weight * 10.0
+                
                 reward += shaping_reward
             
             # Apply reward scaling
@@ -411,10 +443,10 @@ def train_ppo(
 
 def train_ppo_vec(
     mode: str = 'ground_truth',
-    brain_type: str = 'tiny_cnn',
+    brain_type: str = 'base_cnn',
     n_envs: int = 64,
     total_timesteps: int = 100_000,
-    lr: float = 3e-4,
+    lr: float = 5e-4,
     gamma: float = 0.99,
     eps_clip: float = 0.2,
     k_epochs: int = 4,
@@ -441,6 +473,14 @@ def train_ppo_vec(
         device = get_device()
     
     print(f"\n🚀 Vectorized PPO Training: {mode} on {device}")
+    
+    # Ensure seeding is effectively random unless specified otherwise
+    import time
+    seed = int(time.time())
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    print(f"   Random Seed: {seed}")
+    
     print(f"   {n_envs} parallel environments")
     
     config = get_config()
@@ -452,7 +492,11 @@ def train_ppo_vec(
     
     # Create vectorized environment (pulls all settings from config)
     vec_env = create_vec_env(n_envs=n_envs, obs_spec=spec)
+    vec_env = create_vec_env(n_envs=n_envs, obs_spec=spec)
     print(f"   View: {vec_env.view_size}x{vec_env.view_size}, Channels: {vec_env.n_channels}")
+    print(f"   Loop Mode: {vec_env.loop} (Config: {config.get('WORLD_LOOP')})")
+    if not vec_env.loop:
+         print("   ⚠️ WARNING: Loop mode is FALSE! Agents will hit walls.")
     
     # Create policy and value head
     policy = create_brain(brain_type, spec, output_size=n_actions).to(device)
@@ -504,7 +548,23 @@ def train_ppo_vec(
     import time
     start_time = time.perf_counter()
     
+    # Curriculum settings
+    start_food = train_cfg.get('initial_food', 2500)
+    end_food = train_cfg.get('final_food', 500)
+    reward_scale = train_cfg.get('reward_scale', 1.0)
+    
     while total_steps < total_timesteps:
+        # Curriculum: Update food density based on progress
+        progress = min(1.0, total_steps / total_timesteps)
+        current_food = int(start_food - progress * (start_food - end_food))
+        vec_env.initial_food = current_food
+        
+        # Calculate consistency-preserving reward scale
+        # As food becomes scarcer, we scale up reward per item to keep
+        # the total potential reward of the episode roughly constant.
+        # This helps PPO value estimation (returns don't vanish).
+        density_scale = start_food / max(current_food, 1)
+        
         # Get actions from policy
         with torch.no_grad():
             states_t = torch.from_numpy(states).float().to(device)
@@ -519,6 +579,14 @@ def train_ppo_vec(
         # Step all environments
         next_states, rewards, dones = vec_env.step(actions_np)
         
+        # Apply global reward scaling and density scaling
+        rewards = rewards * reward_scale * density_scale
+        
+        # Clip scaled rewards to avoid massive outliers
+        rewards = np.clip(rewards, -10.0, 10.0)
+        
+
+
         # Store experience
         states_buffer.append(states)
         actions_buffer.append(actions_np)
@@ -542,7 +610,7 @@ def train_ppo_vec(
                         episode=episode_count,
                         reward=episode_rewards[i],
                         length=500,  # Approximate
-                        food_eaten=0,
+                        food_eaten=vec_env.current_episode_food[i],
                         food_density=vec_env.initial_food,
                         curriculum_progress=total_steps / total_timesteps,
                         action_prob_std=action_probs.std(axis=1).mean(),
@@ -557,19 +625,36 @@ def train_ppo_vec(
             dashboard.update(mode, 'step', (states[0], action_probs[0], total_steps))
         
         # PPO Update
-        if len(states_buffer) * n_envs >= update_timestep:
-            all_states = np.concatenate(states_buffer, axis=0)
+            # Compute returns properly for vectorized environments
+            # (Bootstrapping with 0 for truncation to match original behavior, though value-bootstrapping would be better)
+            returns_np = np.zeros_like(rewards_buffer)  # (steps, envs)
+            running_returns = np.zeros(n_envs)
+            
+            # Vectorized GAE/Return calculation
+            # We iterate backwards through the buffer
+            # rewards_buffer is list of (n_envs,) arrays -> convert to (steps, n_envs) first
+            rewards_mat = np.stack(rewards_buffer)  # (steps, n_envs)
+            dones_mat = np.stack(dones_buffer)      # (steps, n_envs)
+            
+            for t in reversed(range(len(rewards_buffer))):
+                running_returns = rewards_mat[t] + gamma * running_returns * (1.0 - dones_mat[t])
+                returns_np[t] = running_returns
+                
+            # Flatten everything for PPO
+            all_states = np.concatenate(states_buffer, axis=0) # (steps*envs, ...)
             all_actions = np.concatenate(actions_buffer, axis=0)
             all_log_probs = np.concatenate(log_probs_buffer, axis=0)
-            all_rewards = np.concatenate(rewards_buffer, axis=0)
+            # all_rewards not needed for update if we have returns
             all_dones = np.concatenate(dones_buffer, axis=0)
+            all_returns = returns_np.flatten() # (steps*envs,)
             
             losses = _ppo_update(
                 policy, value_head, optimizer,
                 all_states.tolist(), all_actions.tolist(), all_log_probs.tolist(),
-                all_rewards.tolist(), all_dones.tolist(),
+                None, all_dones.tolist(), # Rewards not needed
                 gamma, eps_clip, k_epochs, device,
-                entropy_coef=entropy_coef, value_coef=value_coef
+                entropy_coef=entropy_coef, value_coef=value_coef,
+                returns=all_returns.tolist()
             )
             
             update_count += 1
@@ -595,8 +680,27 @@ def train_ppo_vec(
             
             # Dashboard update
             if dashboard:
+                # Calculate mean reward for recent episodes to show learning progress
+                # Note: episode_rewards only contains rewards for *finished* episodes in the buffer,
+                # but we reset done indices. We need to track recent episode rewards.
+                # Actually, episode_rewards array holds current episode rewards.
+                # We need to capture rewards from the *just completed* episodes.
+                
+                # Best approximation: use the average of best_reward (max) and current mean?
+                # No, we want the trend.
+                # In vectorized training, we process many episodes. 
+                # Let's track a running mean of finished episode rewards.
+                
+                # For now, let's use the mean of the batch of finished episodes if any,
+                # otherwise use the last known mean.
+                
+                current_reward = best_reward
+                if logger and hasattr(logger, 'episode_rewards') and len(logger.episode_rewards) > 0:
+                    # Get average of last 10 episodes from logger
+                    current_reward = np.mean(logger.episode_rewards[-10:])
+
                 dashboard.update(mode, 'ppo', (policy_loss, value_loss, entropy, action_probs[0]))
-                dashboard.update(mode, 'episode', (episode_count, best_reward, 500, 0, vec_env.initial_food))
+                dashboard.update(mode, 'episode', (episode_count, current_reward, 500, 0, vec_env.initial_food))
             
             # Progress
             elapsed = time.perf_counter() - start_time
@@ -621,7 +725,7 @@ def train_ppo_vec(
 
 
 def _ppo_update(policy, value_head, optimizer, states, actions, log_probs, rewards, dones, 
-                gamma, eps_clip, k_epochs, device, entropy_coef=0.001, value_coef=0.5):
+                gamma, eps_clip, k_epochs, device, entropy_coef=0.001, value_coef=0.5, returns=None):
     """
     Perform PPO update on collected experience.
     
@@ -633,14 +737,15 @@ def _ppo_update(policy, value_head, optimizer, states, actions, log_probs, rewar
     old_actions = torch.tensor(actions, dtype=torch.long).to(device)
     old_log_probs = torch.tensor(log_probs, dtype=torch.float32).to(device)
     
-    # Compute returns (rewards-to-go)
-    returns = []
-    discounted = 0
-    for r, d in zip(reversed(rewards), reversed(dones)):
-        if d:
-            discounted = 0
-        discounted = r + gamma * discounted
-        returns.insert(0, discounted)
+    # Compute returns (rewards-to-go) if not provided
+    if returns is None:
+        returns = []
+        discounted = 0
+        for r, d in zip(reversed(rewards), reversed(dones)):
+            if d:
+                discounted = 0
+            discounted = r + gamma * discounted
+            returns.insert(0, discounted)
     
     returns = torch.tensor(returns, dtype=torch.float32).to(device)
     returns = (returns - returns.mean()) / (returns.std() + 1e-7)
@@ -676,15 +781,13 @@ def _ppo_update(policy, value_head, optimizer, states, actions, log_probs, rewar
         entropy_bonus = entropy.mean()
         
         loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus
-        
+        # Optimize
         optimizer.zero_grad()
         loss.backward()
-        
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=0.5)
-        torch.nn.utils.clip_grad_norm_(value_head.parameters(), max_norm=0.5)
-        
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+        torch.nn.utils.clip_grad_norm_(value_head.parameters(), 0.5)
         optimizer.step()
+
         
         # Track final epoch metrics
         final_policy_loss = policy_loss.item()
@@ -737,7 +840,7 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', default='ground_truth', choices=all_modes + ['all'])
-    parser.add_argument('--brain', default='tiny_cnn', choices=brain_names,
+    parser.add_argument('--brain', default='base_cnn', choices=brain_names,
                         help='Brain architecture to use')
     parser.add_argument('--episodes', type=int, default=500)
     parser.add_argument('--timesteps', type=int, default=100_000,
