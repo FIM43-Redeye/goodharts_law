@@ -175,18 +175,23 @@ class VecEnv:
         self.dones[env_id] = False
     
     def _place_items(self, grid_id: int, cell_type: int, count: int):
-        """Place items at random empty positions on specific grid."""
-        placed = 0
-        attempts = 0
-        max_attempts = count * 3
+        """Place items at random empty positions on specific grid (vectorized)."""
+        grid = self.grids[grid_id]
         
-        while placed < count and attempts < max_attempts:
-            x = np.random.randint(0, self.width)
-            y = np.random.randint(0, self.height)
-            if self.grids[grid_id, y, x] == self.CellType.EMPTY.value:
-                self.grids[grid_id, y, x] = cell_type
-                placed += 1
-            attempts += 1
+        # Find all empty cell indices
+        empty_mask = (grid == self.CellType.EMPTY.value)
+        empty_indices = np.argwhere(empty_mask)
+        
+        if len(empty_indices) == 0:
+            return
+        
+        # Sample min(count, available) positions
+        n_to_place = min(count, len(empty_indices))
+        chosen_idx = np.random.choice(len(empty_indices), size=n_to_place, replace=False)
+        chosen_positions = empty_indices[chosen_idx]
+        
+        # Place all items at once
+        grid[chosen_positions[:, 0], chosen_positions[:, 1]] = cell_type
     
     def step(self, actions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Execute batched actions."""

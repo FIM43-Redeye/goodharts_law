@@ -2,7 +2,6 @@
 import pytest
 import numpy as np
 from goodharts.configs.default_config import get_config
-from goodharts.configs.default_config import get_config
 
 
 @pytest.fixture
