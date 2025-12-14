@@ -14,7 +14,6 @@ from matplotlib.widgets import Button
 from matplotlib.animation import FuncAnimation
 from matplotlib.ticker import MaxNLocator
 import numpy as np
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 import queue
@@ -34,11 +33,11 @@ class RunState:
     food_eaten: int = 0
     food_density: int = 0
     
-    # Metrics history (keep more history for graphs)
-    rewards: deque = field(default_factory=lambda: deque(maxlen=1000))
-    policy_losses: deque = field(default_factory=lambda: deque(maxlen=1000))
-    value_losses: deque = field(default_factory=lambda: deque(maxlen=1000))
-    entropies: deque = field(default_factory=lambda: deque(maxlen=1000))
+    # Metrics history (unlimited for full run visualization)
+    rewards: list = field(default_factory=list)
+    policy_losses: list = field(default_factory=list)
+    value_losses: list = field(default_factory=list)
+    entropies: list = field(default_factory=list)
     
     # Status
     is_running: bool = True
@@ -333,3 +332,207 @@ class TrainingDashboard:
 
 def create_dashboard(modes: list[str], n_actions: int = 8) -> TrainingDashboard:
     return TrainingDashboard(modes, n_actions)
+
+
+# =============================================================================
+# LOG INGESTION - View historical training runs from CSV logs
+# =============================================================================
+
+def load_run_from_logs(log_prefix: str) -> RunState:
+    """
+    Load a training run from CSV log files.
+    
+    Args:
+        log_prefix: Path prefix for log files (without _episodes.csv / _updates.csv suffix)
+                   Example: 'logs/ground_truth_20251214_053108'
+    
+    Returns:
+        RunState populated with historical data
+    """
+    import csv
+    import os
+    
+    episodes_path = f"{log_prefix}_episodes.csv"
+    updates_path = f"{log_prefix}_updates.csv"
+    
+    # Extract mode from prefix (e.g., 'ground_truth' from 'logs/ground_truth_20251214...')
+    basename = os.path.basename(log_prefix)
+    # Mode is everything before the timestamp (YYYYMMDD_HHMMSS pattern)
+    import re
+    match = re.match(r'(.+?)_\d{8}_\d{6}', basename)
+    mode = match.group(1) if match else basename
+    
+    run = RunState(mode=mode)
+    run.is_running = False
+    run.is_finished = True
+    
+    # Load episodes (rewards)
+    if os.path.exists(episodes_path):
+        with open(episodes_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                run.rewards.append(float(row['reward']))
+                run.episode = int(row['episode'])
+        print(f"   Loaded {len(run.rewards)} episodes from {episodes_path}")
+    else:
+        print(f"   Warning: Episodes file not found: {episodes_path}")
+    
+    # Load updates (losses, entropy)
+    if os.path.exists(updates_path):
+        with open(updates_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                run.policy_losses.append(float(row['policy_loss']))
+                run.value_losses.append(float(row['value_loss']))
+                run.entropies.append(float(row['entropy']))
+                run.total_steps = int(row['total_steps'])
+        print(f"   Loaded {len(run.policy_losses)} updates from {updates_path}")
+    else:
+        print(f"   Warning: Updates file not found: {updates_path}")
+    
+    return run
+
+
+def find_latest_logs(log_dir: str = 'logs', mode: str = None) -> list[str]:
+    """
+    Find the latest log prefixes in a directory.
+    
+    Args:
+        log_dir: Directory containing log files
+        mode: Optional mode filter (e.g., 'ground_truth'). If None, finds all modes.
+    
+    Returns:
+        List of log prefixes (one per mode, most recent)
+    """
+    import os
+    import re
+    from collections import defaultdict
+    
+    if not os.path.isdir(log_dir):
+        print(f"Log directory not found: {log_dir}")
+        return []
+    
+    # Find all episode files and extract mode + timestamp
+    pattern = re.compile(r'(.+?)_(\d{8}_\d{6})_episodes\.csv')
+    mode_timestamps = defaultdict(list)
+    
+    for filename in os.listdir(log_dir):
+        match = pattern.match(filename)
+        if match:
+            m, ts = match.groups()
+            if mode is None or m == mode:
+                mode_timestamps[m].append(ts)
+    
+    # Get latest timestamp per mode
+    prefixes = []
+    for m, timestamps in mode_timestamps.items():
+        latest_ts = sorted(timestamps)[-1]
+        prefixes.append(os.path.join(log_dir, f"{m}_{latest_ts}"))
+    
+    return sorted(prefixes)
+
+
+def view_logs(log_prefixes: list[str], smoothing: float = 0.9):
+    """
+    Display a static visualization of historical training runs.
+    
+    Args:
+        log_prefixes: List of log file prefixes to visualize
+        smoothing: EMA smoothing factor (0.0 = no smoothing, 1.0 = maximum)
+    """
+    if not log_prefixes:
+        print("No log files to display.")
+        return
+    
+    print(f"\nLoading {len(log_prefixes)} training run(s)...")
+    runs = [load_run_from_logs(prefix) for prefix in log_prefixes]
+    
+    # Filter out empty runs
+    runs = [r for r in runs if r.rewards or r.policy_losses]
+    if not runs:
+        print("No valid data found in log files.")
+        return
+    
+    # Create static figure
+    plt.style.use('dark_background')
+    
+    n_runs = len(runs)
+    fig, axes = plt.subplots(n_runs, 3, figsize=(14, 3 * n_runs + 1), squeeze=False)
+    fig.suptitle("Training Log Viewer", fontsize=14, fontweight='bold', color='white')
+    
+    def smooth(data, alpha):
+        if not data or alpha <= 0:
+            return data
+        result = []
+        last = data[0]
+        for val in data:
+            last = last * alpha + val * (1 - alpha)
+            result.append(last)
+        return result
+    
+    for i, run in enumerate(runs):
+        # Rewards
+        ax = axes[i, 0]
+        ax.set_title(f"{run.mode}: Rewards ({len(run.rewards)} episodes)", 
+                     fontsize=10, fontweight='bold', color='yellow')
+        if run.rewards:
+            y = smooth(run.rewards, smoothing)
+            ax.plot(y, 'c-', linewidth=1, alpha=0.9)
+            ax.set_xlim(0, len(y))
+        ax.grid(True, alpha=0.15)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        
+        # Losses
+        ax = axes[i, 1]
+        ax.set_title(f"Losses ({len(run.policy_losses)} updates)", fontsize=10, color='silver')
+        if run.policy_losses:
+            x = list(range(len(run.policy_losses)))
+            ax.plot(x, smooth(run.policy_losses, smoothing), 'r-', linewidth=1, label='Policy', alpha=0.8)
+            ax.plot(x, smooth(run.value_losses, smoothing), 'g-', linewidth=1, label='Value', alpha=0.8)
+            ax.legend(fontsize=7, loc='upper right', framealpha=0.3)
+            ax.set_xlim(0, len(x))
+        ax.grid(True, alpha=0.15)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        
+        # Entropy
+        ax = axes[i, 2]
+        ax.set_title("Entropy", fontsize=10, color='silver')
+        if run.entropies:
+            ax.plot(run.entropies, 'm-', linewidth=1, alpha=0.9)
+            ax.axhline(y=np.log(8), color='gray', linestyle='--', alpha=0.3, label='Max (8 actions)')
+            ax.set_xlim(0, len(run.entropies))
+            ax.set_ylim(0, np.log(8) * 1.1)
+        ax.grid(True, alpha=0.15)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.show()
+
+
+if __name__ == '__main__':
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Training Dashboard - View training logs')
+    parser.add_argument('logs', nargs='*', help='Log file prefixes to view (without _episodes.csv suffix)')
+    parser.add_argument('--dir', '-d', default='logs', help='Log directory to search (default: logs)')
+    parser.add_argument('--mode', '-m', help='Filter by mode (e.g., ground_truth)')
+    parser.add_argument('--smooth', '-s', type=float, default=0.9, help='Smoothing factor 0.0-1.0 (default: 0.9)')
+    parser.add_argument('--latest', '-l', action='store_true', help='View latest run(s) automatically')
+    
+    args = parser.parse_args()
+    
+    if args.logs:
+        # User specified explicit log prefixes
+        view_logs(args.logs, smoothing=args.smooth)
+    elif args.latest or not args.logs:
+        # Auto-discover latest logs
+        prefixes = find_latest_logs(args.dir, mode=args.mode)
+        if prefixes:
+            print(f"Found {len(prefixes)} run(s):")
+            for p in prefixes:
+                print(f"  - {p}")
+            view_logs(prefixes, smoothing=args.smooth)
+        else:
+            print(f"No log files found in {args.dir}")
+            if args.mode:
+                print(f"  (filtered by mode: {args.mode})")
