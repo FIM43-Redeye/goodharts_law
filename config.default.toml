@@ -20,7 +20,7 @@ loop = false  # true = edges wrap (toroidal), false = bounded with walls
 # RESOURCES
 # =============================================================================
 [resources]
-food = 50       # Initial food items
+food = 500      # Matches training final_food for consistency
 poison = 10     # Initial poison items
 respawn = true  # Respawn consumed resources
 
@@ -86,9 +86,9 @@ freeze_energy = true # If true, agent energy stays constant (for visualization)
 # =============================================================================
 [training]
 # Curriculum learning - gradually make environment harder
-initial_food = 2500         # Start with lots of food (easy)
-final_food = 50             # End with sparse food (hard)
-curriculum_fraction = 0.9   # Fraction of episodes for curriculum
+initial_food = 500          # Start moderate (was 2500 - too trivial)
+final_food = 200            # End sparse but learnable
+curriculum_fraction = 0.7   # Fraction of episodes for curriculum
 
 # Environment
 poison_count = 30           # Fixed poison count during training
@@ -99,4 +99,11 @@ learning_rate = 0.0003      # 3e-4
 gamma = 0.99                # Discount factor
 eps_clip = 0.2              # PPO clipping parameter
 k_epochs = 4                # PPO epochs per update
-update_timestep = 2000      # Steps between PPO updates
+update_timestep = 500       # Steps between PPO updates
+
+# Reward shaping - provides gradient toward food/away from poison
+reward_scale = 10.0         # Multiply base rewards by this factor
+entropy_coef = 0.0          # Entropy bonus (0 = let policy specialize)
+shaping_food_attract = 0.5  # Reward weight for moving toward visible food
+shaping_poison_repel = 0.3  # Reward weight for moving away from visible poison
+enable_shaping = true       # Enable/disable shaping rewards
