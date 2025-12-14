@@ -4,63 +4,93 @@
 We want EMERGENCE, not just optimization failure. The current demo shows proxies fail,
 but the "a-ha" moment should be watching agents *discover* deceptive strategies themselves.
 
+---
+
 ## Phase 1: Better Measurement & Visualization ✅
-- [x] Track WHY agents die (starvation vs poison) - add death stats
-- [x] Per-agent energy over time charts  
-- [x] Heatmaps showing where agents spend time vs where food/poison is
-- [x] "Suspicion" metric - how often does an agent choose high-proxy cells that are poison?
+- [x] Track WHY agents die (starvation vs poison) - death stats
+- [x] Per-agent energy over time charts (dynamic by behavior type)
+- [x] Heatmaps with RadioButton filtering by agent type
+- [x] Death statistics as stacked bar charts
 
-## Phase 2: Learned Behaviors (CNN/RL) 🚧
-- [x] Replace hardcoded behaviors with small CNNs that process the local view
-- [x] LearnedBehavior with dual-mode (ground_truth/proxy) and flexible action space
-- [x] Replay buffer and data collection infrastructure
-- [x] Reward-weighted behavior cloning training loop
-- [x] Saliency visualization (gradient, guided backprop, integrated gradients)
-- [ ] **Run full comparison**: ground-truth-trained vs proxy-trained agents
-- [ ] Statistical validation that proxy-trained agents die more from poison
+## Phase 2: Learned Behaviors (CNN/RL) ✅
+- [x] BaseCNN architecture with dynamic channel input
+- [x] LearnedBehavior with presets (ground_truth, proxy, proxy_ill_adjusted)
+- [x] PPO with GAE-Lambda (vectorized, ~6000 sps)
+- [x] Multi-mode training dashboard
+- [x] Structured logging (CSV/JSON)
+- [x] Model verification suite
+- [x] Saliency visualization (gradient-based interpretability)
+- [ ] **Run full comparison**: ground-truth vs proxy-trained agents
+- [ ] Statistical validation that proxy agents die more from poison
 
-### Architecture Decisions (In Progress)
-- **Action Space**: Currently discrete (48 actions for max_move_distance=3). Consider:
-  - Keep discrete with max_move_distance=1 (just 8 directions) - simplest
-  - Add continuous mode (2 outputs: dx, dy) for generalization
-  - Make action_mode a config option
-- **Multi-channel Input**: CNN supports arbitrary input_channels - need to make observation
-  generation flexible to stack multiple grids (proxy, density, etc.)
+## Phase 2.5: Code Quality ✅
+- [x] TOML configuration system with defaults
+- [x] Auto-discovery behavior registry
+- [x] Centralized device selection (CPU/CUDA/ROCm)
+- [x] Comprehensive test suite (27 tests)
+- [x] Vectorized environment (VecEnv with shared_grid mode)
+- [x] Documentation refresh (README, training docs)
 
-## Phase 3: Emergent Deception (the cool stuff!)
-- [ ] Multi-agent dynamics: can agents learn to "signal" to others?
-- [ ] Resource scarcity: what happens when agents compete?
-- [ ] Proxy gaming: can agents learn to CREATE high-proxy cells? (gaming the metric)
-- [ ] "Inspector" agents that try to distinguish food from poison
-- [ ] Adversarial co-evolution: proxy-gamers vs inspectors
+---
 
-### New Ideas for Phase 3
-- [ ] **Temporal state**: Feed step count / episode progress to agents (auxiliary MLP head)
-- [ ] **Population awareness**: Tell agents how many others exist - see what emerges
-- [ ] **Noisy vision**: Gaussian noise at view edges, decreasing toward center (uncertainty)
-- [ ] **Recurrent agents**: LSTM/GRU for memory across steps (behavior that evolves over time)
-- [ ] **Auxiliary scalar inputs**: Arbitrary non-grid variables (hunger level, age, etc.)
+## Phase 3: Emergent Deception 🔮
+The cool stuff! Can agents discover deceptive strategies on their own?
+
+### Core Experiments
+- [ ] Multi-agent signaling dynamics
+- [ ] Resource competition under scarcity
+- [ ] Proxy gaming: can agents CREATE high-proxy cells?
+- [ ] "Inspector" agents vs "deceiver" agents
+- [ ] Adversarial co-evolution
+
+### Architecture Extensions
+- [ ] **Temporal state**: Feed step count / episode progress (aux MLP head)
+- [ ] **Population awareness**: Number of other agents as input
+- [ ] **Noisy vision**: Gaussian noise at view edges (uncertainty modeling)
+- [ ] **Recurrent agents**: LSTM/GRU for memory (BaseCNNWithMemory stub exists)
+- [ ] **Auxiliary scalar inputs**: Energy level, age, etc.
+
+---
 
 ## Phase 4: Publication-Ready
-- [ ] Proper README with Goodhart's Law explanation and AI safety connection
+- [x] Comprehensive README with AI safety connection
 - [ ] Reproducible experiments with seeds and config files
 - [ ] Statistical analysis across many runs
-- [ ] Diagrams showing the information asymmetry (proxy vs ground truth)
-- [ ] Connection to real AI alignment failures
+- [ ] Diagrams showing information asymmetry (proxy vs ground truth)
+- [ ] Connection to real-world AI alignment failures
 
-## Wild Ideas
+---
+
+## Technical Debt
+
+### High Priority
+- [ ] Add validation episodes to RL training (periodic eval without exploration)
+- [ ] Make dropout/weight_decay configurable in TOML
+
+### Performance Optimizations
+- [ ] Staggered multi-mode training for better GPU utilization
+      (Currently GPU pauses briefly during CPU work between modes.
+       Staggered starts could keep GPU more consistently busy.)
+- [ ] Profile memory usage for large n_envs
+- [ ] Consider torch.compile() for model optimization
+
+### Code Quality
+- [ ] Consistent error handling across modules
+- [ ] More granular logging levels
+- [ ] CLI help text improvements
+
+---
+
+## Wild Ideas (Someday)
 - Agents that can "lie" about what they found
 - Evolving the proxy function itself
 - Meta-learning: agents learn what proxy to use
 - Hierarchical agents (managers who set proxies, workers who optimize)
+- Self-play between proxy-gamers and inspectors
 
-## Technical Debt
-- [x] Add proper logging
-- [x] Add pytest test suite  
-- [x] Type hints everywhere
-- [x] Performance profiling (numpy vectorization?)
-- [ ] Add validation episodes to RL training (periodic eval without exploration)
-- [ ] Make dropout/weight_decay configurable in TOML (avoid magic numbers)
+---
 
-## Moonshot (do not touch for now!)
-- [ ] Reimplement entire simulation on GPU (JAX/Warp) for massive parallelization
+## Moonshot (Do Not Touch Yet)
+- [ ] Reimplement environment on GPU (JAX/Warp) for massive parallelization
+      (Current bottleneck is Python/NumPy for env, GPU for neural net.
+       Full GPU would unlock 100k+ sps.)

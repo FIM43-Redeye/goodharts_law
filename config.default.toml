@@ -113,3 +113,8 @@ entropy_coef = 0.02         # Increased to prevent collapse with scaled rewards
 shaping_food_attract = 0.5  # Reward weight for moving toward visible food
 shaping_poison_repel = 0.3  # Reward weight for moving away from visible poison
 enable_shaping = true       # Enable/disable shaping rewards
+
+# Long training run options
+checkpoint_interval = 0     # Save checkpoint every N updates (0 = disabled)
+lr_decay = false            # Enable learning rate decay over training
+lr_decay_factor = 0.1       # Final LR = initial_lr * factor (if lr_decay enabled)

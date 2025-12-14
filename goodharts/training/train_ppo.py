@@ -222,6 +222,26 @@ def _train_ppo_core(
         lr=lr
     )
     
+    # LR Scheduler (optional, disabled by default)
+    lr_scheduler = None
+    if train_cfg.get('lr_decay', False):
+        total_updates = total_timesteps // (n_envs * steps_per_env)
+        lr_decay_factor = train_cfg.get('lr_decay_factor', 0.1)
+        # Linear decay from lr to lr * factor
+        lr_scheduler = optim.lr_scheduler.LinearLR(
+            optimizer, 
+            start_factor=1.0, 
+            end_factor=lr_decay_factor, 
+            total_iters=total_updates
+        )
+        print(f"   LR Decay: {lr} → {lr * lr_decay_factor} over {total_updates} updates")
+    
+    # Checkpoint settings
+    checkpoint_interval = train_cfg.get('checkpoint_interval', 0)
+    checkpoint_dir = os.path.dirname(output_path) or 'models'
+    if checkpoint_interval > 0:
+        print(f"   Checkpoints: Every {checkpoint_interval} updates → {checkpoint_dir}/")
+    
     print(f"   Brain: {brain_type} (hidden_size={policy.hidden_size})")
     print(f"   Entropy: {entropy_coef}, GAE Lambda: {gae_lambda}")
     
@@ -509,6 +529,26 @@ def _train_ppo_core(
                   f"Best R={best_reward:.0f} | ProbStd={prob_std:.3f} | Ent={entropy:.3f}")
             print(f"   [Profile] {profiler.summary()}")
             profiler.reset()
+            
+            # Step LR scheduler if enabled
+            if lr_scheduler is not None:
+                lr_scheduler.step()
+            
+            # Save checkpoint if interval is set
+            if checkpoint_interval > 0 and update_count % checkpoint_interval == 0:
+                checkpoint_path = os.path.join(
+                    checkpoint_dir, 
+                    f"checkpoint_{mode}_u{update_count}_s{total_steps}.pth"
+                )
+                torch.save({
+                    'update': update_count,
+                    'total_steps': total_steps,
+                    'policy_state_dict': policy.state_dict(),
+                    'value_head_state_dict': value_head.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_reward': best_reward,
+                }, checkpoint_path)
+                print(f"   💾 Checkpoint saved: {checkpoint_path}")
 
     
     torch.save(policy.state_dict(), output_path)
@@ -625,16 +665,41 @@ if __name__ == '__main__':
     all_modes = get_all_mode_names(config)
     brain_names = get_brain_names()
     
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', default='ground_truth', choices=all_modes + ['all'])
-    parser.add_argument('--brain', default='base_cnn', choices=brain_names)
-    parser.add_argument('--timesteps', type=int, default=100_000)
-    parser.add_argument('--entropy', type=float, default=None)
-    parser.add_argument('--dashboard', '-d', action='store_true')
-    parser.add_argument('--n-envs', type=int, default=64)
+    parser = argparse.ArgumentParser(description='PPO training for Goodhart agents')
+    parser.add_argument('--mode', default='ground_truth', choices=all_modes + ['all'],
+                        help='Training mode (or "all" for parallel training)')
+    parser.add_argument('--brain', default='base_cnn', choices=brain_names,
+                        help='Neural network architecture')
+    parser.add_argument('--timesteps', type=int, default=None,
+                        help='Total environment steps (default: 100,000)')
+    parser.add_argument('--updates', type=int, default=None,
+                        help='Number of PPO updates (alternative to --timesteps)')
+    parser.add_argument('--entropy', type=float, default=None,
+                        help='Entropy coefficient (default: from config)')
+    parser.add_argument('--dashboard', '-d', action='store_true',
+                        help='Show live training dashboard')
+    parser.add_argument('--n-envs', type=int, default=64,
+                        help='Number of parallel environments')
     args = parser.parse_args()
     
+    # Get training config
+    train_cfg = get_training_config()
+    steps_per_env = train_cfg.get('steps_per_env', 128)
+    
+    # Determine timesteps from either --timesteps or --updates
+    if args.updates is not None:
+        total_timesteps = args.updates * args.n_envs * steps_per_env
+        print(f"   📊 {args.updates} updates × {args.n_envs} envs × {steps_per_env} steps = {total_timesteps:,} timesteps")
+    elif args.timesteps is not None:
+        total_timesteps = args.timesteps
+    else:
+        total_timesteps = 100_000  # Default
+    
     modes_to_train = all_modes if args.mode == 'all' else [args.mode]
+    
+    # Get entropy_coef from config if not specified on CLI
+    entropy_coef = args.entropy if args.entropy is not None else train_cfg.get('entropy_coef', 0.02)
+    print(f"   Entropy coefficient: {entropy_coef}")
     
     if args.dashboard:
         from goodharts.training.train_dashboard import create_dashboard
@@ -652,8 +717,8 @@ if __name__ == '__main__':
                     'mode': mode,
                     'brain_type': args.brain,
                     'n_envs': args.n_envs,
-                    'total_timesteps': args.timesteps,
-                    'entropy_coef': args.entropy if args.entropy else 0.0,
+                    'total_timesteps': total_timesteps,
+                    'entropy_coef': entropy_coef,
                     'output_path': output_path,
                     'dashboard': dashboard,
                     'log_to_file': True,
@@ -684,8 +749,8 @@ if __name__ == '__main__':
                         'mode': mode,
                         'brain_type': args.brain,
                         'n_envs': args.n_envs,
-                        'total_timesteps': args.timesteps,
-                        'entropy_coef': args.entropy if args.entropy else 0.0,
+                        'total_timesteps': total_timesteps,
+                        'entropy_coef': entropy_coef,
                         'output_path': output_path,
                         'log_to_file': True,
                     }
@@ -702,7 +767,7 @@ if __name__ == '__main__':
                 mode=modes_to_train[0],
                 brain_type=args.brain,
                 n_envs=args.n_envs,
-                total_timesteps=args.timesteps,
-                entropy_coef=args.entropy if args.entropy else 0.0,
+                total_timesteps=total_timesteps,
+                entropy_coef=entropy_coef,
                 output_path=output_path,
             )
