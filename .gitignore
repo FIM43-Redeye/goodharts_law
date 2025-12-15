@@ -140,9 +140,10 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# IDEs
+# IDEs and etc
 .idea/
 .vscode/
+.devcontainer/
 
 # Personal!
 personal/
