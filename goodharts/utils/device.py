@@ -59,7 +59,7 @@ def get_device(override: str | None = None, verbose: bool = True) -> torch.devic
     if env_device:
         _cached_device = torch.device(env_device)
         if verbose and not _device_logged:
-            print(f"🖥️  Device: {_cached_device} (from GOODHARTS_DEVICE env)")
+            print(f"Device: {_cached_device} (from GOODHARTS_DEVICE env)")
             _device_logged = True
         return _cached_device
     
@@ -70,7 +70,7 @@ def get_device(override: str | None = None, verbose: bool = True) -> torch.devic
         if runtime_cfg and runtime_cfg.get('device'):
             _cached_device = torch.device(runtime_cfg['device'])
             if verbose and not _device_logged:
-                print(f"🖥️  Device: {_cached_device} (from config)")
+                print(f"Device: {_cached_device} (from config)")
                 _device_logged = True
             return _cached_device
     except (ImportError, KeyError):
@@ -81,12 +81,12 @@ def get_device(override: str | None = None, verbose: bool = True) -> torch.devic
         _cached_device = torch.device('cuda')
         if verbose and not _device_logged:
             gpu_name = torch.cuda.get_device_name(0)
-            print(f"🖥️  Device: {_cached_device} ({gpu_name})")
+            print(f"Device: {_cached_device} ({gpu_name})")
             _device_logged = True
     else:
         _cached_device = torch.device('cpu')
         if verbose and not _device_logged:
-            print(f"🖥️  Device: {_cached_device}")
+            print(f"Device: {_cached_device}")
             _device_logged = True
     
     return _cached_device

@@ -209,7 +209,7 @@ class TrainingLogger:
         with open(self.summary_path, 'w') as f:
             json.dump(summary, f, indent=2)
         
-        print(f"📊 Training summary: {self.summary_path}")
+        print(f"Training summary: {self.summary_path}")
         return summary
 
 

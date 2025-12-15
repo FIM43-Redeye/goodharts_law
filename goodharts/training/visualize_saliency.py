@@ -340,7 +340,7 @@ def load_model_from_path(model_path: str, device: torch.device = None) -> tuple[
         'output_size': output_size,
     }
     
-    print(f"📐 Inferred architecture: {input_channels}ch × {side}×{side} → hidden={hidden_size} → {output_size} actions")
+    print(f"Inferred architecture: {input_channels}ch × {side}×{side} → hidden={hidden_size} → {output_size} actions")
     
     model = BaseCNN(
         input_shape=input_shape,
@@ -396,7 +396,7 @@ def analyze_model_attention(
     # Auto-detect model if not specified
     if model_path is None:
         model_path = find_default_model()
-        print(f"🔍 Auto-detected model: {model_path}")
+        print(f"Auto-detected model: {model_path}")
     
     if config is None:
         config = get_config()
@@ -408,7 +408,7 @@ def analyze_model_attention(
     
     # Collect sample views (mode depends on input channels)
     mode = 'ground_truth' if metadata['input_channels'] == 4 else 'proxy_metric'
-    print(f"📊 Collecting {num_samples} sample views (mode: {mode})...")
+    print(f"Collecting {num_samples} sample views (mode: {mode})...")
     buffer = collect_from_expert(config, OmniscientSeeker, num_steps=100, num_agents=5)
     
     # Create output directory
@@ -416,7 +416,7 @@ def analyze_model_attention(
     model_name = Path(model_path).stem
     
     # Generate visualizations
-    print(f"🎨 Generating saliency maps...")
+    print(f"Generating saliency maps...")
     for i in range(min(num_samples, len(buffer))):
         view = buffer.buffer[i].state  # Shape: (C, H, W) or (H, W)
         
@@ -440,7 +440,7 @@ def analyze_model_attention(
         else:
             plt.close(fig)
     
-    print(f"✅ Generated {num_samples} saliency visualizations in {output_dir}/")
+    print(f"Generated {num_samples} saliency visualizations in {output_dir}/")
 
 
 # Also update visualize_saliency to handle multi-channel inputs
@@ -528,7 +528,7 @@ def visualize_saliency(
     
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"  💾 Saved: {save_path}")
+        print(f"Saved: {save_path}")
     
     return fig
 

@@ -227,7 +227,7 @@ def create_brain_layout(sim, agent, visualizer):
     n_rows = 2
     
     fig = plt.figure(figsize=(5 * n_cols, 5 * n_rows))
-    fig.suptitle("🧠 Brain View - Neural Network Visualization", fontsize=14, fontweight='bold')
+    fig.suptitle("Brain View - Neural Network Visualization", fontsize=14, fontweight='bold')
     
     gs = fig.add_gridspec(n_rows, n_cols, hspace=0.3, wspace=0.3)
     
@@ -395,7 +395,7 @@ def update_brain_frame(frame, sim, viz, args):
     
     # Check if we should stop (manual step limit)
     if args.steps and sim.step_count >= args.steps:
-        print(f"\n📊 Brain view complete after {sim.step_count} steps")
+        print(f"\nBrain view complete after {sim.step_count} steps")
         plt.close(viz['fig'])
     
     return []
@@ -502,7 +502,7 @@ def update_frame(frame, sim, viz, args):
     
     # Check stop condition
     if args.steps and sim.step_count >= args.steps:
-        print(f"\n📊 Simulation complete after {sim.step_count} steps")
+        print(f"\nSimulation complete after {sim.step_count} steps")
         plt.close(viz['fig'])
     
     # Return artists to satisfy blit requirement (though we often turn blit off)

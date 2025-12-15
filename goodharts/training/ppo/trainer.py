@@ -139,6 +139,11 @@ class PPOTrainer:
         # Networks
         self.policy = create_brain(cfg.brain_type, self.spec, output_size=n_actions).to(self.device)
         self.value_head = ValueHead(input_size=self.policy.hidden_size).to(self.device)
+
+        # Compile models for extra speed if torch.compile is available (PyTorch 2.0+)
+        if hasattr(torch, 'compile'):
+            self.policy = torch.compile(self.policy)
+            self.value_head = torch.compile(self.value_head)
         
         # Optimizer
         self.optimizer = optim.Adam(
@@ -174,12 +179,17 @@ class PPOTrainer:
         # Profiler
         self.profiler = Profiler(self.device)
         
-        # Curriculum settings
+        # Curriculum settings - inform VecEnv of ranges (each env randomizes on reset)
         self.min_food = train_cfg.get('min_food', 50)
         self.max_food = train_cfg.get('max_food', 200)
         self.min_poison = train_cfg.get('min_poison', 20)
         self.max_poison = train_cfg.get('max_poison', 100)
-        self.vec_env.initial_food = (self.min_food + self.max_food) // 2
+        self.vec_env.set_curriculum_ranges(
+            self.min_food, self.max_food, 
+            self.min_poison, self.max_poison
+        )
+        # Force reset to apply new ranges
+        self.vec_env.reset()
         
         # Checkpoint settings
         self.checkpoint_interval = train_cfg.get('checkpoint_interval', 0)
@@ -271,14 +281,18 @@ class PPOTrainer:
                     if episode_rewards[i] > self.best_reward:
                         self.best_reward = episode_rewards[i]
                     if self.logger:
+                        # Use per-grid food count for this specific environment
+                        grid_id = self.vec_env.grid_indices[i]
+                        food_density = self.vec_env.grid_food_counts[grid_id]
+                        avg_food = (self.min_food + self.max_food) / 2
                         self.logger.log_episode(
                             episode=self.episode_count,
                             reward=episode_rewards[i],
                             length=500,
                             food_eaten=self.vec_env.last_episode_food[i],
                             poison_eaten=self.vec_env.last_episode_poison[i],
-                            food_density=self.vec_env.initial_food,
-                            curriculum_progress=(self.vec_env.initial_food - self.min_food) / (self.max_food - self.min_food + 1e-8),
+                            food_density=food_density,
+                            curriculum_progress=(avg_food - self.min_food) / (self.max_food - self.min_food + 1e-8),
                             action_prob_std=np.std(action_probs[i]),
                         )
                     episode_rewards[i] = 0.0
@@ -349,9 +363,8 @@ class PPOTrainer:
                         action_probs=action_probs[0].tolist()
                     )
                 
-                # Curriculum: randomize food/poison
-                self.vec_env.initial_food = np.random.randint(self.min_food, self.max_food + 1)
-                self.vec_env.poison_count = np.random.randint(self.min_poison, self.max_poison + 1)
+                # Note: Per-environment randomization now handled inside VecEnv on each reset.
+                # Trainer no longer needs to set global food/poison values.
                 
                 # Dashboard update (aggregated per-update, not per-episode)
                 if self.dashboard:
@@ -361,12 +374,13 @@ class PPOTrainer:
                         avg_reward = update_reward_sum / update_episodes
                         avg_food = update_food_sum / update_episodes
                         avg_poison = update_poison_sum / update_episodes
+                        avg_food_density = np.mean(self.vec_env.grid_food_counts)
                         self.dashboard.update(cfg.mode, 'episode', (
                             self.episode_count,
                             avg_reward,
                             500,
                             0,  # legacy
-                            self.vec_env.initial_food,
+                            avg_food_density,
                             avg_food,
                             avg_poison,
                         ))

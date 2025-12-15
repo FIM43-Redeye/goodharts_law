@@ -74,10 +74,17 @@ class VecEnv:
         self.initial_energy = config.get('ENERGY_START', 50.0)
         self.energy_move_cost = config.get('ENERGY_MOVE_COST', 0.1)
         
-        # Training settings
-        self.initial_food = config.get('GRID_FOOD_INIT', 500)
-        self.poison_count = config.get('GRID_POISON_INIT', 30)
+        # Training settings - base values from config
+        default_food = config.get('GRID_FOOD_INIT', 500)
+        default_poison = config.get('GRID_POISON_INIT', 30)
         self.max_steps = train_cfg.get('steps_per_episode', 500)
+        
+        # Curriculum ranges (trainer can override these)
+        # Per-environment randomization: each grid gets its own settings
+        self.food_range = (default_food, default_food)  # (min, max)
+        self.poison_range = (default_poison, default_poison)  # (min, max)
+        self._default_food = default_food
+        self._default_poison = default_poison
         
         # Get CellType for rewards
         self.CellType = config['CellType']
@@ -97,6 +104,10 @@ class VecEnv:
         # If shared_grid, we strictly have 1 grid. If not, we have n_envs grids.
         self.n_grids = 1 if shared_grid else n_envs
         self.grid_indices = np.zeros(n_envs, dtype=np.int32) if shared_grid else np.arange(n_envs, dtype=np.int32)
+        
+        # Per-grid food/poison counts (now that n_grids is known)
+        self.grid_food_counts = np.full(self.n_grids, self._default_food, dtype=np.int32)
+        self.grid_poison_counts = np.full(self.n_grids, self._default_poison, dtype=np.int32)
         
         self.grids = np.zeros((self.n_grids, self.height, self.width), dtype=np.int8)
         self.agent_x = np.zeros(n_envs, dtype=np.int32)
@@ -157,12 +168,30 @@ class VecEnv:
         
         return self._get_observations()
     
+    def set_curriculum_ranges(self, food_min: int, food_max: int, 
+                               poison_min: int, poison_max: int):
+        """
+        Set curriculum ranges for per-environment randomization.
+        
+        Trainer calls this to inform VecEnv of the valid ranges.
+        Each environment randomizes within these ranges on reset.
+        """
+        self.food_range = (food_min, food_max)
+        self.poison_range = (poison_min, poison_max)
+    
     def _reset_grid(self, grid_id: int):
-        """Clear and repopulate a specific grid."""
+        """Clear and repopulate a specific grid with random food/poison counts."""
         CellType = self.CellType
         self.grids[grid_id] = CellType.EMPTY.value
-        self._place_items(grid_id, CellType.FOOD.value, self.initial_food)
-        self._place_items(grid_id, CellType.POISON.value, self.poison_count)
+        
+        # Randomize per-grid (this is the key fix for PPO gradient diversity)
+        food_count = np.random.randint(self.food_range[0], self.food_range[1] + 1)
+        poison_count = np.random.randint(self.poison_range[0], self.poison_range[1] + 1)
+        self.grid_food_counts[grid_id] = food_count
+        self.grid_poison_counts[grid_id] = poison_count
+        
+        self._place_items(grid_id, CellType.FOOD.value, food_count)
+        self._place_items(grid_id, CellType.POISON.value, poison_count)
 
     def _reset_agent(self, env_id: int):
         """Reset a single agent's state."""
