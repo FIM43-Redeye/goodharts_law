@@ -47,7 +47,7 @@ docker compose exec -it dev-cpu bash
 You will now be at a prompt like `appuser@<container-id>:/app$`.
 
 ### 3. Edit Code
-You continue to edit code in **Antigravity** (your editor) just like normal. Since we mapped the volume (`.:/app`), any change you make in the editor is immediately visible inside the container.
+You continue to edit code in your editor just like normal. Since we mapped the volume (`.:/app`), any change you make in the editor is immediately visible inside the container.
 
 ### 4. Stop the Environment
 When you are done, run:
@@ -55,6 +55,36 @@ When you are done, run:
 ```bash
 docker compose down
 ```
+
+
+## Alternative: VS Code Dev Containers (Recommended)
+
+If you use VS Code, you can open the project directly inside a container. This handles all the setup for you and supports Jupyter Notebooks out of the box.
+
+### 1. Setup
+1.  Install the **Dev Containers** extension in VS Code.
+2.  Open this project folder in VS Code.
+
+### 2. Enter Environment
+1.  Press `F1` (or `Ctrl+Shift+P` / `Cmd+Shift+P`).
+2.  Run **"Dev Containers: Reopen in Container"**.
+3.  VS Code will build the image and connect. You are now "inside" the container.
+
+### 3. GPU Configuration (Important!)
+By default, the Dev Container uses the **CPU** profile to ensure compatibility.
+To use your GPU:
+1.  Open `.devcontainer/devcontainer.json`.
+2.  Find the line `"service": "dev-cpu"`.
+3.  Change it to:
+    - `"service": "dev-rocm"` (for AMD)
+    - `"service": "dev-cuda"` (for NVIDIA)
+4.  Press `F1` and run **"Dev Containers: Rebuild Container"**.
+
+### 4. Using Notebooks (Colab Extension etc.)
+1.  Open `notebook_template.ipynb` or any `.ipynb` file.
+2.  In the top right, click **Select Kernel**.
+3.  Choose **Python 3** (it should say "Recommended" or path `/usr/local/bin/python`).
+4.  Run your code. It runs inside the container with full access to the project.
 
 ## Troubleshooting
 - **GPU Not Found or Permission Errors**:

@@ -5,3 +5,4 @@ torch
 torchvision
 pytest
 pytest-cov
+ipykernel
