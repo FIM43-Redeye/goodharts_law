@@ -146,13 +146,10 @@ class RewardComputer(ABC):
         Scale raw rewards. Default is to scale by max magnitude (energy delta).
         Override for custom scaling (e.g. +1/-1).
         """
-        # We need to access CellType properties relative to the running config?
-        # Maybe just hardcode or assume standard scaling if not available?
-        # Actually PPO Trainer sets up things.
-        # Let's use 1.0/100 as default or passed in?
-        # In rewards.py it used CellType from config.
-        # Let's bring back CellType import locally inside method if needed or assume standard.
-        return rewards * 0.01 # Approximate 1/100
+        from goodharts.configs.default_config import TRAINING_DEFAULTS
+        # Use centralized default scaling
+        scale = TRAINING_DEFAULTS.get('reward_scale', 0.1)
+        return rewards * scale
         
     def _calculate_potential_from_target(self, states: np.ndarray, target_mask: np.ndarray) -> np.ndarray:
         """Helper to calculate inverse distance potential to targets."""
@@ -169,8 +166,11 @@ class RewardComputer(ABC):
             masked_dist = np.where(target_mask[has_target], dist_map, np.inf)
             min_dists = masked_dist.reshape(masked_dist.shape[0], -1).min(axis=1)
             
-            # Inverse potential: 0.5 / dist
-            potentials[has_target] = 0.5 / (min_dists + 1e-6)
+            # Inverse potential: 0.1 / (dist + 0.5)
+            # Max value (at dist=0) = 0.2
+            # Value at dist=1 = 0.067
+            # This ensures shaping is weak (<10% of consumption reward) and tapers hard.
+            potentials[has_target] = 0.1 / (min_dists + 0.5)
             
         return potentials
 
