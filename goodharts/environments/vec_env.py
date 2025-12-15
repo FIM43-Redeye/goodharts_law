@@ -12,7 +12,7 @@ Design:
 import numpy as np
 from typing import Tuple
 
-from goodharts.configs.observation_spec import ObservationSpec
+from goodharts.modes import ObservationSpec
 from goodharts.configs.default_config import CellType, get_config
 from goodharts.config import get_training_config
 
@@ -116,6 +116,8 @@ class VecEnv:
         # Stats tracking
         self.current_episode_food = np.zeros(n_envs, dtype=np.int32)
         self.last_episode_food = np.zeros(n_envs, dtype=np.int32)
+        self.current_episode_poison = np.zeros(n_envs, dtype=np.int32)
+        self.last_episode_poison = np.zeros(n_envs, dtype=np.int32)
         
         # Reset all environments
         self.reset()
@@ -166,6 +168,8 @@ class VecEnv:
         """Reset a single agent's state."""
         self.last_episode_food[env_id] = self.current_episode_food[env_id]
         self.current_episode_food[env_id] = 0
+        self.last_episode_poison[env_id] = self.current_episode_poison[env_id]
+        self.current_episode_poison[env_id] = 0
         
         # Random spawn (avoid walls if we had them, but we don't yet)
         self.agent_x[env_id] = np.random.randint(0, self.width)
@@ -213,7 +217,16 @@ class VecEnv:
         self.dones = (self.agent_energy <= 0) | (self.agent_steps >= self.max_steps)
         rewards = np.where(self.dones, rewards - 10.0, rewards)
         
-        return self._get_observations(), rewards, self.dones.copy()
+        # Save dones before reset (reset clears the flag)
+        dones_to_return = self.dones.copy()
+        
+        # Auto-reset done agents
+        if self.dones.any():
+            done_indices = np.where(self.dones)[0]
+            for i in done_indices:
+                self._reset_agent(i)
+        
+        return self._get_observations(), rewards, dones_to_return
     
     def _eat_batch(self) -> np.ndarray:
         """Batched eating logic with shared grid support."""
@@ -275,6 +288,7 @@ class VecEnv:
         
         rewards[poison_mask] = -self.poison_penalty
         self.agent_energy[poison_mask] -= self.poison_penalty
+        self.current_episode_poison[poison_mask] += 1
         
         # Consumed items
         consumed_mask = food_mask | poison_mask
@@ -361,14 +375,29 @@ class VecEnv:
         ]
         
         # Convert to channels
+        # Supports two channel name formats:
+        # 1. 'cell_<name>' - one-hot encoding for a specific CellType (e.g. 'cell_food')
+        # 2. '<property>' - continuous value from CellTypeInfo (e.g. 'interestingness')
+        # This extensible design supports adding new cell types or properties without code changes.
+        property_names = CellType.all_types()[0].property_names()  # Get all valid property names
+        
         for c, name in enumerate(self.channel_names):
             if name.startswith('cell_'):
+                # One-hot encoding for specific cell type
                 cell_name = name[5:].upper()
                 try:
                     cell_type = getattr(CellType, cell_name)
                     self._view_buffer[:, c] = (grid_views == cell_type.value).astype(np.float32)
                 except AttributeError:
                     self._view_buffer[:, c] = 0.0
+            elif name in property_names:
+                # Continuous property value (e.g. 'interestingness', 'energy_reward')
+                # Build a lookup table: cell_value -> property_value
+                prop_values = np.zeros_like(grid_views, dtype=np.float32)
+                for ct in CellType.all_types():
+                    mask = (grid_views == ct.value)
+                    prop_values[mask] = ct.get_property(name)
+                self._view_buffer[:, c] = prop_values
             else:
                 self._view_buffer[:, c] = 0.0
         

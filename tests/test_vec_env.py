@@ -2,7 +2,7 @@
 import pytest
 import numpy as np
 from goodharts.environments.vec_env import create_vec_env
-from goodharts.configs.observation_spec import ObservationSpec
+from goodharts.modes import ObservationSpec
 from goodharts.configs.default_config import get_config
 
 

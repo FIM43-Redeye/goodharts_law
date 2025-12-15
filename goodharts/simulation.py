@@ -8,7 +8,7 @@ from goodharts.behaviors.learned import LEARNED_PRESETS
 from goodharts.environments.vec_env import create_vec_env
 from goodharts.behaviors import get_behavior, create_learned_behavior
 from goodharts.utils.logging_config import get_logger
-from goodharts.configs.observation_spec import ObservationSpec, get_mode_for_requirement
+from goodharts.modes import ObservationSpec, get_mode_for_requirement
 import numpy as np
 
 
@@ -206,8 +206,13 @@ class Simulation:
         for i, agent in enumerate(self.agents):
             # Check for death/reset
             if dones[i]:
-                # Infer reason
-                reason = "Starvation" if agent.energy <= 0 else "Old Age" # VecEnv handles poison as energy subtraction
+                # Infer reason from reward (poison penalty is very negative: -150)
+                if rewards[i] <= -100:
+                    reason = "Poisoned"
+                elif agent.energy <= 0:
+                    reason = "Starvation"
+                else:
+                    reason = "Old Age"
                 
                 # Log death
                 b_name = str(agent.behavior)

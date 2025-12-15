@@ -25,9 +25,10 @@ class EpisodeLog:
     reward: float
     length: int
     food_eaten: int
-    food_density: int
-    curriculum_progress: float
-    action_prob_std: float
+    poison_eaten: int
+    food_density: int = 0
+    curriculum_progress: float = 0.0
+    action_prob_std: float = 0.0
     timestamp: str = ""
     
     def __post_init__(self):
@@ -119,8 +120,9 @@ class TrainingLogger:
         self.hyperparams.update(kwargs)
     
     def log_episode(self, episode: int, reward: float, length: int, 
-                    food_eaten: int, food_density: int, 
-                    curriculum_progress: float, action_prob_std: float):
+                    food_eaten: int, poison_eaten: int,
+                    food_density: int = 0, curriculum_progress: float = 0.0, 
+                    action_prob_std: float = 0.0):
         """Log an episode completion (batched write)."""
         self.episode_count = episode
         self.episode_rewards.append(reward)
@@ -133,6 +135,7 @@ class TrainingLogger:
             reward=reward,
             length=length,
             food_eaten=food_eaten,
+            poison_eaten=poison_eaten,
             food_density=food_density,
             curriculum_progress=curriculum_progress,
             action_prob_std=action_prob_std,

@@ -3,7 +3,7 @@ import time
 import numpy as np
 import torch
 from goodharts.environments.vec_env import create_vec_env
-from goodharts.configs.observation_spec import ObservationSpec
+from goodharts.modes import ObservationSpec
 from goodharts.configs.default_config import get_config
 
 def test_vec_env_rewards():
