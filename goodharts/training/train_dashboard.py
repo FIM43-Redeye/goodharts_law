@@ -5,6 +5,9 @@ Single matplotlib window showing:
 - Reward History
 - Losses (Policy, Value)
 - Entropy
+- Explained Variance
+- Behavior (Food/Poison)
+- Action Distribution
 
 Optimized for fast vectorized training (no image rendering).
 """
@@ -26,27 +29,23 @@ class RunState:
     mode: str
     n_actions: int = 8
     
-    # Episode data
+    # Current snapshot
     episode: int = 0
-    episode_reward: float = 0.0
-    episode_length: int = 0
-    food_eaten: int = 0
-    food_density: int = 0
+    total_steps: int = 0
+    current_action_probs: np.ndarray = field(default_factory=lambda: np.zeros(8))
     
-    # Metrics history (unlimited for full run visualization)
+    # Metrics history (aligned by Update)
     rewards: list = field(default_factory=list)
     policy_losses: list = field(default_factory=list)
     value_losses: list = field(default_factory=list)
     entropies: list = field(default_factory=list)
-    explained_variances: list = field(default_factory=list)  # Value function quality
+    explained_variances: list = field(default_factory=list)
     food_history: list = field(default_factory=list)
     poison_history: list = field(default_factory=list)
     
     # Status
     is_running: bool = True
     is_finished: bool = False
-    total_steps: int = 0
-    best_efficiency: float = float('-inf')
     
     # Timestamps
     last_update: float = 0.0
@@ -71,19 +70,22 @@ class TrainingDashboard:
         # Thread-safe update queue
         self.update_queue: queue.Queue = queue.Queue()
         
-        # Speed control
-        self.speed_mode = 'normal'
+        # UI State
         self.paused = False
-        
-        # Matplotlib state
         self.fig = None
-        self.axes: dict[str, dict[str, Any]] = {}  # mode -> {axis_name: axis}
-        self.line_artists: dict[str, dict[str, Any]] = {}  # mode -> {name: Line2D}
-        
+        self.axes: dict[str, dict[str, Any]] = {}
+        self.artists: dict[str, dict[str, Any]] = {}
         self.running = True
     
     def update(self, mode: str, update_type: str, data: Any):
-        """Queue an update from a training thread."""
+        """
+        Queue an update from a training thread.
+        
+        Args:
+            mode: Training mode
+            update_type: 'update' (unified), 'finished'
+            data: Payload
+        """
         try:
             self.update_queue.put_nowait((mode, update_type, data))
         except queue.Full:
@@ -92,7 +94,7 @@ class TrainingDashboard:
     def _process_updates(self):
         """Process all pending updates."""
         updates_processed = 0
-        max_updates = 200
+        max_updates = 500  # Process more updates per frame to catch up
         
         while not self.update_queue.empty() and updates_processed < max_updates:
             try:
@@ -103,30 +105,45 @@ class TrainingDashboard:
                 
                 run.last_update = time.time()
                 
-                if update_type == 'step':
-                    # data: (agent_view, action_probs, total_steps) -> IGNORE view/probs
-                    run.total_steps = data[2]
-                
-                elif update_type == 'episode':
-                    # data: (episode, reward, length, food, density)
-                    run.episode = data[0]
-                    run.episode_reward = data[1]
-                    run.episode_length = data[2]
-                    run.episode_length = data[2]
-                    run.rewards.append(data[1])
-                    if len(data) > 5:
-                        run.food_history.append(data[5])
-                        run.poison_history.append(data[6])
-                
-                elif update_type == 'ppo':
-                    # data: (policy_loss, value_loss, entropy, action_probs) or
-                    #       (policy_loss, value_loss, entropy, action_probs, explained_var)
-                    run.policy_losses.append(data[0])
-                    run.value_losses.append(data[1])
-                    run.entropies.append(data[2])
-                    # Handle EV if present (new logs have it, old logs don't)
-                    if len(data) > 4:
-                        run.explained_variances.append(data[4])
+                if update_type == 'update':
+                    # Unified Update Payload:
+                    # {
+                    #   'ppo': (p_loss, v_loss, ent, probs, ev),
+                    #   'episodes': { 'reward': ..., 'food': ..., 'poison': ... } OR None
+                    #   'steps': int
+                    # }
+                    
+                    ppo = data.get('ppo')
+                    episodes = data.get('episodes')
+                    steps = data.get('steps', 0)
+                    
+                    if ppo:
+                        # 1. PPO Stats (Always present)
+                        p_loss, v_loss, ent, probs, ev = ppo
+                        run.policy_losses.append(p_loss)
+                        run.value_losses.append(v_loss)
+                        run.entropies.append(ent)
+                        run.explained_variances.append(ev)
+                        run.current_action_probs = np.array(probs)
+                        
+                        # 2. Episode Stats (Forward fill if missing)
+                        # If no episodes finished this update, repeat the last known value
+                        # to maintain graph continuity with the "Update" axis.
+                        if episodes:
+                            run.rewards.append(episodes['reward'])
+                            run.food_history.append(episodes['food'])
+                            run.poison_history.append(episodes['poison'])
+                        else:
+                            # Forward fill
+                            last_reward = run.rewards[-1] if run.rewards else 0.0
+                            last_food = run.food_history[-1] if run.food_history else 0.0
+                            last_poison = run.poison_history[-1] if run.poison_history else 0.0
+                            
+                            run.rewards.append(last_reward)
+                            run.food_history.append(last_food)
+                            run.poison_history.append(last_poison)
+                            
+                    run.total_steps = steps
                 
                 elif update_type == 'finished':
                     run.is_finished = True
@@ -156,17 +173,17 @@ class TrainingDashboard:
         
         # Layout: 1 row per run
         rows = self.n_runs
-        cols = 5  # Reward, Loss, Entropy, Explained Variance, Behavior
+        cols = 6  # Reward, Loss, Entropy, Expl Var, Behavior, Action Dist
         
         # Adjust height based on rows
         fig_height = 3 * rows + 1
-        self.fig = plt.figure(figsize=(14, fig_height))
-        self.fig.suptitle("Training Dashboard", fontsize=14, fontweight='bold', color='white')
+        self.fig = plt.figure(figsize=(16, fig_height))
+        self.fig.suptitle("Training Dashboard (Unified)", fontsize=14, fontweight='bold', color='white')
         
         # Grid
         gs = gridspec.GridSpec(rows, cols, figure=self.fig, 
-                               hspace=0.4, wspace=0.25, 
-                               left=0.05, right=0.95, top=0.9, bottom=0.1)
+                               hspace=0.4, wspace=0.3, 
+                               left=0.03, right=0.97, top=0.9, bottom=0.1)
         
         for i, mode in enumerate(self.modes):
             self._create_run_row(gs, i, mode)
@@ -176,113 +193,96 @@ class TrainingDashboard:
     def _create_run_row(self, gs, row_idx: int, mode: str):
         """Create a row of graphs for one run."""
         self.axes[mode] = {}
-        self.line_artists[mode] = {}
+        self.artists[mode] = {}
         
         # 1. Reward
-        ax_rew = self.fig.add_subplot(gs[row_idx, 0])
-        ax_rew.set_title(f"{mode}: Rewards", fontsize=10, fontweight='bold', color='yellow')
-        ax_rew.grid(True, alpha=0.15)
-        # Force integer x-axis ticks
-        ax_rew.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax = self.fig.add_subplot(gs[row_idx, 0])
+        ax.set_title(f"{mode}: Rewards", fontsize=10, fontweight='bold', color='yellow')
+        ax.grid(True, alpha=0.15)
+        # ax.set_xlabel("Update") # Save space
         
-        line_rew, = ax_rew.plot([], [], 'c-', linewidth=1.5, alpha=0.9)
-        self.axes[mode]['reward'] = ax_rew
-        self.line_artists[mode]['reward'] = line_rew
+        l_rew, = ax.plot([], [], 'c-', linewidth=1.5, alpha=0.9)
+        self.axes[mode]['reward'] = ax
+        self.artists[mode]['reward'] = l_rew
         
         # 2. Losses
-        ax_loss = self.fig.add_subplot(gs[row_idx, 1])
-        ax_loss.set_title("Losses", fontsize=10, color='silver')
-        ax_loss.grid(True, alpha=0.15)
-        ax_loss.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax = self.fig.add_subplot(gs[row_idx, 1])
+        ax.set_title("Losses", fontsize=10, color='silver')
+        ax.grid(True, alpha=0.15)
         
-        l_pol, = ax_loss.plot([], [], 'r-', linewidth=1, label='Policy', alpha=0.8)
-        l_val, = ax_loss.plot([], [], 'g-', linewidth=1, label='Value', alpha=0.8)
-        ax_loss.legend(fontsize=7, loc='upper right', framealpha=0.3)
+        l_pol, = ax.plot([], [], 'r-', linewidth=1, label='Pol', alpha=0.8)
+        l_val, = ax.plot([], [], 'g-', linewidth=1, label='Val', alpha=0.8)
+        ax.legend(fontsize=7, loc='upper right', framealpha=0.3)
         
-        self.axes[mode]['loss'] = ax_loss
-        self.line_artists[mode]['policy'] = l_pol
-        self.line_artists[mode]['value'] = l_val
+        self.axes[mode]['loss'] = ax
+        self.artists[mode]['policy'] = l_pol
+        self.artists[mode]['value'] = l_val
         
         # 3. Entropy
-        ax_ent = self.fig.add_subplot(gs[row_idx, 2])
-        ax_ent.set_title("Entropy", fontsize=10, color='silver')
-        ax_ent.grid(True, alpha=0.15)
-        ax_ent.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax = self.fig.add_subplot(gs[row_idx, 2])
+        ax.set_title("Entropy", fontsize=10, color='silver')
+        ax.grid(True, alpha=0.15)
         
-        # Target entropy reference
         max_ent = np.log(self.n_actions)
-        ax_ent.axhline(y=max_ent, color='gray', linestyle='--', alpha=0.3)
-        ax_ent.set_ylim(0, max_ent * 1.1)
+        ax.axhline(y=max_ent, color='gray', linestyle='--', alpha=0.3)
+        ax.set_ylim(0, max_ent * 1.1)
         
-        l_ent, = ax_ent.plot([], [], 'm-', linewidth=1.5, alpha=0.9)
+        l_ent, = ax.plot([], [], 'm-', linewidth=1.5, alpha=0.9)
+        self.axes[mode]['entropy'] = ax
+        self.artists[mode]['entropy'] = l_ent
         
-        self.axes[mode]['entropy'] = ax_ent
-        self.line_artists[mode]['entropy'] = l_ent
+        # 4. Explained Variance
+        ax = self.fig.add_subplot(gs[row_idx, 3])
+        ax.set_title("Expl. Var.", fontsize=10, color='silver')
+        ax.grid(True, alpha=0.15)
+        ax.axhline(y=1.0, color='lime', linestyle='--', alpha=0.3)
+        ax.axhline(y=0.0, color='gray', linestyle=':', alpha=0.3)
+        ax.set_ylim(-0.5, 1.1)
         
-        # 4. Explained Variance (Value function quality)
-        ax_ev = self.fig.add_subplot(gs[row_idx, 3])
-        ax_ev.set_title("Expl. Var.", fontsize=10, color='silver')
-        ax_ev.grid(True, alpha=0.15)
-        ax_ev.xaxis.set_major_locator(MaxNLocator(integer=True))
+        l_ev, = ax.plot([], [], 'y-', linewidth=1.5, alpha=0.9)
+        self.axes[mode]['ev'] = ax
+        self.artists[mode]['ev'] = l_ev
         
-        # Reference line at 1.0 (perfect value prediction)
-        ax_ev.axhline(y=1.0, color='lime', linestyle='--', alpha=0.3, label='Perfect')
-        ax_ev.axhline(y=0.0, color='gray', linestyle=':', alpha=0.3)
-        ax_ev.set_ylim(-0.5, 1.1)  # EV can be negative if predictions are worse than mean
+        # 5. Behavior
+        ax = self.fig.add_subplot(gs[row_idx, 4])
+        ax.set_title("Behavior", fontsize=10, color='silver')
+        ax.grid(True, alpha=0.15)
         
-        l_ev, = ax_ev.plot([], [], 'y-', linewidth=1.5, alpha=0.9)
+        l_food, = ax.plot([], [], 'g-', linewidth=1.5, alpha=0.9, label='Food')
+        l_poison, = ax.plot([], [], 'r-', linewidth=1.5, alpha=0.9, label='Pois')
+        ax.legend(fontsize=7, loc='upper right', framealpha=0.3)
         
-        self.axes[mode]['ev'] = ax_ev
-        self.line_artists[mode]['ev'] = l_ev
+        self.axes[mode]['beh'] = ax
+        self.artists[mode]['food'] = l_food
+        self.artists[mode]['poison'] = l_poison
         
-        # 5. Behavior (Food/Poison)
-        ax_beh = self.fig.add_subplot(gs[row_idx, 4])
-        ax_beh.set_title("Behavior", fontsize=10, color='silver')
-        ax_beh.grid(True, alpha=0.15)
-        ax_beh.xaxis.set_major_locator(MaxNLocator(integer=True))
+        # 6. Action Distribution (Bar Chart)
+        ax = self.fig.add_subplot(gs[row_idx, 5])
+        ax.set_title("Actions", fontsize=10, color='silver')
+        ax.grid(False)
+        ax.set_ylim(0, 0.6) # reasonable max prob
+        ax.axhline(y=1.0/self.n_actions, color='gray', linestyle='--', alpha=0.3)
         
-        l_food, = ax_beh.plot([], [], 'g-', linewidth=1.5, alpha=0.9, label='Food')
-        l_poison, = ax_beh.plot([], [], 'r-', linewidth=1.5, alpha=0.9, label='Poison')
-        ax_beh.legend(fontsize=7, loc='upper right', framealpha=0.3)
+        action_labels = ['↑', '↓', '←', '→', '↖', '↗', '↙', '↘'][:self.n_actions]
+        x = np.arange(self.n_actions)
+        bars = ax.bar(x, np.zeros(self.n_actions), color='#00d9ff', alpha=0.7)
+        ax.set_xticks(x)
+        ax.set_xticklabels(action_labels)
         
-        self.axes[mode]['beh'] = ax_beh
-        self.line_artists[mode]['food'] = l_food
-        self.line_artists[mode]['poison'] = l_poison
+        self.axes[mode]['act'] = ax
+        self.artists[mode]['act_bars'] = bars
 
     def _create_controls(self):
         """Create simple control buttons."""
-        # Place buttons at very bottom
-        ax_pause = self.fig.add_axes([0.35, 0.02, 0.1, 0.04])
+        ax_pause = self.fig.add_axes([0.45, 0.02, 0.1, 0.04])
         self.btn_pause = Button(ax_pause, 'Pause', color='#333333', hovercolor='#555555')
         self.btn_pause.label.set_color('white')
-        
-        ax_finish = self.fig.add_axes([0.55, 0.02, 0.1, 0.04])
-        self.btn_finish = Button(ax_finish, 'Finish', color='#333333', hovercolor='#555555')
-        self.btn_finish.label.set_color('white')
         
         def toggle_pause(event):
             self.paused = not self.paused
             self.btn_pause.label.set_text('Resume' if self.paused else 'Pause')
             
-        def finish_training(event):
-            self.finish_requested = True
-            self.btn_finish.label.set_text('Stopping...')
-            # Queue finish for all runs? Or just signal globally.
-            # We'll set a flag that the trainer checks.
-            # Note: Trainer runs in separate process. Dashboard update queue is one-way.
-            # Actually, typically trainer pushes to dashboard. Dashboard can't easily push back
-            # without a shared flag or file.
-            # User is running single process with threads? "python -m ... --mode all"
-            # It likely uses multiprocessing.
-            # If multiprocessing, we can't easily stop them from here unless they listen for a file or shared value.
-            # Simplest hack: Create a 'training.stop' file.
-            import os
-            with open('.training_stop_signal', 'w') as f:
-                f.write('stop')
-            print("\nStop signal sent (file created). Waiting for trainers...")
-            
         self.btn_pause.on_clicked(toggle_pause)
-        self.btn_finish.on_clicked(finish_training)
         
     def _update_frame(self, frame):
         """Update graphs."""
@@ -291,86 +291,81 @@ class TrainingDashboard:
             
         self._process_updates()
         
+        artists_to_draw = []
+        
         for mode, run in self.runs.items():
-            artists = self.line_artists[mode]
+            artists = self.artists[mode]
             axes = self.axes[mode]
             
-            # --- Update Data ---
+            # Common X-axis (Updates)
+            n_updates = len(run.rewards)
+            if n_updates < 2:
+                continue
+                
+            x_data = list(range(n_updates))
             
-            # REWARDS
-            if len(run.rewards) > 1:
-                # X-axis is simply local index for now, could be episodes
-                raw_y = list(run.rewards)
-                smooth_y = self._smooth(raw_y, alpha=0.9)
+            # 1. Rewards
+            y_rew = self._smooth(run.rewards, 0.9)
+            artists['reward'].set_data(x_data, y_rew)
+            axes['reward'].set_xlim(0, n_updates + 5)
+            # Auto-scale Y with padding
+            if y_rew:
+                mn, mx = min(y_rew), max(y_rew)
+                rng = mx - mn if mx != mn else 1.0
+                axes['reward'].set_ylim(mn - rng*0.1, mx + rng*0.1)
                 
-                x_data = list(range(len(raw_y)))
-                artists['reward'].set_data(x_data, smooth_y)
+            # 2. Losses
+            y_pol = self._smooth(run.policy_losses, 0.9)
+            y_val = self._smooth(run.value_losses, 0.9)
+            artists['policy'].set_data(x_data, y_pol)
+            artists['value'].set_data(x_data, y_val)
+            axes['loss'].set_xlim(0, n_updates + 5)
+            # Combine for scale
+            all_loss = y_pol + y_val
+            if all_loss:
+                mn, mx = min(all_loss), max(all_loss)
+                rng = mx - mn if mx != mn else 1.0
+                axes['loss'].set_ylim(mn - rng*0.1, mx + rng*0.1)
                 
-                axes['reward'].set_xlim(0, len(raw_y) + 5)
-                # Dynamic Y-limits with padding (based on smoothed data for stability)
-                min_y, max_y = min(smooth_y), max(smooth_y)
-                rng = max_y - min_y if max_y != min_y else 1.0
-                axes['reward'].set_ylim(min_y - rng*0.1, max_y + rng*0.1)
-
-            # LOSSES
-            if len(run.policy_losses) > 1:
-                x_data = list(range(len(run.policy_losses)))
-                
-                p_loss = self._smooth(list(run.policy_losses), alpha=0.9)
-                v_loss = self._smooth(list(run.value_losses), alpha=0.9)
-                
-                artists['policy'].set_data(x_data, p_loss)
-                artists['value'].set_data(x_data, v_loss)
-                
-                axes['loss'].set_xlim(0, len(x_data) + 5)
-                
-                # Combine limits
-                all_vals = p_loss + v_loss
-                min_y, max_y = min(all_vals), max(all_vals)
-                rng = max_y - min_y if max_y != min_y else 1.0
-                axes['loss'].set_ylim(min_y - rng*0.1, max_y + rng*0.1)
-
-            # ENTROPY
-            if len(run.entropies) > 1:
-                y_data = list(run.entropies) # Entropy usually doesn't need much smoothing, but consistency is good
-                # smooth_y = self._smooth(y_data, alpha=0.9) 
-                # Keep entropy raw as it's less noisy and good for debugging collapse
-                
-                x_data = list(range(len(y_data)))
-                artists['entropy'].set_data(x_data, y_data)
-                
-                axes['entropy'].set_xlim(0, len(x_data) + 5)
-                # Entropy Y is fixed 0..log(N) usually, but let's autoscale bottom slightly
-                axes['entropy'].set_ylim(0, np.log(self.n_actions)*1.1)
+            # 3. Entropy
+            artists['entropy'].set_data(x_data, run.entropies)
+            axes['entropy'].set_xlim(0, n_updates + 5)
             
-            # EXPLAINED VARIANCE (blank if no data from old logs)
-            if len(run.explained_variances) > 1:
-                y_data = self._smooth(list(run.explained_variances), alpha=0.9)
-                x_data = list(range(len(y_data)))
-                artists['ev'].set_data(x_data, y_data)
-                axes['ev'].set_xlim(0, len(x_data) + 5)
-                # Keep fixed Y limits for consistency
+            # 4. Explained Variance
+            y_ev = self._smooth(run.explained_variances, 0.9)
+            artists['ev'].set_data(x_data, y_ev)
+            axes['ev'].set_xlim(0, n_updates + 5)
+            
+            # 5. Behavior
+            y_food = self._smooth(run.food_history, 0.9)
+            y_pois = self._smooth(run.poison_history, 0.9)
+            artists['food'].set_data(x_data, y_food)
+            artists['poison'].set_data(x_data, y_pois)
+            axes['beh'].set_xlim(0, n_updates + 5)
+            # Scale
+            all_beh = y_food + y_pois
+            if all_beh:
+                mn, mx = min(all_beh), max(all_beh)
+                rng = mx - mn if mx != mn else 1.0
+                axes['beh'].set_ylim(max(0, mn - rng*0.1), mx + rng*0.1)
                 
-                # Keep fixed Y limits for consistency
-                
-            # BEHAVIOR
-            if len(run.food_history) > 1:
-                f_data = self._smooth(list(run.food_history), alpha=0.9)
-                p_data = self._smooth(list(run.poison_history), alpha=0.9)
-                x_data = list(range(len(f_data)))
-                
-                artists['food'].set_data(x_data, f_data)
-                artists['poison'].set_data(x_data, p_data)
-                
-                axes['beh'].set_xlim(0, len(x_data) + 5)
-                
-                # Dynamic Y-limits
-                all_vals = f_data + p_data
-                if all_vals:
-                    min_y, max_y = min(all_vals), max(all_vals)
-                    rng = max_y - min_y if max_y != min_y else 1.0
-                    axes['beh'].set_ylim(max(0, min_y - rng*0.1), max_y + rng*0.1)
-                
+            # 6. Action Distribution
+            probs = run.current_action_probs
+            for bar, prob in zip(artists['act_bars'], probs):
+                bar.set_height(prob)
+                # Color code
+                uniform = 1.0 / self.n_actions
+                if prob > uniform * 1.5:
+                    bar.set_color('#ff6b6b') # Red = High
+                elif prob < uniform * 0.5:
+                    bar.set_color('#4ecdc4') # Teal = Low
+                else:
+                    bar.set_color('#00d9ff') # Blue = Normal
+            
+            # Collect artists?
+            # Matplotlib FuncAnimation with blit=False redraws everything, returning list helps if blit=True
+            # We used blit=False so update is implicit
+            
         return []
 
     def run(self):
@@ -385,7 +380,7 @@ class TrainingDashboard:
         self.ani = FuncAnimation(
             self.fig,
             self._update_frame,
-            interval=100, # 10fps is plenty for graphs
+            interval=200, 
             blit=False,
             cache_frame_data=False
         )
