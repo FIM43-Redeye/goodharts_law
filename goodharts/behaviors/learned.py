@@ -37,8 +37,8 @@ class LearnedBehavior(BehaviorStrategy):
                          1.0 = sample from softmax probs
                          High (2.0+) = more random
         """
-        if mode not in ('ground_truth', 'ground_truth_handhold', 'proxy'):
-            raise ValueError(f"mode must be 'ground_truth', 'ground_truth_handhold', or 'proxy', got '{mode}'")
+        if mode not in ('ground_truth', 'ground_truth_handhold', 'proxy', 'proxy_ill_adjusted'):
+            raise ValueError(f"mode must be 'ground_truth', 'ground_truth_handhold', 'proxy', or 'proxy_ill_adjusted', got '{mode}'")
         
         self.name = name
         self._mode = mode

@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 
 if TYPE_CHECKING:
-    from goodharts.configs.observation_spec import ObservationSpec
+    from goodharts.modes import ObservationSpec
 
 
 @runtime_checkable

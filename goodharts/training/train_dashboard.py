@@ -39,6 +39,8 @@ class RunState:
     value_losses: list = field(default_factory=list)
     entropies: list = field(default_factory=list)
     explained_variances: list = field(default_factory=list)  # Value function quality
+    food_history: list = field(default_factory=list)
+    poison_history: list = field(default_factory=list)
     
     # Status
     is_running: bool = True
@@ -110,7 +112,11 @@ class TrainingDashboard:
                     run.episode = data[0]
                     run.episode_reward = data[1]
                     run.episode_length = data[2]
+                    run.episode_length = data[2]
                     run.rewards.append(data[1])
+                    if len(data) > 5:
+                        run.food_history.append(data[5])
+                        run.poison_history.append(data[6])
                 
                 elif update_type == 'ppo':
                     # data: (policy_loss, value_loss, entropy, action_probs) or
@@ -150,7 +156,7 @@ class TrainingDashboard:
         
         # Layout: 1 row per run
         rows = self.n_runs
-        cols = 4  # Reward, Loss, Entropy, Explained Variance
+        cols = 5  # Reward, Loss, Entropy, Explained Variance, Behavior
         
         # Adjust height based on rows
         fig_height = 3 * rows + 1
@@ -228,6 +234,20 @@ class TrainingDashboard:
         
         self.axes[mode]['ev'] = ax_ev
         self.line_artists[mode]['ev'] = l_ev
+        
+        # 5. Behavior (Food/Poison)
+        ax_beh = self.fig.add_subplot(gs[row_idx, 4])
+        ax_beh.set_title("Behavior", fontsize=10, color='silver')
+        ax_beh.grid(True, alpha=0.15)
+        ax_beh.xaxis.set_major_locator(MaxNLocator(integer=True))
+        
+        l_food, = ax_beh.plot([], [], 'g-', linewidth=1.5, alpha=0.9, label='Food')
+        l_poison, = ax_beh.plot([], [], 'r-', linewidth=1.5, alpha=0.9, label='Poison')
+        ax_beh.legend(fontsize=7, loc='upper right', framealpha=0.3)
+        
+        self.axes[mode]['beh'] = ax_beh
+        self.line_artists[mode]['food'] = l_food
+        self.line_artists[mode]['poison'] = l_poison
 
     def _create_controls(self):
         """Create simple control buttons."""
@@ -330,6 +350,26 @@ class TrainingDashboard:
                 artists['ev'].set_data(x_data, y_data)
                 axes['ev'].set_xlim(0, len(x_data) + 5)
                 # Keep fixed Y limits for consistency
+                
+                # Keep fixed Y limits for consistency
+                
+            # BEHAVIOR
+            if len(run.food_history) > 1:
+                f_data = self._smooth(list(run.food_history), alpha=0.9)
+                p_data = self._smooth(list(run.poison_history), alpha=0.9)
+                x_data = list(range(len(f_data)))
+                
+                artists['food'].set_data(x_data, f_data)
+                artists['poison'].set_data(x_data, p_data)
+                
+                axes['beh'].set_xlim(0, len(x_data) + 5)
+                
+                # Dynamic Y-limits
+                all_vals = f_data + p_data
+                if all_vals:
+                    min_y, max_y = min(all_vals), max(all_vals)
+                    rng = max_y - min_y if max_y != min_y else 1.0
+                    axes['beh'].set_ylim(max(0, min_y - rng*0.1), max_y + rng*0.1)
                 
         return []
 

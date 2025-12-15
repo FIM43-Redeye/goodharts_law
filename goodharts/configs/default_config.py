@@ -160,7 +160,7 @@ def get_config(config_path: str | None = None):
         config_path: Optional path to specific config file.
                      If None, uses auto-detection (config.toml > config.default.toml)
     """
-    from .observation_spec import ObservationSpec
+    from goodharts.modes import ObservationSpec
     from goodharts.config import load_config, get_config as get_toml_config
     
     # Load TOML config
