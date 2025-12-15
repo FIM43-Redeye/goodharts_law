@@ -64,6 +64,7 @@ class BaseCNN(nn.Module):
         # Input: CNN features + auxiliary scalars
         fc_input_size = conv_output_size + num_aux_inputs
         self.fc1 = nn.Linear(fc_input_size, hidden_size)
+
         
         # Output layer depends on action mode
         if action_mode == 'discrete':
@@ -73,6 +74,19 @@ class BaseCNN(nn.Module):
             self.fc_out = nn.Linear(hidden_size, 2)
         else:
             raise ValueError(f"Unknown action_mode: {action_mode}")
+        
+        self._init_weights()
+
+    def _init_weights(self):
+        # Orthogonal init for better PPO stability
+        for name, module in self.named_modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        
+        # Scale the final action layer to be nearly 0 (uniform random policy at start)
+        nn.init.orthogonal_(self.fc_out.weight, gain=0.01)
 
     @classmethod
     def from_spec(cls, spec: 'ObservationSpec', output_size: int, **kwargs) -> 'BaseCNN':

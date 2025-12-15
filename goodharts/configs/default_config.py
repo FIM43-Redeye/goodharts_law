@@ -64,7 +64,7 @@ class CellType:
     EMPTY = CellTypeInfo(0, "Empty", color=(26, 26, 46))
     WALL = CellTypeInfo(1, "Wall", color=(74, 74, 74))
     FOOD = CellTypeInfo(2, "Food", color=(22, 199, 154), interestingness=1.0, energy_reward=15.0)
-    POISON = CellTypeInfo(3, "Poison", color=(255, 107, 107), interestingness=0.9, energy_penalty=150.0)
+    POISON = CellTypeInfo(3, "Poison", color=(255, 107, 107), interestingness=0.9, energy_penalty=10.0)
     # Agent types (visible in observations)
     PREY = CellTypeInfo(4, "Prey", color=(0, 255, 255), interestingness=0.3)
     PREDATOR = CellTypeInfo(5, "Predator", color=(255, 0, 0), interestingness=1.0, energy_reward=25.0)  

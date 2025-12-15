@@ -177,7 +177,7 @@ class TrainingVisualizer:
     def _create_figure(self):
         """Create the matplotlib figure and axes."""
         self.fig = plt.figure(figsize=(14, 10))
-        self.fig.suptitle(f"🧠 Training: {self.mode}", fontsize=14, fontweight='bold')
+        self.fig.suptitle(f"Training: {self.mode}", fontsize=14, fontweight='bold')
         
         # 3x3 grid layout
         gs = gridspec.GridSpec(3, 3, figure=self.fig, hspace=0.4, wspace=0.3)
@@ -253,7 +253,7 @@ class TrainingVisualizer:
         
         # Entropy (key diagnostic!)
         ax = self.axes['entropy']
-        ax.set_title("Entropy 🔍")
+        ax.set_title("Entropy")
         ax.set_xlabel("Update")
         ax.set_ylabel("Entropy")
         ax.grid(True, alpha=0.3)
@@ -273,7 +273,7 @@ class TrainingVisualizer:
         
         # Action probability std (KEY DIAGNOSTIC)
         ax = self.axes['action_std']
-        ax.set_title("Action Prob Std 🔍 (higher = more opinionated)")
+        ax.set_title("Action Prob Std (higher = more opinionated)")
         ax.set_xlabel("Update")
         ax.set_ylabel("Std Dev")
         ax.grid(True, alpha=0.3)

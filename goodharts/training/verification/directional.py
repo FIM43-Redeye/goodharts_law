@@ -42,10 +42,10 @@ def test_directional_accuracy(model_path: str, model_name: str) -> float:
         model.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=True))
         model.eval()
     except FileNotFoundError:
-        print(f"  ✗ Model not found: {model_path}")
+        print(f"Model not found: {model_path}")
         return 0.0
     except Exception as e:
-        print(f"  ✗ Error loading model: {e}")
+        print(f"Error loading model: {e}")
         return 0.0
     
     # Test cases: food position -> expected direction indices
@@ -86,7 +86,6 @@ def test_directional_accuracy(model_path: str, model_name: str) -> float:
             correct += 1
     
     accuracy = correct / len(test_cases)
-    status = "✓" if accuracy >= 0.75 else "✗"
-    print(f"  {status} Directional accuracy: {accuracy:.0%} ({correct}/{len(test_cases)})")
+    print(f"Directional accuracy: {accuracy:.0%} ({correct}/{len(test_cases)})")
     
     return accuracy

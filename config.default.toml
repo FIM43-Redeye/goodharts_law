@@ -101,7 +101,7 @@ max_poison = 100            # Maximum poison count during training
 steps_per_episode = 500     # Max steps per episode
 
 # PPO hyperparameters
-learning_rate = 0.001       # 1e-3 (Faster convergence)
+learning_rate = 0.0003       # 3e-4 (Please god let this work)
 gamma = 0.99                # Discount factor
 eps_clip = 0.2              # PPO clipping parameter
 k_epochs = 4                # PPO epochs per update

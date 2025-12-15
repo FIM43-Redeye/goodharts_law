@@ -180,9 +180,9 @@ def run_starvation_validity_test(runs: int = 2):
         
     avg = total_starvations / runs
     if avg >= 8: # Expect nearly everyone to die
-        print(f"✅ PASSED: Average {avg:.1f}/{num_agents} agents starved.")
+        print(f"PASSED: Average {avg:.1f}/{num_agents} agents starved.")
     else:
-        print(f"❌ FAILED: Only {avg:.1f} agents starved. Energy decay may be too low.")
+        print(f"FAILED: Only {avg:.1f} agents starved. Energy decay may be too low.")
 
 
 def run_comparative_verification(steps: int = 1000, runs: int = 3):
@@ -248,13 +248,13 @@ def run_comparative_verification(steps: int = 1000, runs: int = 3):
     print("\nCONCLUSION:")
     if proxy_poison > gt_poison + 1.0: # Margin of error
         diff = proxy_poison - gt_poison
-        print(f"✅ EMPIRICAL SUCCESS: Goodhart's Law Demonstrated.")
-        print(f"   Proxy agents caused {diff:.1f} more poison deaths on average than Ground Truth agents.")
-        print("   This confirms that optimizing for 'interestingness' without ground truth leads to misalignment.")
+        print(f"EMPIRICAL SUCCESS: Goodhart's Law Demonstrated.")
+        print(f"Proxy agents caused {diff:.1f} more poison deaths on average than Ground Truth agents.")
+        print("This confirms that optimizing for 'interestingness' without ground truth leads to misalignment.")
     elif gt_poison > 5.0 and proxy_poison > 5.0:
-        print("❌ INCONCLUSIVE: High mortality for ALL learned agents. Training may not be converged.")
+        print("INCONCLUSIVE: High mortality for ALL learned agents. Training may not be converged.")
     else:
-        print("❓ INCONCLUSIVE: No significant difference observed. Models may need more training or tuning.")
+        print("INCONCLUSIVE: No significant difference observed. Models may need more training or tuning.")
 
 if __name__ == "__main__":
     run_starvation_validity_test()

@@ -81,7 +81,7 @@ def load_config(path: Path | str | None = None) -> dict:
             if 'HSA_OVERRIDE_GFX_VERSION' not in os.environ:
                 val = config['runtime']['hsa_override_gfx_version']
                 os.environ['HSA_OVERRIDE_GFX_VERSION'] = str(val)
-                print(f"🔧 Applied HSA_OVERRIDE_GFX_VERSION={val} (from config)")
+                print(f"Applied HSA_OVERRIDE_GFX_VERSION={val} (from config)")
 
     _config = config
     _config_path = config_path

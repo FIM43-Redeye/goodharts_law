@@ -161,7 +161,7 @@ class TrainingDashboard:
         # Adjust height based on rows
         fig_height = 3 * rows + 1
         self.fig = plt.figure(figsize=(14, fig_height))
-        self.fig.suptitle("🧠 Training Dashboard", fontsize=14, fontweight='bold', color='white')
+        self.fig.suptitle("Training Dashboard", fontsize=14, fontweight='bold', color='white')
         
         # Grid
         gs = gridspec.GridSpec(rows, cols, figure=self.fig, 
@@ -253,16 +253,16 @@ class TrainingDashboard:
         """Create simple control buttons."""
         # Place buttons at very bottom
         ax_pause = self.fig.add_axes([0.35, 0.02, 0.1, 0.04])
-        self.btn_pause = Button(ax_pause, '⏸ Pause', color='#333333', hovercolor='#555555')
+        self.btn_pause = Button(ax_pause, 'Pause', color='#333333', hovercolor='#555555')
         self.btn_pause.label.set_color('white')
         
         ax_finish = self.fig.add_axes([0.55, 0.02, 0.1, 0.04])
-        self.btn_finish = Button(ax_finish, '🏁 Finish', color='#333333', hovercolor='#555555')
+        self.btn_finish = Button(ax_finish, 'Finish', color='#333333', hovercolor='#555555')
         self.btn_finish.label.set_color('white')
         
         def toggle_pause(event):
             self.paused = not self.paused
-            self.btn_pause.label.set_text('▶ Resume' if self.paused else '⏸ Pause')
+            self.btn_pause.label.set_text('Resume' if self.paused else 'Pause')
             
         def finish_training(event):
             self.finish_requested = True
@@ -279,7 +279,7 @@ class TrainingDashboard:
             import os
             with open('.training_stop_signal', 'w') as f:
                 f.write('stop')
-            print("\n🛑 Stop signal sent (file created). Waiting for trainers...")
+            print("\nStop signal sent (file created). Waiting for trainers...")
             
         self.btn_pause.on_clicked(toggle_pause)
         self.btn_finish.on_clicked(finish_training)
