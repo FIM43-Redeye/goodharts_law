@@ -215,8 +215,9 @@ class PPOTrainer:
         self.reward_computer.initialize(states)
         episode_rewards = np.zeros(cfg.n_envs)
         
-        # Dashboard aggregation (per-update, not per-episode)
-        update_episodes = 0
+        # Dashboard aggregation (per-update)
+        # We track how many episodes finished during this collection phase
+        update_episodes_count = 0
         update_reward_sum = 0.0
         update_food_sum = 0
         update_poison_sum = 0
@@ -272,25 +273,31 @@ class PPOTrainer:
                 done_envs = np.where(dones)[0]
                 for i in done_envs:
                     self.episode_count += 1
-                    # Track for this update's aggregation
-                    update_episodes += 1
-                    update_reward_sum += episode_rewards[i]
-                    update_food_sum += self.vec_env.last_episode_food[i]
-                    update_poison_sum += self.vec_env.last_episode_poison[i]
                     
-                    if episode_rewards[i] > self.best_reward:
-                        self.best_reward = episode_rewards[i]
+                    # Accumulate for update stats
+                    r = episode_rewards[i]
+                    f = self.vec_env.last_episode_food[i]
+                    p = self.vec_env.last_episode_poison[i]
+                    
+                    update_episodes_count += 1
+                    update_reward_sum += r
+                    update_food_sum += f
+                    update_poison_sum += p
+                    
+                    if r > self.best_reward:
+                        self.best_reward = r
+                        
+                    # Logger still logs every episode to CSV for detailed analysis
                     if self.logger:
-                        # Use per-grid food count for this specific environment
                         grid_id = self.vec_env.grid_indices[i]
                         food_density = self.vec_env.grid_food_counts[grid_id]
                         avg_food = (self.min_food + self.max_food) / 2
                         self.logger.log_episode(
                             episode=self.episode_count,
-                            reward=episode_rewards[i],
+                            reward=r,
                             length=500,
-                            food_eaten=self.vec_env.last_episode_food[i],
-                            poison_eaten=self.vec_env.last_episode_poison[i],
+                            food_eaten=f,
+                            poison_eaten=p,
                             food_density=food_density,
                             curriculum_progress=(avg_food - self.min_food) / (self.max_food - self.min_food + 1e-8),
                             action_prob_std=np.std(action_probs[i]),
@@ -363,29 +370,27 @@ class PPOTrainer:
                         action_probs=action_probs[0].tolist()
                     )
                 
-                # Note: Per-environment randomization now handled inside VecEnv on each reset.
-                # Trainer no longer needs to set global food/poison values.
-                
-                # Dashboard update (aggregated per-update, not per-episode)
+                # Dashboard update (Unified!)
                 if self.dashboard:
-                    self.dashboard.update(cfg.mode, 'ppo', (policy_loss, value_loss, entropy, action_probs[0], explained_var))
-                    # Send aggregated episode stats for this update
-                    if update_episodes > 0:
-                        avg_reward = update_reward_sum / update_episodes
-                        avg_food = update_food_sum / update_episodes
-                        avg_poison = update_poison_sum / update_episodes
-                        avg_food_density = np.mean(self.vec_env.grid_food_counts)
-                        self.dashboard.update(cfg.mode, 'episode', (
-                            self.episode_count,
-                            avg_reward,
-                            500,
-                            0,  # legacy
-                            avg_food_density,
-                            avg_food,
-                            avg_poison,
-                        ))
-                    # Reset accumulators for next update
-                    update_episodes = 0
+                    # Prepare episode stats if any finished
+                    ep_stats = None
+                    if update_episodes_count > 0:
+                        ep_stats = {
+                            'reward': update_reward_sum / update_episodes_count,
+                            'food': update_food_sum / update_episodes_count,
+                            'poison': update_poison_sum / update_episodes_count
+                        }
+                    
+                    # Unified payload
+                    payload = {
+                        'ppo': (policy_loss, value_loss, entropy, action_probs[0].tolist(), explained_var),
+                        'episodes': ep_stats,
+                        'steps': self.total_steps
+                    }
+                    self.dashboard.update(cfg.mode, 'update', payload)
+                    
+                    # Reset aggregators
+                    update_episodes_count = 0
                     update_reward_sum = 0.0
                     update_food_sum = 0
                     update_poison_sum = 0
