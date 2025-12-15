@@ -1,18 +1,9 @@
 """
-Model verification suite.
-
-Run headless tests on trained models to verify behavior and fitness
-before running visual demos.
-
-Usage:
-    python -m goodharts.training.verification
-    python -m goodharts.training.verification --steps 500 --verbose
+Verification and testing modules.
 """
-from .directional import test_directional_accuracy
-from .survival import test_simulation_survival, compare_behaviors
+from .survival import run_survival_test, run_comparative_verification
 
 __all__ = [
-    'test_directional_accuracy',
-    'test_simulation_survival',
-    'compare_behaviors',
+    'run_survival_test',
+    'run_comparative_verification',
 ]

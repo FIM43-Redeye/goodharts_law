@@ -81,7 +81,7 @@ class RewardComputer(ABC):
     Base class for computing shaped rewards for training.
     """
     
-    def __init__(self, mode: str, spec: ObservationSpec, gamma: float = 0.99):
+    def __init__(self, mode: str, spec: 'ObservationSpec', gamma: float = 0.99):
         """
         Initialize reward computer.
         
@@ -94,14 +94,19 @@ class RewardComputer(ABC):
         self.spec = spec
         self.gamma = gamma
         
-        # We need CellType but can't import config easily due to circularity if we aren't careful.
-        # However, this method is instantiated with `spec` and calls back to config often.
-        # But wait, we can't import CellType from default_config if Modes are configured there?
-        # Actually modes.py shouldn't depend on default_config if possible.
-        # But _get_modes DOES depend on config.
-        # Let's rely on the fact that instance methods run at runtime.
+    @classmethod
+    def create(cls, mode: str, spec: 'ObservationSpec', gamma: float = 0.99) -> 'RewardComputer':
+        """
+        Factory method to create the appropriate RewardComputer instance.
+        """
+        if spec.reward_strategy is None:
+             raise ValueError(f"No reward strategy defined for mode: {mode}")
+             
+        # Instantiate the strategy class defined in the spec
+        return spec.reward_strategy(mode, spec, gamma)
     
     def initialize(self, states: np.ndarray):
+
         """Initialize potentials for first step."""
         self.prev_potentials = self._compute_potentials(states)
     

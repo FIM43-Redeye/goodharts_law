@@ -105,7 +105,7 @@ class CellType:
 # Simulation Physics / Hyperparameters
 # These should match config.default.toml
 ENERGY_START = 50.0
-ENERGY_MOVE_COST = 0.01          # Matches config.default.toml (was 0.1)
+ENERGY_MOVE_COST = 0.1          # Matches config.default.toml (was 0.1)
 MOVE_COST_EXPONENT = 1.5
 MAX_MOVE_DISTANCE = 3
 

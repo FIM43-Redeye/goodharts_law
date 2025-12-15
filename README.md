@@ -169,7 +169,7 @@ respawn = true      # Consumed items respawn
 [agent]
 view_range = 5      # Agent vision radius (view = 11x11)
 energy_start = 50.0
-energy_move_cost = 0.01
+energy_move_cost = 0.1
 
 [training]
 # Curriculum: density ranges for robust training
