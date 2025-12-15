@@ -51,7 +51,7 @@ count = 5
 [agent]
 view_range = 5         # How far agents can see
 energy_start = 50.0    # Starting energy
-energy_move_cost = 0.01 # Cheap movement to encourage exploration (was 0.1)
+energy_move_cost = 0.1 # Cheap movement to encourage exploration (was 0.1)
 move_cost_exponent = 1.5
 max_move_distance = 3  # Speed cap
 
