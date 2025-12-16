@@ -35,6 +35,7 @@ def train_ppo(
     dashboard = None,
     log_to_file: bool = True,
     use_amp: bool = False,
+    compile_models: bool = True,
     **kwargs
 ) -> dict:
     """
@@ -53,6 +54,7 @@ def train_ppo(
         dashboard: Optional training dashboard
         log_to_file: Whether to log training metrics
         use_amp: Enable automatic mixed precision
+        compile_models: Whether to use torch.compile (disable for parallel training)
         
     Returns:
         Summary dict with training results
@@ -72,6 +74,7 @@ def train_ppo(
             output_path=output_path,
             log_to_file=log_to_file,
             use_amp=use_amp,
+            compile_models=compile_models,
             n_minibatches=kwargs.get('n_minibatches', 4),
         )
         
@@ -127,6 +130,8 @@ def main():
                         help='Disable automatic mixed precision')
     parser.add_argument('--minibatches', type=int, default=None,
                         help='Number of minibatches per epoch (default: from config)')
+    parser.add_argument('--no-compile', action='store_true',
+                        help='Disable torch.compile (required for parallel multi-mode training)')
     args = parser.parse_args()
     
     # Determine steps_per_env for update calculation
@@ -158,16 +163,27 @@ def main():
     entropy_coef = args.entropy if args.entropy is not None else train_cfg.get('entropy_coef', 0.02)
     n_minibatches = args.minibatches if args.minibatches is not None else train_cfg.get('n_minibatches', 4)
     
+    # Determine compile_models setting
+    # Auto-disable for parallel multi-mode training (FX/dynamo conflict)
+    is_parallel_multi = len(modes_to_train) > 1 and not args.sequential
+    if args.no_compile:
+        compile_models = False
+    elif is_parallel_multi:
+        print("   [Note] Disabling torch.compile for parallel multi-mode training")
+        compile_models = False
+    else:
+        compile_models = True
+    
     print(f"   Entropy coefficient: {entropy_coef}")
     
     # Training execution
     if args.dashboard:
-        _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches)
+        _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches, compile_models)
     else:
-        _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches)
+        _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches, compile_models)
  
  
-def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches):
+def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches, compile_models):
     """Run training with live dashboard."""
     from goodharts.training.train_dashboard import create_dashboard
     from goodharts.behaviors.action_space import num_actions
@@ -190,6 +206,7 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
                     dashboard=dashboard,
                     log_to_file=True,
                     use_amp=use_amp,
+                    compile_models=compile_models,
                 )
         
         t = threading.Thread(target=sequential_training, daemon=True)
@@ -218,6 +235,7 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
                     'dashboard': dashboard,
                     'log_to_file': True,
                     'use_amp': use_amp,
+                    'compile_models': compile_models,
                     'n_minibatches': n_minibatches,
                 },
                 daemon=True
@@ -235,7 +253,7 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
 
 
 
-def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches):
+def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches, compile_models):
     """Run training without dashboard."""
     if len(modes_to_train) > 1 and not args.sequential:
         # Parallel training
@@ -254,6 +272,7 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
                     'output_path': output_path,
                     'log_to_file': True,
                     'use_amp': use_amp,
+                    'compile_models': compile_models,
                     'n_minibatches': n_minibatches,
                 }
             )
@@ -277,6 +296,7 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
                 output_path=output_path,
                 log_to_file=len(modes_to_train) > 1,
                 use_amp=use_amp,
+                compile_models=compile_models,
                 n_minibatches=n_minibatches,
             )
 

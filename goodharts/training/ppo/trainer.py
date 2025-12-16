@@ -55,6 +55,7 @@ class PPOConfig:
     log_to_file: bool = True
     log_dir: str = 'logs'
     use_amp: bool = False
+    compile_models: bool = True  # Set to False when training multiple models in parallel
 
 
 class PPOTrainer:
@@ -158,7 +159,7 @@ class PPOTrainer:
         # Compile models for extra speed if torch.compile is available (PyTorch 2.0+)
         # Use lock to serialize compilation - Dynamo's global state is not thread-safe
         with _COMPILE_LOCK:
-            if hasattr(torch, 'compile'):
+            if cfg.compile_models and hasattr(torch, 'compile'):
                 # Keep references to originals in case compilation fails
                 orig_policy = self.policy
                 orig_value_head = self.value_head

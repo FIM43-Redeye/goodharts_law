@@ -273,8 +273,9 @@ class TrainingDashboard:
         self.artists[mode]['act_bars'] = bars
 
     def _create_controls(self):
-        """Create simple control buttons."""
-        ax_pause = self.fig.add_axes([0.45, 0.02, 0.1, 0.04])
+        """Create control buttons."""
+        # Pause button
+        ax_pause = self.fig.add_axes([0.42, 0.02, 0.08, 0.04])
         self.btn_pause = Button(ax_pause, 'Pause', color='#333333', hovercolor='#555555')
         self.btn_pause.label.set_color('white')
         
@@ -283,6 +284,25 @@ class TrainingDashboard:
             self.btn_pause.label.set_text('Resume' if self.paused else 'Pause')
             
         self.btn_pause.on_clicked(toggle_pause)
+        
+        # Stop button - creates signal file that trainers check
+        ax_stop = self.fig.add_axes([0.51, 0.02, 0.08, 0.04])
+        self.btn_stop = Button(ax_stop, 'Stop', color='#442222', hovercolor='#663333')
+        self.btn_stop.label.set_color('#ff6666')
+        
+        def request_stop(event):
+            import os
+            try:
+                with open('.training_stop_signal', 'w') as f:
+                    f.write('stop')
+                self.btn_stop.label.set_text('Stopping...')
+                self.btn_stop.color = '#222222'
+                self.btn_stop.hovercolor = '#222222'
+                print("[Dashboard] Stop signal sent - training will stop at next update cycle")
+            except Exception as e:
+                print(f"[Dashboard] Failed to create stop signal: {e}")
+        
+        self.btn_stop.on_clicked(request_stop)
         
     def _update_frame(self, frame):
         """Update graphs."""
