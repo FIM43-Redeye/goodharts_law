@@ -105,7 +105,8 @@ def ppo_update(
     
     for epoch in range(k_epochs):
         # Shuffle indices for this epoch
-        indices = torch.randperm(batch_size, device=device)
+        # Use argsort(random) instead of randperm for TPU int32 compatibility
+        indices = torch.argsort(torch.rand(batch_size, device=device))
         
         for mb_idx in range(n_minibatches):
             start = mb_idx * minibatch_size
