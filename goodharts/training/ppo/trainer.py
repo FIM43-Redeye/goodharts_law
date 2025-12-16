@@ -6,8 +6,15 @@ Can be extended for multi-agent scenarios.
 """
 import os
 import time
+import threading
 import numpy as np
 import torch
+
+
+# Lock to serialize torch.compile() calls across threads.
+# Dynamo has global state that is not thread-safe during compilation.
+# This only affects startup; compiled models run in parallel fine.
+_COMPILE_LOCK = threading.Lock()
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
@@ -149,21 +156,23 @@ class PPOTrainer:
         self.scaler = GradScaler(enabled=cfg.use_amp) if cfg.use_amp else None
 
         # Compile models for extra speed if torch.compile is available (PyTorch 2.0+)
-        if hasattr(torch, 'compile'):
-            self.policy = torch.compile(self.policy)
-            self.value_head = torch.compile(self.value_head)
-            
-            # Explicit JIT Warmup to avoid silence during first update
-            print(f"   [JIT] Warming up torch.compile... (this may take a minute)")
-            warmup_start = time.time()
-            dummy_obs = torch.zeros((1, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size), device=self.device)
-            with torch.no_grad():
-                with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                    # Trigger compilation
-                    self.policy(dummy_obs)
-                    features = self.policy.get_features(dummy_obs)
-                    self.value_head(features)
-            print(f"   [JIT] Compilation complete ({time.time() - warmup_start:.1f}s)")
+        # Use lock to serialize compilation - Dynamo's global state is not thread-safe
+        with _COMPILE_LOCK:
+            if hasattr(torch, 'compile'):
+                self.policy = torch.compile(self.policy)
+                self.value_head = torch.compile(self.value_head)
+                
+                # Explicit JIT Warmup to avoid silence during first update
+                print(f"   [JIT] Warming up torch.compile... (this may take a minute)")
+                warmup_start = time.time()
+                dummy_obs = torch.zeros((1, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size), device=self.device)
+                with torch.no_grad():
+                    with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                        # Trigger compilation
+                        self.policy(dummy_obs)
+                        features = self.policy.get_features(dummy_obs)
+                        self.value_head(features)
+                print(f"   [JIT] Compilation complete ({time.time() - warmup_start:.1f}s)")
         
         # Optimizer
         self.optimizer = optim.Adam(
