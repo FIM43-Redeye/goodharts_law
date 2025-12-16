@@ -29,7 +29,7 @@ from typing import Optional
 
 from goodharts.configs.default_config import get_config
 from goodharts.config import get_training_config
-from goodharts.utils.device import get_device, apply_system_optimizations
+from goodharts.utils.device import get_device, apply_system_optimizations, is_tpu, sync_device
 from goodharts.behaviors.brains import create_brain
 from goodharts.behaviors.action_space import num_actions
 from goodharts.environments.vec_env import create_vec_env
@@ -173,8 +173,9 @@ class PPOTrainer:
 
         # Compile models for extra speed if torch.compile is available (PyTorch 2.0+)
         # Use lock to serialize compilation - Dynamo's global state is not thread-safe
+        # Skip on TPU - XLA uses its own JIT compilation
         with _COMPILE_LOCK:
-            if cfg.compile_models and hasattr(torch, 'compile'):
+            if cfg.compile_models and hasattr(torch, 'compile') and not is_tpu(self.device):
                 # Keep references to originals in case compilation fails
                 orig_policy = self.policy
                 orig_value_head = self.value_head
@@ -503,6 +504,8 @@ class PPOTrainer:
                     if update_episodes_count > 0:
                         avg_reward = update_reward_sum / update_episodes_count
                         self.tb_writer.add_scalar('reward/episode', avg_reward, self.total_steps)
+                    # Flush for real-time updates in TensorBoard UI
+                    self.tb_writer.flush()
                 
                 # Dashboard update (Unified!)
                 if self.dashboard:
@@ -565,6 +568,10 @@ class PPOTrainer:
         
         if self.logger:
             self.logger.finalize(best_efficiency=self.best_reward, final_model_path=cfg.output_path)
+        
+        # Close TensorBoard writer to flush all data
+        if self.tb_writer:
+            self.tb_writer.close()
         
         if self.dashboard:
             self.dashboard.update(cfg.mode, 'finished', None)
