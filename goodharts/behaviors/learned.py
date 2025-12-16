@@ -92,6 +92,9 @@ class LearnedBehavior(BehaviorStrategy):
             try:
                 state_dict = torch.load(self.model_path, map_location=self.device, weights_only=True)
                 
+                # Sanitize keys (remove _orig_mod prefix from torch.compile)
+                state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+                
                 # Detect if this is an ActorCritic model (has 'actor' keys)
                 if any('actor' in k for k in state_dict.keys()):
                     # Map ActorCritic keys to BaseCNN keys

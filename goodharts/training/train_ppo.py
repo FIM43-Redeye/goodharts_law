@@ -72,6 +72,7 @@ def train_ppo(
             output_path=output_path,
             log_to_file=log_to_file,
             use_amp=use_amp,
+            n_minibatches=kwargs.get('n_minibatches', 4),
         )
         
         trainer = PPOTrainer(config, dashboard=dashboard)
@@ -124,6 +125,8 @@ def main():
                         help='Enable automatic mixed precision (FP16)')
     parser.add_argument('--no-amp', action='store_true',
                         help='Disable automatic mixed precision')
+    parser.add_argument('--minibatches', type=int, default=None,
+                        help='Number of minibatches per epoch (default: from config)')
     args = parser.parse_args()
     
     # Determine steps_per_env for update calculation
@@ -153,17 +156,18 @@ def main():
     
     modes_to_train = all_modes if args.mode == 'all' else [args.mode]
     entropy_coef = args.entropy if args.entropy is not None else train_cfg.get('entropy_coef', 0.02)
+    n_minibatches = args.minibatches if args.minibatches is not None else train_cfg.get('n_minibatches', 4)
     
     print(f"   Entropy coefficient: {entropy_coef}")
     
     # Training execution
     if args.dashboard:
-        _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp)
+        _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches)
     else:
-        _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp)
-
-
-def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp):
+        _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches)
+ 
+ 
+def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches):
     """Run training with live dashboard."""
     from goodharts.training.train_dashboard import create_dashboard
     from goodharts.behaviors.action_space import num_actions
@@ -214,6 +218,7 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
                     'dashboard': dashboard,
                     'log_to_file': True,
                     'use_amp': use_amp,
+                    'n_minibatches': n_minibatches,
                 },
                 daemon=True
             )
@@ -229,7 +234,8 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
             t.join(timeout=1.0)
 
 
-def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp):
+
+def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches):
     """Run training without dashboard."""
     if len(modes_to_train) > 1 and not args.sequential:
         # Parallel training
@@ -248,6 +254,7 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
                     'output_path': output_path,
                     'log_to_file': True,
                     'use_amp': use_amp,
+                    'n_minibatches': n_minibatches,
                 }
             )
             threads.append(t)
@@ -270,6 +277,7 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
                 output_path=output_path,
                 log_to_file=len(modes_to_train) > 1,
                 use_amp=use_amp,
+                n_minibatches=n_minibatches,
             )
 
 

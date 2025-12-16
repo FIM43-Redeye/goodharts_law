@@ -283,3 +283,39 @@ def get_device_info() -> dict:
         info['cuda_available'] = torch.cuda.is_available()
     
     return info
+
+
+def apply_system_optimizations(device: torch.device = None, verbose: bool = True):
+    """
+    Apply global performance optimizations for the given device.
+    
+    Automatically enables:
+    - TensorFloat32 (TF32) for matmuls on Ampere+ GPUs (huge speedup for FP32)
+    - cuDNN benchmarking (finds best convolution algorithms)
+    
+    Args:
+        device: Device to optimize for (default: auto-detect)
+        verbose: Print applied optimizations
+    """
+    if device is None:
+        device = get_device(verbose=False)
+        
+    if device.type == 'cuda':
+        # 1. Enable TensorFloat32 (TF32)
+        # This allows FP32 operations to run on Tensor Cores with slight precision reduction
+        # (similar to BF16) but significant speedup. Standard for DL since Ampere.
+        if hasattr(torch, 'set_float32_matmul_precision'):
+            current_prec = torch.get_float32_matmul_precision()
+            if current_prec == 'highest':
+                torch.set_float32_matmul_precision('high')
+                if verbose:
+                    print("   Performance: TF32 enabled (fast float32 matmul)")
+        
+        # 2. Enable cuDNN benchmark
+        # This runs a quick benchmark on start to find the best convolution algo
+        # for the specific hardware/input size. Great for fixed input sizes (standard RL).
+        if torch.backends.cudnn.is_available():
+            if not torch.backends.cudnn.benchmark:
+                torch.backends.cudnn.benchmark = True
+                if verbose:
+                    print("   Performance: cuDNN benchmark enabled")

@@ -141,6 +141,7 @@ TRAINING_DEFAULTS = {
     'eps_clip': 0.2,
     'k_epochs': 4,
     'steps_per_env': 128,
+    'n_minibatches': 4,
     'reward_scale': 0.1,
     'entropy_coef': 0.02,
     'shaping_food_attract': 0.5,
