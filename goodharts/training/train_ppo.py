@@ -119,6 +119,7 @@ def train_ppo(
             n_minibatches=kwargs.get('n_minibatches', 4),
             tensorboard=kwargs.get('tensorboard', False),
             skip_warmup=kwargs.get('skip_warmup', False),
+            use_torch_env=kwargs.get('use_torch_env', False),
         )
         
         trainer = PPOTrainer(config, dashboard=dashboard)
@@ -177,6 +178,8 @@ def main():
                         help='Disable torch.compile (required for parallel multi-mode training)')
     parser.add_argument('--tensorboard', '-tb', action='store_true',
                         help='Enable TensorBoard logging (works on Colab)')
+    parser.add_argument('--torch-env', action='store_true',
+                        help='Use GPU-native TorchVecEnv (faster on powerful GPUs)')
     args = parser.parse_args()
     
     # Determine steps_per_env for update calculation
@@ -251,6 +254,7 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
                     compile_models=compile_models,
                     n_minibatches=n_minibatches,
                     tensorboard=args.tensorboard,
+                    use_torch_env=args.torch_env,
                 )
         
         t = threading.Thread(target=sequential_training, daemon=True)
@@ -287,6 +291,7 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
                     'n_minibatches': n_minibatches,
                     'tensorboard': args.tensorboard,
                     'skip_warmup': True,
+                    'use_torch_env': args.torch_env,
                 },
                 daemon=True
             )
@@ -331,6 +336,7 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
                     'n_minibatches': n_minibatches,
                     'tensorboard': args.tensorboard,
                     'skip_warmup': True,
+                    'use_torch_env': args.torch_env,
                 }
             )
             threads.append(t)
@@ -356,6 +362,7 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
                 compile_models=compile_models,
                 n_minibatches=n_minibatches,
                 tensorboard=args.tensorboard,
+                use_torch_env=args.torch_env,
             )
 
 
