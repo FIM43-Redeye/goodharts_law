@@ -176,14 +176,14 @@ class TorchVecEnv:
         """Clear and repopulate a specific grid."""
         self.grids[grid_id].fill_(self.CellType.EMPTY.value)
         
-        # Randomize counts
+        # Randomize counts - use int32 for XLA/TPU compatibility
         food_count = torch.randint(
             self.food_range[0], self.food_range[1] + 1, (1,),
-            device=self.device
+            dtype=torch.int32, device=self.device
         ).item()
         poison_count = torch.randint(
             self.poison_range[0], self.poison_range[1] + 1, (1,),
-            device=self.device
+            dtype=torch.int32, device=self.device
         ).item()
         
         self.grid_food_counts[grid_id] = food_count
@@ -203,7 +203,15 @@ class TorchVecEnv:
         n_empty = empty_y.shape[0]
         
         if n_empty > 0:
+<<<<<<< HEAD
             idx = torch.randint(n_empty, (1,), device=self.device).item()
+=======
+<<<<<<< HEAD
+            idx = torch.randint(n_empty, (1,), device=self.device).item()
+=======
+            idx = torch.randint(n_empty, (1,), dtype=torch.int32, device=self.device).item()
+>>>>>>> c27e7cd (TPU compat SECOND attempt)
+>>>>>>> 3f28129 (TPU compat SECOND attempt)
             self.agent_y[env_id] = empty_y[idx]
             self.agent_x[env_id] = empty_x[idx]
         
@@ -232,12 +240,28 @@ class TorchVecEnv:
         
         # Randomly select positions - use int32 for XLA/TPU compatibility
         n_to_place = min(count, n_empty)
+<<<<<<< HEAD
+=======
+<<<<<<< HEAD
+>>>>>>> 3f28129 (TPU compat SECOND attempt)
         # randperm doesn't support int32 directly, so we generate and cast
         perm = torch.randperm(n_empty, device=self.device)[:n_to_place]
         
         # Index and place items
         chosen_y = empty_y[perm]
         chosen_x = empty_x[perm]
+<<<<<<< HEAD
+=======
+=======
+        # Generate random indices (with replacement to avoid int64 randperm)
+        # For small counts vs large pool, duplicates are rare and handled by overwriting
+        indices = torch.randint(n_empty, (n_to_place,), dtype=torch.int32, device=self.device)
+        
+        # Index and place items
+        chosen_y = empty_y[indices.long()]  # Index with long for PyTorch compat
+        chosen_x = empty_x[indices.long()]
+>>>>>>> c27e7cd (TPU compat SECOND attempt)
+>>>>>>> 3f28129 (TPU compat SECOND attempt)
         self.grids[grid_id, chosen_y, chosen_x] = cell_type
     
     def step(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
