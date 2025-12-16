@@ -351,6 +351,11 @@ class PPOTrainer:
         step_in_update = 0
         start_time = time.perf_counter()
         
+        # Rolling window for sps calculation (exclude compilation warmup)
+        sps_window = []  # (steps, time) pairs for last 4 updates
+        last_update_time = start_time
+        last_update_steps = 0
+        
         while self.total_steps < cfg.total_timesteps:
             self.profiler.start()
             
@@ -568,12 +573,25 @@ class PPOTrainer:
                     update_food_sum = 0
                     update_poison_sum = 0
                 
-                # Progress
-                elapsed = time.perf_counter() - start_time
-                sps = self.total_steps / elapsed
+                # Progress - use rolling window for sps (excludes compilation warmup)
+                now = time.perf_counter()
+                update_steps = self.total_steps - last_update_steps
+                update_time = now - last_update_time
+                sps_window.append((update_steps, update_time))
+                if len(sps_window) > 4:
+                    sps_window.pop(0)
+                
+                # Calculate sps from window
+                window_steps = sum(s for s, t in sps_window)
+                window_time = sum(t for s, t in sps_window)
+                sps = window_steps / window_time if window_time > 0 else 0
+                
                 print(f"   [{cfg.mode}] Step {self.total_steps:,}: {sps:,.0f} sps | Best R={self.best_reward:.0f} | Ent={entropy:.3f}")
                 print(f"   [Profile] {self.profiler.summary()}")
                 self.profiler.reset()
+                
+                last_update_time = now
+                last_update_steps = self.total_steps
                 
                 # Checkpoint
                 if self.checkpoint_interval > 0 and self.update_count % self.checkpoint_interval == 0:
