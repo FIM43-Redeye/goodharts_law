@@ -159,20 +159,35 @@ class PPOTrainer:
         # Use lock to serialize compilation - Dynamo's global state is not thread-safe
         with _COMPILE_LOCK:
             if hasattr(torch, 'compile'):
-                self.policy = torch.compile(self.policy)
-                self.value_head = torch.compile(self.value_head)
+                # Keep references to originals in case compilation fails
+                orig_policy = self.policy
+                orig_value_head = self.value_head
                 
-                # Explicit JIT Warmup to avoid silence during first update
-                print(f"   [JIT] Warming up torch.compile... (this may take a minute)")
-                warmup_start = time.time()
-                dummy_obs = torch.zeros((1, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size), device=self.device)
-                with torch.no_grad():
-                    with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                        # Trigger compilation
-                        self.policy(dummy_obs)
-                        features = self.policy.get_features(dummy_obs)
-                        self.value_head(features)
-                print(f"   [JIT] Compilation complete ({time.time() - warmup_start:.1f}s)")
+                try:
+                    self.policy = torch.compile(self.policy)
+                    self.value_head = torch.compile(self.value_head)
+                    
+                    # Explicit JIT Warmup to avoid silence during first update
+                    print(f"   [JIT] Warming up torch.compile... (this may take a minute)")
+                    warmup_start = time.time()
+                    dummy_obs = torch.zeros((1, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size), device=self.device)
+                    with torch.no_grad():
+                        with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                            # Trigger compilation
+                            self.policy(dummy_obs)
+                            features = self.policy.get_features(dummy_obs)
+                            self.value_head(features)
+                    print(f"   [JIT] Compilation complete ({time.time() - warmup_start:.1f}s)")
+                    
+                except RuntimeError as e:
+                    # Fallback if compilation fails (common in complex multi-threaded setups)
+                    if "FX" in str(e) or "dynamo" in str(e).lower():
+                        print(f"   [JIT] Warning: torch.compile failed ({e}). Reverting to eager mode.")
+                        self.policy = orig_policy
+                        self.value_head = orig_value_head
+                    else:
+                        # Re-raise unexpected errors
+                        raise e
         
         # Optimizer
         self.optimizer = optim.Adam(
