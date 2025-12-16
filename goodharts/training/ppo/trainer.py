@@ -33,6 +33,7 @@ from goodharts.utils.device import get_device, apply_system_optimizations
 from goodharts.behaviors.brains import create_brain
 from goodharts.behaviors.action_space import num_actions
 from goodharts.environments.vec_env import create_vec_env
+from goodharts.environments.torch_env import create_torch_vec_env
 from goodharts.training.train_log import TrainingLogger
 
 from .models import Profiler, ValueHead
@@ -63,6 +64,7 @@ class PPOConfig:
     compile_models: bool = True  # Set to False when training multiple models in parallel
     tensorboard: bool = False  # Enable TensorBoard logging (works on Colab)
     skip_warmup: bool = False  # Skip JIT warmup (use when global warmup was done)
+    use_torch_env: bool = False  # Use GPU-native TorchVecEnv (faster on powerful GPUs)
 
 
 class PPOTrainer:
@@ -151,8 +153,14 @@ class PPOTrainer:
         self.spec = sim_config['get_observation_spec'](cfg.mode)
         n_actions = num_actions(1)
         
-        # Environment
-        self.vec_env = create_vec_env(n_envs=cfg.n_envs, obs_spec=self.spec)
+        # Environment - use GPU-native TorchVecEnv if requested and CUDA available
+        if cfg.use_torch_env and self.device.type == 'cuda':
+            self.vec_env = create_torch_vec_env(n_envs=cfg.n_envs, obs_spec=self.spec, device=self.device)
+            self._torch_env = True
+            print(f"   Env: TorchVecEnv (GPU-native)")
+        else:
+            self.vec_env = create_vec_env(n_envs=cfg.n_envs, obs_spec=self.spec)
+            self._torch_env = False
         print(f"   View: {self.vec_env.view_size}x{self.vec_env.view_size}, Channels: {self.vec_env.n_channels}")
         
         # Networks
@@ -301,7 +309,9 @@ class PPOTrainer:
         
         # Initial state
         states = self.vec_env.reset()
-        self.reward_computer.initialize(states)
+        # Reward computer uses numpy, convert if TorchVecEnv
+        states_np = states.cpu().numpy() if self._torch_env else states
+        self.reward_computer.initialize(states_np)
         episode_rewards = np.zeros(cfg.n_envs)
         
         # Dashboard aggregation (per-update)
@@ -323,7 +333,12 @@ class PPOTrainer:
             
             # Collect experience
             with torch.no_grad():
-                states_t = torch.from_numpy(states).float().to(self.device)
+                # Convert states to torch if using NumPy env
+                if self._torch_env:
+                    states_t = states.float()  # Already on device
+                else:
+                    states_t = torch.from_numpy(states).float().to(self.device)
+                
                 with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                     logits = self.policy(states_t)
                     features = self.policy.get_features(states_t)
@@ -335,38 +350,54 @@ class PPOTrainer:
                     action_probs = F.softmax(logits, dim=1).cpu().numpy()
             
             self.profiler.tick("Inference")
-            actions_np = actions.cpu().numpy()
             
-            # Environment step
-            next_states, rewards, dones = self.vec_env.step(actions_np)
+            # Environment step - TorchVecEnv takes torch actions, VecEnv takes numpy
+            if self._torch_env:
+                next_states, rewards, dones = self.vec_env.step(actions)
+                # Convert to numpy for reward computer and buffers
+                rewards_np = rewards.cpu().numpy()
+                dones_np = dones.cpu().numpy()
+                next_states_np = next_states.cpu().numpy()
+            else:
+                actions_np = actions.cpu().numpy()
+                next_states, rewards, dones = self.vec_env.step(actions_np)
+                rewards_np = rewards
+                dones_np = dones
+                next_states_np = next_states
             self.profiler.tick("Env Step")
             
             # Compute shaped rewards
             shaped_rewards = self.reward_computer.compute(
-                rewards, states, next_states, dones
+                rewards_np, states if not self._torch_env else states.cpu().numpy(), 
+                next_states_np, dones_np
             )
             
-            # Store experience
-            states_buffer.append(states)
-            actions_buffer.append(actions_np)
+            # Store experience (keep numpy for now - GAE expects numpy)
+            states_buffer.append(states if not self._torch_env else states.cpu().numpy())
+            actions_buffer.append(actions.cpu().numpy())
             log_probs_buffer.append(log_probs.detach())
             rewards_buffer.append(shaped_rewards)
-            dones_buffer.append(dones)
+            dones_buffer.append(dones_np)
             values_buffer.append(values)
             
             self.total_steps += cfg.n_envs
-            episode_rewards += rewards
+            episode_rewards += rewards_np
             
             # Track episodes
-            if dones.any():
-                done_envs = np.where(dones)[0]
+            if dones_np.any():
+                done_envs = np.where(dones_np)[0]
                 for i in done_envs:
                     self.episode_count += 1
                     
                     # Accumulate for update stats
                     r = episode_rewards[i]
-                    f = self.vec_env.last_episode_food[i]
-                    p = self.vec_env.last_episode_poison[i]
+                    # Handle torch vs numpy for last_episode_food/poison
+                    if self._torch_env:
+                        f = self.vec_env.last_episode_food[i].item()
+                        p = self.vec_env.last_episode_poison[i].item()
+                    else:
+                        f = self.vec_env.last_episode_food[i]
+                        p = self.vec_env.last_episode_poison[i]
                     
                     update_episodes_count += 1
                     update_reward_sum += r
