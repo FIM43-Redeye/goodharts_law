@@ -11,12 +11,9 @@ import numpy as np
 import torch
 
 
-# Enable persistent kernel cache for torch.compile
-# This avoids ~300s recompilation on every run
-# Cache is GPU-specific (device name + compute capability in cache key)
-_CACHE_DIR = os.path.expanduser("~/.cache/torch_inductor")
-os.makedirs(_CACHE_DIR, exist_ok=True)
-os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", _CACHE_DIR)
+
+# Note: TORCHINDUCTOR_CACHE_DIR is set in train_ppo.py before torch is imported
+# This ensures the cache persists across runs
 
 
 # Lock to serialize torch.compile() calls across threads.
@@ -64,6 +61,8 @@ class PPOConfig:
     log_dir: str = 'logs'
     use_amp: bool = False
     compile_models: bool = True  # Set to False when training multiple models in parallel
+    tensorboard: bool = False  # Enable TensorBoard logging (works on Colab)
+    skip_warmup: bool = False  # Skip JIT warmup (use when global warmup was done)
 
 
 class PPOTrainer:
@@ -173,44 +172,48 @@ class PPOTrainer:
                 orig_value_head = self.value_head
                 
                 try:
-                    self.policy = torch.compile(self.policy, dynamic=True)
-                    self.value_head = torch.compile(self.value_head, dynamic=True)
+                    # Note: NOT using dynamic=True because we warmup with exact batch size
+                    # Fixed-shape kernels should cache properly across runs
+                    self.policy = torch.compile(self.policy)
+                    self.value_head = torch.compile(self.value_head)
                     
-                    # Explicit JIT Warmup - MUST use actual training batch size
-                    # Otherwise torch.compile recompiles on first real batch (85s+ forward, 270s+ backward!)
-                    warmup_batch = (cfg.n_envs * cfg.steps_per_env) // cfg.n_minibatches
-                    
-                    print(f"   [JIT] Warming up torch.compile (batch={warmup_batch})...")
-                    warmup_start = time.time()
-                    
-                    dummy_obs = torch.zeros(
-                        (warmup_batch, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size), 
-                        device=self.device, requires_grad=False
-                    )
-                    dummy_actions = torch.zeros(warmup_batch, dtype=torch.long, device=self.device)
-                    dummy_returns = torch.zeros(warmup_batch, device=self.device)
-                    
-                    # Forward warmup (with autocast if using AMP)
-                    with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                        logits = self.policy(dummy_obs)
-                        features = self.policy.get_features(dummy_obs)
-                        values = self.value_head(features).squeeze()
+                    # Skip explicit warmup if global warmup was already done (parallel training)
+                    if not cfg.skip_warmup:
+                        # Explicit JIT Warmup - MUST use actual training batch size
+                        # Otherwise torch.compile recompiles on first real batch (85s+ forward, 270s+ backward!)
+                        warmup_batch = (cfg.n_envs * cfg.steps_per_env) // cfg.n_minibatches
                         
-                        # Compute dummy loss (triggers backward graph compilation)
-                        from torch.distributions import Categorical
-                        dist = Categorical(logits=logits)
-                        log_probs = dist.log_prob(dummy_actions)
-                        dummy_loss = -log_probs.mean() + F.mse_loss(values, dummy_returns)
-                    
-                    # Backward warmup (compiles gradient kernels)
-                    dummy_loss.backward()
-                    
-                    # Clear gradients and CUDA cache
-                    self.policy.zero_grad()
-                    self.value_head.zero_grad()
-                    torch.cuda.empty_cache() if self.device.type == 'cuda' else None
-                    
-                    print(f"   [JIT] Compilation complete ({time.time() - warmup_start:.1f}s)")
+                        print(f"   [JIT] Warming up torch.compile (batch={warmup_batch})...")
+                        warmup_start = time.time()
+                        
+                        dummy_obs = torch.zeros(
+                            (warmup_batch, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size), 
+                            device=self.device, requires_grad=False
+                        )
+                        dummy_actions = torch.zeros(warmup_batch, dtype=torch.long, device=self.device)
+                        dummy_returns = torch.zeros(warmup_batch, device=self.device)
+                        
+                        # Forward warmup (with autocast if using AMP)
+                        with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                            logits = self.policy(dummy_obs)
+                            features = self.policy.get_features(dummy_obs)
+                            values = self.value_head(features).squeeze()
+                            
+                            # Compute dummy loss (triggers backward graph compilation)
+                            from torch.distributions import Categorical
+                            dist = Categorical(logits=logits)
+                            log_probs = dist.log_prob(dummy_actions)
+                            dummy_loss = -log_probs.mean() + F.mse_loss(values, dummy_returns)
+                        
+                        # Backward warmup (compiles gradient kernels)
+                        dummy_loss.backward()
+                        
+                        # Clear gradients and CUDA cache
+                        self.policy.zero_grad()
+                        self.value_head.zero_grad()
+                        torch.cuda.empty_cache() if self.device.type == 'cuda' else None
+                        
+                        print(f"   [JIT] Compilation complete ({time.time() - warmup_start:.1f}s)")
                     
                 except RuntimeError as e:
                     # Fallback if compilation fails (common in complex multi-threaded setups)
@@ -250,6 +253,17 @@ class PPOTrainer:
                 entropy_coef=cfg.entropy_coef,
                 vectorized=True,
             )
+        
+        # TensorBoard (optional - works on Colab without display server)
+        self.tb_writer = None
+        if cfg.tensorboard:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                tb_dir = os.path.join(cfg.log_dir, 'tensorboard', cfg.mode)
+                self.tb_writer = SummaryWriter(log_dir=tb_dir)
+                print(f"   TensorBoard: {tb_dir}")
+            except ImportError:
+                print("   TensorBoard: Not available (install tensorboard package)")
         
         # Profiler
         self.profiler = Profiler(self.device)
@@ -448,6 +462,16 @@ class PPOTrainer:
                         explained_variance=explained_var,
                         action_probs=action_probs[0].tolist()
                     )
+                
+                # TensorBoard logging
+                if self.tb_writer:
+                    self.tb_writer.add_scalar('loss/policy', policy_loss, self.total_steps)
+                    self.tb_writer.add_scalar('loss/value', value_loss, self.total_steps)
+                    self.tb_writer.add_scalar('metrics/entropy', entropy, self.total_steps)
+                    self.tb_writer.add_scalar('metrics/explained_variance', explained_var, self.total_steps)
+                    if update_episodes_count > 0:
+                        avg_reward = update_reward_sum / update_episodes_count
+                        self.tb_writer.add_scalar('reward/episode', avg_reward, self.total_steps)
                 
                 # Dashboard update (Unified!)
                 if self.dashboard:

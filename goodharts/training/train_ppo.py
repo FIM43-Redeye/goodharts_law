@@ -9,8 +9,14 @@ Usage:
     python -m goodharts.training.train_ppo --mode ground_truth --timesteps 100000
     python -m goodharts.training.train_ppo --mode all --dashboard
 """
-import argparse
+# CRITICAL: Set cache dir BEFORE any torch imports
+# torch.compile reads this env var at import time, not at compile time
 import os
+_CACHE_DIR = os.path.expanduser("~/.cache/torch_inductor")
+os.makedirs(_CACHE_DIR, exist_ok=True)
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", _CACHE_DIR)
+
+import argparse
 import threading
 
 from goodharts.modes import get_all_mode_names
@@ -23,6 +29,41 @@ from goodharts.training.ppo import PPOTrainer, PPOConfig
 # Global synchronization for stop signal (multi-threaded training)
 _TRAINING_LOCK = threading.Lock()
 _TRAINING_COUNTER = 0
+
+
+def _warmup_compile(brain_type: str, n_envs: int, n_minibatches: int):
+    """
+    Pre-compile kernels by running a single-threaded warmup.
+    This populates the cache so parallel threads can reuse compiled kernels.
+    """
+    print("\n[Warmup] Pre-compiling kernels for parallel training...")
+    
+    # Create a minimal config just for warmup
+    config = PPOConfig(
+        mode='ground_truth',  # Any mode works, they all use the same model
+        brain_type=brain_type,
+        n_envs=n_envs,
+        total_timesteps=0,  # No actual training
+        compile_models=True,
+        n_minibatches=n_minibatches,
+        log_to_file=False,
+    )
+    
+    # Create trainer and just run setup (which includes JIT warmup)
+    trainer = PPOTrainer(config)
+    trainer._setup()
+    
+    # Cleanup
+    del trainer
+    import gc
+    gc.collect()
+    
+    # Force CUDA cache cleanup
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    print("[Warmup] Pre-compilation complete. Starting parallel training...\n")
 
 
 def train_ppo(
@@ -76,6 +117,8 @@ def train_ppo(
             use_amp=use_amp,
             compile_models=compile_models,
             n_minibatches=kwargs.get('n_minibatches', 4),
+            tensorboard=kwargs.get('tensorboard', False),
+            skip_warmup=kwargs.get('skip_warmup', False),
         )
         
         trainer = PPOTrainer(config, dashboard=dashboard)
@@ -132,6 +175,8 @@ def main():
                         help='Number of minibatches per epoch (default: from config)')
     parser.add_argument('--no-compile', action='store_true',
                         help='Disable torch.compile (required for parallel multi-mode training)')
+    parser.add_argument('--tensorboard', '-tb', action='store_true',
+                        help='Enable TensorBoard logging (works on Colab)')
     args = parser.parse_args()
     
     # Determine steps_per_env for update calculation
@@ -164,12 +209,9 @@ def main():
     n_minibatches = args.minibatches if args.minibatches is not None else train_cfg.get('n_minibatches', 4)
     
     # Determine compile_models setting
-    # Auto-disable for parallel multi-mode training (FX/dynamo conflict)
-    is_parallel_multi = len(modes_to_train) > 1 and not args.sequential
+    # Note: With _warmup_compile(), parallel training is safe - warmup runs single-threaded,
+    # then all threads use cached kernels
     if args.no_compile:
-        compile_models = False
-    elif is_parallel_multi:
-        print("   [Note] Disabling torch.compile for parallel multi-mode training")
         compile_models = False
     else:
         compile_models = True
@@ -208,6 +250,7 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
                     use_amp=use_amp,
                     compile_models=compile_models,
                     n_minibatches=n_minibatches,
+                    tensorboard=args.tensorboard,
                 )
         
         t = threading.Thread(target=sequential_training, daemon=True)
@@ -221,6 +264,10 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
         t.join(timeout=1.0)
     else:
         # Parallel: all modes at once
+        # First, do single-threaded warmup to populate kernel cache
+        if compile_models:
+            _warmup_compile(args.brain, args.n_envs, n_minibatches)
+        
         threads = []
         for mode in modes_to_train:
             output_path = f'models/ppo_{mode}.pth'
@@ -238,6 +285,8 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
                     'use_amp': use_amp,
                     'compile_models': compile_models,
                     'n_minibatches': n_minibatches,
+                    'tensorboard': args.tensorboard,
+                    'skip_warmup': True,
                 },
                 daemon=True
             )
@@ -259,6 +308,11 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
     if len(modes_to_train) > 1 and not args.sequential:
         # Parallel training
         print(f"\nParallel training: {len(modes_to_train)} modes")
+        
+        # First, do single-threaded warmup to populate kernel cache
+        if compile_models:
+            _warmup_compile(args.brain, args.n_envs, n_minibatches)
+        
         threads = []
         for mode in modes_to_train:
             output_path = f'models/ppo_{mode}.pth'
@@ -275,6 +329,8 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
                     'use_amp': use_amp,
                     'compile_models': compile_models,
                     'n_minibatches': n_minibatches,
+                    'tensorboard': args.tensorboard,
+                    'skip_warmup': True,
                 }
             )
             threads.append(t)
@@ -299,6 +355,7 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
                 use_amp=use_amp,
                 compile_models=compile_models,
                 n_minibatches=n_minibatches,
+                tensorboard=args.tensorboard,
             )
 
 
