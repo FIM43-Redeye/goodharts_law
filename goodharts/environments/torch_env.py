@@ -197,14 +197,15 @@ class TorchVecEnv:
         """Reset a single agent's state."""
         grid_id = self.grid_indices[env_id].item()
         
-        # Find empty positions
+        # Find empty positions - use as_tuple for XLA compatibility
         empty_mask = (self.grids[grid_id] == self.CellType.EMPTY.value)
-        empty_positions = empty_mask.nonzero()
+        empty_y, empty_x = empty_mask.nonzero(as_tuple=True)
+        n_empty = empty_y.shape[0]
         
-        if len(empty_positions) > 0:
-            idx = torch.randint(len(empty_positions), (1,), device=self.device).item()
-            self.agent_y[env_id] = empty_positions[idx, 0]
-            self.agent_x[env_id] = empty_positions[idx, 1]
+        if n_empty > 0:
+            idx = torch.randint(n_empty, (1,), device=self.device).item()
+            self.agent_y[env_id] = empty_y[idx]
+            self.agent_x[env_id] = empty_x[idx]
         
         self.agent_energy[env_id] = self.initial_energy
         self.agent_steps[env_id] = 0
@@ -222,18 +223,22 @@ class TorchVecEnv:
             return
         
         empty_mask = (self.grids[grid_id] == self.CellType.EMPTY.value)
-        empty_positions = empty_mask.nonzero()
+        # Use as_tuple for XLA compatibility (returns tuple of 1D tensors)
+        empty_y, empty_x = empty_mask.nonzero(as_tuple=True)
+        n_empty = empty_y.shape[0]
         
-        if len(empty_positions) == 0:
+        if n_empty == 0:
             return
         
-        # Randomly select positions
-        n_to_place = min(count, len(empty_positions))
-        perm = torch.randperm(len(empty_positions), device=self.device)[:n_to_place]
-        chosen = empty_positions[perm]
+        # Randomly select positions - use int32 for XLA/TPU compatibility
+        n_to_place = min(count, n_empty)
+        # randperm doesn't support int32 directly, so we generate and cast
+        perm = torch.randperm(n_empty, device=self.device)[:n_to_place]
         
-        # Place items
-        self.grids[grid_id, chosen[:, 0], chosen[:, 1]] = cell_type
+        # Index and place items
+        chosen_y = empty_y[perm]
+        chosen_x = empty_x[perm]
+        self.grids[grid_id, chosen_y, chosen_x] = cell_type
     
     def step(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Execute batched actions."""

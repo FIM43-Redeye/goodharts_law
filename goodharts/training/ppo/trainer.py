@@ -141,6 +141,8 @@ class PPOTrainer:
         
         print(f"\n[PPO] Starting training: {cfg.mode}")
         print(f"   Device: {self.device}, Envs: {cfg.n_envs}")
+        if is_tpu(self.device):
+            print("   Note: TPU uses XLA - first step compiles the graph (may take a few minutes)")
         
         # Apply hardware optimizations
         apply_system_optimizations(self.device, verbose=True)
@@ -471,6 +473,9 @@ class PPOTrainer:
                 )
                 # Clear progress line
                 print(" " * 40, end='\r')
+                
+                # Sync device - critical for TPU to force XLA execution
+                sync_device(self.device)
                 self.profiler.tick("PPO Update")
                 
                 self.update_count += 1
