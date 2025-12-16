@@ -74,100 +74,118 @@ def ppo_update(
     value_coef: float = 0.5,
     max_grad_norm: float = 0.5,
     scaler: GradScaler = None,
+    n_minibatches: int = 4,
+    verbose: bool = False,
 ) -> tuple[float, float, float, float]:
     """
-    Perform PPO clipped objective update.
-    
-    Args:
-        policy: Policy network (outputs logits)
-        value_head: Value network head
-        optimizer: Shared optimizer for both networks
-        states: Observations, shape (batch, channels, h, w)
-        actions: Action indices, shape (batch,)
-        log_probs: Old log probabilities, shape (batch,)
-        returns: Computed returns, shape (batch,)
-        advantages: GAE advantages (should be normalized), shape (batch,)
-        old_values: Value estimates from collection, shape (batch,)
-        device: Torch device
-        eps_clip: PPO clipping parameter
-        k_epochs: Number of update epochs
-        entropy_coef: Entropy bonus coefficient
-        value_coef: Value loss coefficient
-        max_grad_norm: Gradient clipping threshold
-        scaler: GradScaler for AMP (None if disabled)
-        
-    Returns:
-        (policy_loss, value_loss, entropy, explained_variance)
+    Perform PPO clipped objective update with minibatches.
     """
     use_amp = scaler is not None
     device_type = 'cuda' if device.type == 'cuda' else 'cpu'
     
-    # Convert NumPy arrays to tensors
-    old_states = torch.from_numpy(states).float().to(device)
-    old_actions = torch.from_numpy(actions).long().to(device)
-    old_log_probs = torch.from_numpy(log_probs).float().to(device)
-    returns_t = torch.from_numpy(returns).float().to(device)
-    advantages_t = torch.from_numpy(advantages).float().to(device)
-    old_values_t = torch.from_numpy(old_values).float().to(device)
+    # Convert NumPy arrays to tensors ONCE
+    # Note: If VRAM is tight, we should keep these on CPU and move minibatches to GPU.
+    # But for now, user has a decent GPU, so keeping full batch on GPU is faster if it fits.
+    # If 192 envs * 128 steps * ~5KB state is too big, move `.to(device)` inside loop.
+    old_states_d = torch.from_numpy(states).float().to(device)
+    old_actions_d = torch.from_numpy(actions).long().to(device)
+    old_log_probs_d = torch.from_numpy(log_probs).float().to(device)
+    returns_d = torch.from_numpy(returns).float().to(device)
+    advantages_d = torch.from_numpy(advantages).float().to(device)
+    old_values_d = torch.from_numpy(old_values).float().to(device)
 
-    final_policy_loss = 0.0
-    final_value_loss = 0.0
-    final_entropy = 0.0
+    batch_size = states.shape[0]
+    minibatch_size = batch_size // n_minibatches
     
-    for _ in range(k_epochs):
-        with autocast(device_type=device_type, enabled=use_amp):
-            logits = policy(old_states)
-            features = policy.get_features(old_states)
-            values = value_head(features).squeeze()
-            
-            dist = Categorical(logits=logits)
-            new_log_probs = dist.log_prob(old_actions)
-            entropy = dist.entropy()
-            
-            # Ratio and clipped surrogate
-            ratios = torch.exp(new_log_probs - old_log_probs)
-            
-            surr1 = ratios * advantages_t
-            surr2 = torch.clamp(ratios, 1 - eps_clip, 1 + eps_clip) * advantages_t
-            
-            policy_loss = -torch.min(surr1, surr2).mean()
-            
-            # Value loss with clipping
-            v_clip = old_values_t + torch.clamp(values - old_values_t, -eps_clip, eps_clip)
-            v_loss1 = F.mse_loss(values, returns_t)
-            v_loss2 = F.mse_loss(v_clip, returns_t)
-            value_loss = torch.max(v_loss1, v_loss2)
-                
-            entropy_bonus = entropy.mean()
-            
-            loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus
+    # Track metrics
+    total_policy_loss = 0.0
+    total_value_loss = 0.0
+    total_entropy = 0.0
+    n_updates = 0
+    
+    for epoch in range(k_epochs):
+        # Shuffle indices for this epoch
+        indices = torch.randperm(batch_size, device=device)
         
-        # Backward pass (outside autocast)
-        optimizer.zero_grad()
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
-            torch.nn.utils.clip_grad_norm_(value_head.parameters(), max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
-            torch.nn.utils.clip_grad_norm_(value_head.parameters(), max_grad_norm)
-            optimizer.step()
-
-        final_policy_loss = policy_loss.item()
-        final_value_loss = value_loss.item()
-        final_entropy = entropy_bonus.item()
+        for mb_idx in range(n_minibatches):
+            start = mb_idx * minibatch_size
+            end = start + minibatch_size
+            mb_inds = indices[start:end]
+            
+            # Progress reporting
+            if verbose:
+                # \033[K clears the line
+                print(f"     [GPU] Epoch {epoch+1}/{k_epochs} | Batch {mb_idx+1}/{n_minibatches} ({(mb_idx+1)/n_minibatches*100:.0f}%)", end='\r')
+            
+            # Slice minibatch
+            mb_states = old_states_d[mb_inds]
+            mb_actions = old_actions_d[mb_inds]
+            mb_log_probs = old_log_probs_d[mb_inds]
+            mb_returns = returns_d[mb_inds]
+            mb_advantages = advantages_d[mb_inds]
+            mb_old_values = old_values_d[mb_inds]
+            
+            with autocast(device_type=device_type, enabled=use_amp):
+                logits = policy(mb_states)
+                features = policy.get_features(mb_states)
+                values = value_head(features).squeeze()
+                
+                dist = Categorical(logits=logits)
+                new_log_probs = dist.log_prob(mb_actions)
+                entropy = dist.entropy()
+                
+                # Ratio and clipped surrogate
+                ratios = torch.exp(new_log_probs - mb_log_probs)
+                
+                surr1 = ratios * mb_advantages
+                surr2 = torch.clamp(ratios, 1 - eps_clip, 1 + eps_clip) * mb_advantages
+                
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                # Value loss with clipping
+                v_clip = mb_old_values + torch.clamp(values - mb_old_values, -eps_clip, eps_clip)
+                v_loss1 = F.mse_loss(values, mb_returns)
+                v_loss2 = F.mse_loss(v_clip, mb_returns)
+                value_loss = torch.max(v_loss1, v_loss2)
+                    
+                entropy_bonus = entropy.mean()
+                
+                loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus
+            
+            # Backward pass
+            optimizer.zero_grad()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(value_head.parameters(), max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(value_head.parameters(), max_grad_norm)
+                optimizer.step()
     
-    # Compute explained variance
+            # Accumulate stats
+            total_policy_loss += policy_loss.item()
+            total_value_loss += value_loss.item()
+            total_entropy += entropy_bonus.item()
+            n_updates += 1
+    
+    # Compute explained variance (on full batch for accuracy, or just return 0 to save time)
+    # Let's do a quick estimate on the last minibatch to save time/memory
     with torch.no_grad():
-        var_returns = returns_t.var()
+        var_returns = mb_returns.var()
         if var_returns > 1e-8:
-            explained_var = 1 - (returns_t - old_values_t).var() / var_returns
+            explained_var = 1 - (mb_returns - mb_old_values).var() / var_returns
             explained_var = explained_var.item()
         else:
             explained_var = 0.0
     
-    return final_policy_loss, final_value_loss, final_entropy, explained_var
+    return (
+        total_policy_loss / n_updates,
+        total_value_loss / n_updates,
+        total_entropy / n_updates,
+        explained_var
+    )

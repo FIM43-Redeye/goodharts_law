@@ -17,7 +17,7 @@ from typing import Optional
 
 from goodharts.configs.default_config import get_config
 from goodharts.config import get_training_config
-from goodharts.utils.device import get_device
+from goodharts.utils.device import get_device, apply_system_optimizations
 from goodharts.behaviors.brains import create_brain
 from goodharts.behaviors.action_space import num_actions
 from goodharts.environments.vec_env import create_vec_env
@@ -41,6 +41,7 @@ class PPOConfig:
     eps_clip: float = 0.2
     k_epochs: int = 4
     steps_per_env: int = 128
+    n_minibatches: int = 4
     entropy_coef: float = 0.0
     value_coef: float = 0.5
     output_path: str = 'models/ppo_agent.pth'
@@ -124,6 +125,9 @@ class PPOTrainer:
         print(f"\n[PPO] Starting training: {cfg.mode}")
         print(f"   Device: {self.device}, Envs: {cfg.n_envs}")
         
+        # Apply hardware optimizations
+        apply_system_optimizations(self.device, verbose=True)
+        
         # Load configs
         sim_config = get_config()
         train_cfg = get_training_config()
@@ -140,10 +144,26 @@ class PPOTrainer:
         self.policy = create_brain(cfg.brain_type, self.spec, output_size=n_actions).to(self.device)
         self.value_head = ValueHead(input_size=self.policy.hidden_size).to(self.device)
 
+        # AMP
+        self.device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
+        self.scaler = GradScaler(enabled=cfg.use_amp) if cfg.use_amp else None
+
         # Compile models for extra speed if torch.compile is available (PyTorch 2.0+)
         if hasattr(torch, 'compile'):
             self.policy = torch.compile(self.policy)
             self.value_head = torch.compile(self.value_head)
+            
+            # Explicit JIT Warmup to avoid silence during first update
+            print(f"   [JIT] Warming up torch.compile... (this may take a minute)")
+            warmup_start = time.time()
+            dummy_obs = torch.zeros((1, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size), device=self.device)
+            with torch.no_grad():
+                with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                    # Trigger compilation
+                    self.policy(dummy_obs)
+                    features = self.policy.get_features(dummy_obs)
+                    self.value_head(features)
+            print(f"   [JIT] Compilation complete ({time.time() - warmup_start:.1f}s)")
         
         # Optimizer
         self.optimizer = optim.Adam(
@@ -151,9 +171,6 @@ class PPOTrainer:
             lr=cfg.lr
         )
         
-        # AMP
-        self.device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
-        self.scaler = GradScaler(enabled=cfg.use_amp) if cfg.use_amp else None
         
         # Reward computer
         self.reward_computer = RewardComputer.create(cfg.mode, self.spec, cfg.gamma)
@@ -172,6 +189,7 @@ class PPOTrainer:
                 eps_clip=cfg.eps_clip,
                 k_epochs=cfg.k_epochs,
                 steps_per_env=cfg.steps_per_env,
+                n_minibatches=cfg.n_minibatches,
                 entropy_coef=cfg.entropy_coef,
                 vectorized=True,
             )
@@ -344,8 +362,12 @@ class PPOTrainer:
                     k_epochs=cfg.k_epochs,
                     entropy_coef=cfg.entropy_coef,
                     value_coef=cfg.value_coef,
+                    n_minibatches=cfg.n_minibatches,
                     scaler=self.scaler,
+                    verbose=True,
                 )
+                # Clear progress line
+                print(" " * 40, end='\r')
                 self.profiler.tick("PPO Update")
                 
                 self.update_count += 1
