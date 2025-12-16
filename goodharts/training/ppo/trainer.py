@@ -196,6 +196,20 @@ class PPOTrainer:
         # Skip on TPU - XLA uses its own JIT compilation
         with _COMPILE_LOCK:
             if cfg.compile_models and hasattr(torch, 'compile') and not is_tpu(self.device):
+                # Try to load cached compilation artifacts (skips recompilation)
+                cache_path = os.path.expanduser(f"~/.cache/torch_compile_{cfg.brain_type}_{cfg.n_envs}_{cfg.n_minibatches}.bin")
+                cache_loaded = False
+                if os.path.exists(cache_path):
+                    try:
+                        import pickle
+                        with open(cache_path, 'rb') as f:
+                            cached_artifacts = pickle.load(f)
+                        torch.compiler.load_cache_artifacts(cached_artifacts)
+                        cache_loaded = True
+                        print(f"   [JIT] Loaded cached compilation artifacts", flush=True)
+                    except Exception as e:
+                        print(f"   [JIT] Cache load failed ({e}), will recompile", flush=True)
+                
                 # Keep references to originals in case compilation fails
                 orig_policy = self.policy
                 orig_value_head = self.value_head
@@ -212,7 +226,7 @@ class PPOTrainer:
                         # Otherwise torch.compile recompiles on first real batch (85s+ forward, 270s+ backward!)
                         warmup_batch = (cfg.n_envs * cfg.steps_per_env) // cfg.n_minibatches
                         
-                        print(f"   [JIT] Warming up torch.compile (batch={warmup_batch})...")
+                        print(f"   [JIT] Warming up torch.compile (batch={warmup_batch})...", flush=True)
                         warmup_start = time.time()
                         
                         dummy_obs = torch.zeros(
@@ -242,17 +256,60 @@ class PPOTrainer:
                         self.value_head.zero_grad()
                         torch.cuda.empty_cache() if self.device.type == 'cuda' else None
                         
-                        print(f"   [JIT] Compilation complete ({time.time() - warmup_start:.1f}s)")
+                        warmup_time = time.time() - warmup_start
+                        print(f"   [JIT] Compilation complete ({warmup_time:.1f}s)", flush=True)
+                        
+                        # Save cache artifacts for next run (if not already loaded from cache)
+                        if not cache_loaded and warmup_time > 5.0:  # Only cache if compilation took a while
+                            try:
+                                artifacts = torch.compiler.save_cache_artifacts()
+                                import pickle
+                                with open(cache_path, 'wb') as f:
+                                    pickle.dump(artifacts, f)
+                                print(f"   [JIT] Saved compilation cache ({os.path.getsize(cache_path) // 1024}KB)", flush=True)
+                            except Exception as e:
+                                print(f"   [JIT] Warning: Could not save cache ({e})", flush=True)
                     
                 except RuntimeError as e:
                     # Fallback if compilation fails (common in complex multi-threaded setups)
                     if "FX" in str(e) or "dynamo" in str(e).lower():
-                        print(f"   [JIT] Warning: torch.compile failed ({e}). Reverting to eager mode.")
+                        print(f"   [JIT] Warning: torch.compile failed ({e}). Reverting to eager mode.", flush=True)
                         self.policy = orig_policy
                         self.value_head = orig_value_head
                     else:
                         # Re-raise unexpected errors
                         raise e
+        
+        # Eager warmup (even without torch.compile) for cuDNN algorithm selection
+        # This warms up cuDNN benchmark mode and autograd graph construction
+        if not cfg.skip_warmup:
+            warmup_batch = (cfg.n_envs * cfg.steps_per_env) // cfg.n_minibatches
+            print(f"   [Warmup] Running eager warmup (cuDNN + autograd)...", flush=True)
+            warmup_start = time.time()
+            
+            dummy_obs = torch.zeros(
+                (warmup_batch, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size), 
+                device=self.device, requires_grad=False
+            )
+            dummy_actions = torch.zeros(warmup_batch, dtype=torch.long, device=self.device)
+            dummy_returns = torch.zeros(warmup_batch, device=self.device)
+            
+            # Forward + backward warmup
+            with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                logits = self.policy(dummy_obs)
+                features = self.policy.get_features(dummy_obs)
+                values = self.value_head(features).squeeze()
+                
+                dist = Categorical(logits=logits, validate_args=False)
+                log_probs = dist.log_prob(dummy_actions)
+                dummy_loss = -log_probs.mean() + F.mse_loss(values, dummy_returns)
+            
+            dummy_loss.backward()
+            self.policy.zero_grad()
+            self.value_head.zero_grad()
+            torch.cuda.empty_cache() if self.device.type == 'cuda' else None
+            
+            print(f"   [Warmup] Complete ({time.time() - warmup_start:.1f}s)", flush=True)
         
         # Optimizer
         self.optimizer = optim.Adam(
@@ -261,8 +318,10 @@ class PPOTrainer:
         )
         
         
-        # Reward computer
-        self.reward_computer = RewardComputer.create(cfg.mode, self.spec, cfg.gamma)
+        # Reward computer - unified class handles both numpy and torch
+        self.reward_computer = RewardComputer.create(
+            cfg.mode, self.spec, cfg.gamma, device=self.device
+        )
         
         # Logger
         if cfg.log_to_file:
@@ -333,12 +392,15 @@ class PPOTrainer:
         _vprint("Resetting environment for initial state...", v)
         states = self.vec_env.reset()
         _vprint("Environment reset done", v)
-        # Reward computer uses numpy, convert if TorchVecEnv
-        # Note: .cpu() implicitly syncs on TPU/XLA
-        states_np = states.cpu().numpy() if self._torch_env else states
+        
+        # Initialize reward computer (torch-native for TorchVecEnv)
         _vprint("Initializing reward computer...", v)
-        self.reward_computer.initialize(states_np)
-        episode_rewards = np.zeros(cfg.n_envs)
+        if self._torch_env:
+            self.reward_computer.initialize(states)  # stays on GPU
+            episode_rewards = torch.zeros(cfg.n_envs, device=self.device)
+        else:
+            self.reward_computer.initialize(states)  # numpy
+            episode_rewards = np.zeros(cfg.n_envs)
         _vprint("Training loop ready to start", v)
         
         # Dashboard aggregation (per-update)
@@ -380,88 +442,141 @@ class PPOTrainer:
                 with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                     logits = self.policy(states_t)
                     features = self.policy.get_features(states_t)
-                    values = self.value_head(features).squeeze().cpu().numpy()
+                    values = self.value_head(features).squeeze()
                     
                     dist = Categorical(logits=logits, validate_args=False)
                     actions = dist.sample()
                     log_probs = dist.log_prob(actions)
-                    action_probs = F.softmax(logits, dim=1).cpu().numpy()
+                    # Store last logits for action_probs logging (computed once per update)
+                    last_logits = logits
             
             self.profiler.tick("Inference")
             
-            # Environment step - TorchVecEnv takes torch actions, VecEnv takes numpy
+            # Environment step
             if self._torch_env:
+                # GPU-native path: everything stays on GPU
                 next_states, rewards, dones = self.vec_env.step(actions)
-                # Convert to numpy for reward computer and buffers
-                # Note: .cpu() implicitly syncs on TPU/XLA
-                rewards_np = rewards.cpu().numpy()
-                dones_np = dones.cpu().numpy()
-                next_states_np = next_states.cpu().numpy()
+                
+                # Compute shaped rewards (torch-native, stays on GPU)
+                shaped_rewards = self.reward_computer.compute(
+                    rewards, states, next_states, dones
+                )
+                
+                # Store experience as tensors
+                states_buffer.append(states)
+                actions_buffer.append(actions)
+                log_probs_buffer.append(log_probs.detach())
+                rewards_buffer.append(shaped_rewards)
+                dones_buffer.append(dones)
+                values_buffer.append(values)
+                
+                self.total_steps += cfg.n_envs
+                episode_rewards += rewards  # Tensor addition
             else:
+                # NumPy path (deprecated, kept for VecEnv compatibility)
                 actions_np = actions.cpu().numpy()
                 next_states, rewards, dones = self.vec_env.step(actions_np)
-                rewards_np = rewards
-                dones_np = dones
-                next_states_np = next_states
+                
+                # Convert to tensors for reward computation
+                rewards_t = torch.from_numpy(rewards).float().to(self.device)
+                states_t = torch.from_numpy(states).float().to(self.device)
+                next_states_t = torch.from_numpy(next_states).float().to(self.device)
+                dones_t = torch.from_numpy(dones).to(self.device)
+                
+                shaped_rewards = self.reward_computer.compute(
+                    rewards_t, states_t, next_states_t, dones_t
+                )
+                
+                # Store as tensors (unified path)
+                states_buffer.append(states_t)
+                actions_buffer.append(torch.from_numpy(actions_np).long().to(self.device))
+                log_probs_buffer.append(log_probs.detach())
+                rewards_buffer.append(shaped_rewards)
+                dones_buffer.append(dones_t)
+                values_buffer.append(values)
+                
+                self.total_steps += cfg.n_envs
+                episode_rewards += rewards_t
             self.profiler.tick("Env Step")
             
-            # Compute shaped rewards
-            shaped_rewards = self.reward_computer.compute(
-                rewards_np, states if not self._torch_env else states.cpu().numpy(), 
-                next_states_np, dones_np
-            )
-            
-            # Store experience (keep numpy for now - GAE expects numpy)
-            states_buffer.append(states if not self._torch_env else states.cpu().numpy())
-            actions_buffer.append(actions.cpu().numpy())
-            log_probs_buffer.append(log_probs.detach())
-            rewards_buffer.append(shaped_rewards)
-            dones_buffer.append(dones_np)
-            values_buffer.append(values)
-            
-            self.total_steps += cfg.n_envs
-            episode_rewards += rewards_np
-            
-            # Track episodes
-            if dones_np.any():
-                done_envs = np.where(dones_np)[0]
-                for i in done_envs:
-                    self.episode_count += 1
+            # Track episodes - batch sync to reduce GPU stalls
+            if self._torch_env:
+                # Check if any episodes ended (single sync)
+                done_indices = torch.where(dones)[0]
+                if len(done_indices) > 0:
+                    # Batch extract all needed values in one sync
+                    done_rewards = episode_rewards[done_indices].cpu().numpy()
+                    done_food = self.vec_env.last_episode_food[done_indices].cpu().numpy()
+                    done_poison = self.vec_env.last_episode_poison[done_indices].cpu().numpy()
                     
-                    # Accumulate for update stats
-                    r = episode_rewards[i]
-                    # Handle torch vs numpy for last_episode_food/poison
-                    if self._torch_env:
-                        f = self.vec_env.last_episode_food[i].item()
-                        p = self.vec_env.last_episode_poison[i].item()
-                    else:
-                        f = self.vec_env.last_episode_food[i]
-                        p = self.vec_env.last_episode_poison[i]
-                    
-                    update_episodes_count += 1
-                    update_reward_sum += r
-                    update_food_sum += f
-                    update_poison_sum += p
-                    
-                    if r > self.best_reward:
-                        self.best_reward = r
+                    for j, i in enumerate(done_indices.cpu().numpy()):
+                        self.episode_count += 1
+                        r, f, p = done_rewards[j], int(done_food[j]), int(done_poison[j])
                         
-                    # Logger still logs every episode to CSV for detailed analysis
-                    if self.logger:
-                        grid_id = self.vec_env.grid_indices[i]
-                        food_density = self.vec_env.grid_food_counts[grid_id]
-                        avg_food = (self.min_food + self.max_food) / 2
-                        self.logger.log_episode(
-                            episode=self.episode_count,
-                            reward=r,
-                            length=500,
-                            food_eaten=f,
-                            poison_eaten=p,
-                            food_density=food_density,
-                            curriculum_progress=(avg_food - self.min_food) / (self.max_food - self.min_food + 1e-8),
-                            action_prob_std=np.std(action_probs[i]),
-                        )
-                    episode_rewards[i] = 0.0
+                        update_episodes_count += 1
+                        update_reward_sum += r
+                        update_food_sum += f
+                        update_poison_sum += p
+                        
+                        if r > self.best_reward:
+                            self.best_reward = r
+                        
+                        if self.logger:
+                            grid_id = self.vec_env.grid_indices[i]
+                            if isinstance(grid_id, torch.Tensor):
+                                grid_id = grid_id.item()
+                            food_density = self.vec_env.grid_food_counts[grid_id]
+                            if isinstance(food_density, torch.Tensor):
+                                food_density = food_density.item()
+                            avg_food = (self.min_food + self.max_food) / 2
+                            self.logger.log_episode(
+                                episode=self.episode_count,
+                                reward=r,
+                                length=500,
+                                food_eaten=f,
+                                poison_eaten=p,
+                                food_density=food_density,
+                                curriculum_progress=(avg_food - self.min_food) / (self.max_food - self.min_food + 1e-8),
+                                action_prob_std=0.0,  # Skip expensive softmax conversion
+                            )
+                        
+                        episode_rewards[i] = 0.0
+            else:
+                # CPU path - dones_t is a tensor now
+                done_indices = torch.where(dones_t)[0]
+                if len(done_indices) > 0:
+                    done_rewards = episode_rewards[done_indices].cpu().numpy()
+                    done_food = np.array([self.vec_env.last_episode_food[i] for i in done_indices.cpu().numpy()])
+                    done_poison = np.array([self.vec_env.last_episode_poison[i] for i in done_indices.cpu().numpy()])
+                    
+                    for j, i in enumerate(done_indices.cpu().numpy()):
+                        self.episode_count += 1
+                        r, f, p = done_rewards[j], int(done_food[j]), int(done_poison[j])
+                        
+                        update_episodes_count += 1
+                        update_reward_sum += r
+                        update_food_sum += f
+                        update_poison_sum += p
+                        
+                        if r > self.best_reward:
+                            self.best_reward = r
+                        
+                        if self.logger:
+                            grid_id = self.vec_env.grid_indices[i]
+                            food_density = self.vec_env.grid_food_counts[grid_id]
+                            avg_food = (self.min_food + self.max_food) / 2
+                            self.logger.log_episode(
+                                episode=self.episode_count,
+                                reward=r,
+                                length=500,
+                                food_eaten=f,
+                                poison_eaten=p,
+                                food_density=food_density,
+                                curriculum_progress=(avg_food - self.min_food) / (self.max_food - self.min_food + 1e-8),
+                                action_prob_std=0.0,
+                            )
+                        
+                        episode_rewards[i] = 0.0
             
             states = next_states
             
@@ -469,35 +584,44 @@ class PPOTrainer:
             if len(states_buffer) >= cfg.steps_per_env:
                 self.profiler.tick("Collection")
                 
-                # Get bootstrap value
+                # Get bootstrap value (keep on GPU for torch path)
                 with torch.no_grad():
-                    # Handle both TorchVecEnv (Tensor) and VecEnv (numpy)
                     if self._torch_env:
-                        states_t = states.float()  # Already on device
+                        states_t = states.float()
                     else:
                         states_t = torch.from_numpy(states).float().to(self.device)
                     features = self.policy.get_features(states_t)
-                    next_value = self.value_head(features).squeeze().cpu().numpy()
+                    next_value = self.value_head(features).squeeze()
                 
-                # Compute GAE
+                # Compute GAE - unified function handles both numpy and torch
                 advantages, returns = compute_gae(
                     rewards_buffer, values_buffer, dones_buffer,
-                    next_value, cfg.gamma, cfg.gae_lambda
+                    next_value, cfg.gamma, cfg.gae_lambda, device=self.device
                 )
                 self.profiler.tick("GAE Calc")
                 
-                # Flatten buffers
-                all_states = np.concatenate(states_buffer, axis=0)
-                all_actions = np.concatenate(actions_buffer, axis=0)
-                all_log_probs = torch.cat(log_probs_buffer, dim=0).cpu().numpy()
+                # Flatten and prepare buffers for PPO (all tensors stay on GPU)
+                if self._torch_env:
+                    # GPU path: buffers are tensors
+                    all_states = torch.cat(states_buffer, dim=0)
+                    all_actions = torch.cat(actions_buffer, dim=0)
+                    all_log_probs = torch.cat(log_probs_buffer, dim=0)
+                    all_old_values = torch.stack(values_buffer).flatten()
+                else:
+                    # CPU path: buffers are numpy, convert to tensors
+                    all_states = torch.from_numpy(np.concatenate(states_buffer, axis=0)).float().to(self.device)
+                    all_actions = torch.from_numpy(np.concatenate(actions_buffer, axis=0)).long().to(self.device)
+                    all_log_probs = torch.cat(log_probs_buffer, dim=0)
+                    all_old_values = torch.from_numpy(np.stack(values_buffer).flatten()).float().to(self.device)
+                
+                # Returns and advantages from compute_gae (always tensors now)
                 all_returns = returns.flatten()
                 all_advantages = advantages.flatten()
-                all_old_values = np.stack(values_buffer).flatten()
                 
                 # Normalize advantages
                 all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
                 
-                # PPO update
+                # PPO update - tensors go in directly, no CPU sync needed
                 policy_loss, value_loss, entropy, explained_var = ppo_update(
                     self.policy, self.value_head, self.optimizer,
                     all_states, all_actions, all_log_probs,
@@ -528,6 +652,9 @@ class PPOTrainer:
                 dones_buffer = []
                 values_buffer = []
                 
+                # Compute action_probs once for logging (only sync here, not every step)
+                action_probs = F.softmax(last_logits, dim=1)[0].cpu().numpy().tolist()
+                
                 # Logging
                 if self.logger:
                     self.logger.log_update(
@@ -537,7 +664,7 @@ class PPOTrainer:
                         value_loss=value_loss,
                         entropy=entropy,
                         explained_variance=explained_var,
-                        action_probs=action_probs[0].tolist()
+                        action_probs=action_probs
                     )
                 
                 # TensorBoard logging
@@ -565,7 +692,7 @@ class PPOTrainer:
                     
                     # Unified payload
                     payload = {
-                        'ppo': (policy_loss, value_loss, entropy, action_probs[0].tolist(), explained_var),
+                        'ppo': (policy_loss, value_loss, entropy, action_probs, explained_var),
                         'episodes': ep_stats,
                         'steps': self.total_steps
                     }

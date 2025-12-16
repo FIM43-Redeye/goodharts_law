@@ -4,7 +4,6 @@ Core PPO algorithm implementations.
 Pure functions for GAE calculation and PPO clipped objective updates.
 No state - easy to test and reuse.
 """
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
@@ -12,33 +11,38 @@ from torch.distributions import Categorical
 
 
 def compute_gae(
-    rewards: list[np.ndarray],
-    values: list[np.ndarray],
-    dones: list[np.ndarray],
-    next_value: np.ndarray,
+    rewards: list[torch.Tensor],
+    values: list[torch.Tensor],
+    dones: list[torch.Tensor],
+    next_value: torch.Tensor,
     gamma: float = 0.99,
-    gae_lambda: float = 0.95
-) -> tuple[np.ndarray, np.ndarray]:
+    gae_lambda: float = 0.95,
+    device: torch.device = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute Generalized Advantage Estimation (GAE).
     
+    All inputs should be torch tensors on the same device.
+    
     Args:
-        rewards: List of reward arrays, shape [(n_envs,), ...]
-        values: List of value arrays, shape [(n_envs,), ...]
-        dones: List of done flags, shape [(n_envs,), ...]
+        rewards: List of reward tensors, shape [(n_envs,), ...]
+        values: List of value tensors, shape [(n_envs,), ...]
+        dones: List of done flag tensors, shape [(n_envs,), ...]
         next_value: Bootstrap value for final state, shape (n_envs,)
         gamma: Discount factor
         gae_lambda: GAE lambda parameter
+        device: Torch device (inferred from rewards if not provided)
         
     Returns:
         advantages: Shape (steps, n_envs)
         returns: Shape (steps, n_envs)
     """
+    device = device or rewards[0].device
     steps = len(rewards)
     n_envs = rewards[0].shape[0]
     
-    advantages = np.zeros((steps, n_envs), dtype=np.float32)
-    lastgae = np.zeros(n_envs, dtype=np.float32)
+    advantages = torch.zeros((steps, n_envs), device=device, dtype=torch.float32)
+    lastgae = torch.zeros(n_envs, device=device, dtype=torch.float32)
     
     for t in reversed(range(steps)):
         if t == steps - 1:
@@ -46,13 +50,13 @@ def compute_gae(
         else:
             nextvalues = values[t + 1]
         
-        mask = 1.0 - dones[t]
+        mask = 1.0 - dones[t].float()
         delta = rewards[t] + gamma * nextvalues * mask - values[t]
         lastgae = delta + gamma * gae_lambda * mask * lastgae
         advantages[t] = lastgae
     
     # Returns = Advantages + Values
-    returns = advantages + np.stack(values)
+    returns = advantages + torch.stack(values)
     
     return advantages, returns
 
@@ -61,12 +65,12 @@ def ppo_update(
     policy: torch.nn.Module,
     value_head: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-    states: np.ndarray,
-    actions: np.ndarray,
-    log_probs: np.ndarray,
-    returns: np.ndarray,
-    advantages: np.ndarray,
-    old_values: np.ndarray,
+    states: torch.Tensor,
+    actions: torch.Tensor,
+    log_probs: torch.Tensor,
+    returns: torch.Tensor,
+    advantages: torch.Tensor,
+    old_values: torch.Tensor,
     device: torch.device,
     eps_clip: float = 0.2,
     k_epochs: int = 4,
@@ -79,43 +83,37 @@ def ppo_update(
 ) -> tuple[float, float, float, float]:
     """
     Perform PPO clipped objective update with minibatches.
+    
+    All inputs should be torch tensors already on the target device.
     """
     use_amp = scaler is not None
     device_type = 'cuda' if device.type == 'cuda' else 'cpu'
     
-    # Convert NumPy arrays to tensors ONCE
-    # Note: If VRAM is tight, we should keep these on CPU and move minibatches to GPU.
-    # But for now, user has a decent GPU, so keeping full batch on GPU is faster if it fits.
-    # If 192 envs * 128 steps * ~5KB state is too big, move `.to(device)` inside loop.
-    old_states_d = torch.from_numpy(states).float().to(device)
-    old_actions_d = torch.from_numpy(actions).long().to(device)
-    old_log_probs_d = torch.from_numpy(log_probs).float().to(device)
-    returns_d = torch.from_numpy(returns).float().to(device)
-    advantages_d = torch.from_numpy(advantages).float().to(device)
-    old_values_d = torch.from_numpy(old_values).float().to(device)
+    # Ensure correct dtypes (tensors should already be on device)
+    old_states_d = states.float()
+    old_actions_d = actions.long()
+    old_log_probs_d = log_probs.float()
+    returns_d = returns.float()
+    advantages_d = advantages.float()
+    old_values_d = old_values.float()
 
     batch_size = states.shape[0]
     minibatch_size = batch_size // n_minibatches
     
-    # Track metrics
-    total_policy_loss = 0.0
-    total_value_loss = 0.0
-    total_entropy = 0.0
+    # Track metrics on GPU to avoid sync during loop
+    total_policy_loss = torch.tensor(0.0, device=device)
+    total_value_loss = torch.tensor(0.0, device=device)
+    total_entropy = torch.tensor(0.0, device=device)
     n_updates = 0
     
     for epoch in range(k_epochs):
         # Shuffle indices for this epoch
-        # Use argsort(random) instead of randperm for TPU int32 compatibility
         indices = torch.argsort(torch.rand(batch_size, device=device))
         
         for mb_idx in range(n_minibatches):
             start = mb_idx * minibatch_size
             end = start + minibatch_size
             mb_inds = indices[start:end]
-            
-            # Progress reporting (minimal - only show epoch completion)
-            # if verbose and mb_idx == n_minibatches - 1:
-            #     print(f"     [GPU] Epoch {epoch+1}/{k_epochs} complete", end='\r')
             
             # Slice minibatch
             mb_states = old_states_d[mb_inds]
@@ -167,25 +165,24 @@ def ppo_update(
                 torch.nn.utils.clip_grad_norm_(value_head.parameters(), max_grad_norm)
                 optimizer.step()
     
-            # Accumulate stats
-            total_policy_loss += policy_loss.item()
-            total_value_loss += value_loss.item()
-            total_entropy += entropy_bonus.item()
+            # Accumulate stats (stay on GPU, no sync)
+            total_policy_loss = total_policy_loss + policy_loss.detach()
+            total_value_loss = total_value_loss + value_loss.detach()
+            total_entropy = total_entropy + entropy_bonus.detach()
             n_updates += 1
     
-    # Compute explained variance (on full batch for accuracy, or just return 0 to save time)
-    # Let's do a quick estimate on the last minibatch to save time/memory
+    # Compute explained variance on last minibatch
     with torch.no_grad():
         var_returns = mb_returns.var()
         if var_returns > 1e-8:
             explained_var = 1 - (mb_returns - mb_old_values).var() / var_returns
-            explained_var = explained_var.item()
         else:
-            explained_var = 0.0
+            explained_var = torch.tensor(0.0, device=device)
     
+    # Single sync point at the very end
     return (
-        total_policy_loss / n_updates,
-        total_value_loss / n_updates,
-        total_entropy / n_updates,
-        explained_var
+        (total_policy_loss / n_updates).item(),
+        (total_value_loss / n_updates).item(),
+        (total_entropy / n_updates).item(),
+        explained_var.item()
     )

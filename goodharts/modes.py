@@ -6,19 +6,8 @@ This enables automatic configuration without hardcoding mode names throughout.
 """
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
-from functools import lru_cache
 from typing import Type
-import numpy as np
-
-
-@lru_cache(maxsize=4)
-def _get_distance_map(h: int, w: int) -> np.ndarray:
-    """Get cached distance map for given dimensions."""
-    y, x = np.ogrid[:h, :w]
-    center = (h // 2, w // 2)
-    dist = np.sqrt((y - center[0])**2 + (x - center[1])**2)
-    dist[center] = 1e-6  # Avoid division by zero
-    return dist
+import torch
 
 
 @dataclass
@@ -76,12 +65,31 @@ class ObservationSpec:
         return f"ObservationSpec(mode='{self.mode}', channels={self.num_channels}, view={self.view_size}x{self.view_size}{extra})"
 
 
+# Cache for torch distance maps per (h, w, device) tuple
+_torch_distance_map_cache: dict[tuple[int, int, str], torch.Tensor] = {}
+
+def _get_distance_map_torch(h: int, w: int, device: torch.device) -> torch.Tensor:
+    """Get cached distance map as torch tensor on specified device."""
+    cache_key = (h, w, str(device))
+    if cache_key not in _torch_distance_map_cache:
+        y = torch.arange(h, device=device, dtype=torch.float32).unsqueeze(1)
+        x = torch.arange(w, device=device, dtype=torch.float32).unsqueeze(0)
+        center_y, center_x = h // 2, w // 2
+        dist = torch.sqrt((y - center_y)**2 + (x - center_x)**2)
+        dist[center_y, center_x] = 1e-6  # Avoid division by zero
+        _torch_distance_map_cache[cache_key] = dist
+    return _torch_distance_map_cache[cache_key]
+
+
 class RewardComputer(ABC):
     """
     Base class for computing shaped rewards for training.
+    
+    Uses torch tensors exclusively. All inputs/outputs are torch tensors.
     """
     
-    def __init__(self, mode: str, spec: 'ObservationSpec', gamma: float = 0.99):
+    def __init__(self, mode: str, spec: 'ObservationSpec', gamma: float = 0.99,
+                 device: torch.device = None):
         """
         Initialize reward computer.
         
@@ -89,41 +97,44 @@ class RewardComputer(ABC):
             mode: Training mode name
             spec: Observation specification
             gamma: Discount factor (for potential-based shaping)
+            device: Torch device (auto-detected if None)
         """
         self.mode = mode
         self.spec = spec
         self.gamma = gamma
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.prev_potentials: torch.Tensor = None
+        # Cache constant tensor to avoid per-call allocation
+        self._inf_tensor = torch.tensor(float('inf'), device=self.device)
         
     @classmethod
-    def create(cls, mode: str, spec: 'ObservationSpec', gamma: float = 0.99) -> 'RewardComputer':
-        """
-        Factory method to create the appropriate RewardComputer instance.
-        """
+    def create(cls, mode: str, spec: 'ObservationSpec', gamma: float = 0.99,
+               device: torch.device = None) -> 'RewardComputer':
+        """Factory method to create the appropriate RewardComputer instance."""
         if spec.reward_strategy is None:
              raise ValueError(f"No reward strategy defined for mode: {mode}")
-             
-        # Instantiate the strategy class defined in the spec
-        return spec.reward_strategy(mode, spec, gamma)
+        return spec.reward_strategy(mode, spec, gamma, device)
     
-    def initialize(self, states: np.ndarray):
-
+    def initialize(self, states: torch.Tensor):
         """Initialize potentials for first step."""
         self.prev_potentials = self._compute_potentials(states)
     
     def compute(
         self,
-        raw_rewards: np.ndarray,
-        states: np.ndarray,
-        next_states: np.ndarray,
-        dones: np.ndarray
-    ) -> np.ndarray:
+        raw_rewards: torch.Tensor,
+        states: torch.Tensor,
+        next_states: torch.Tensor,
+        dones: torch.Tensor
+    ) -> torch.Tensor:
         """Compute shaped rewards for training."""
         # 1. Scale raw rewards based on reward type
-        scaled_rewards = self._scale_rewards(raw_rewards)
+        scaled_rewards = self._scale_rewards(raw_rewards.float())
         
         # 2. Add potential-based shaping
         next_potentials = self._compute_potentials(next_states)
-        target_potentials = np.where(dones, 0.0, next_potentials)
+        target_potentials = torch.where(dones.bool(), 
+                                         torch.zeros_like(next_potentials), 
+                                         next_potentials)
         
         shaping = (target_potentials * self.gamma) - self.prev_potentials
         
@@ -132,69 +143,64 @@ class RewardComputer(ABC):
         
         # 3. Combine and clip
         total_rewards = scaled_rewards + shaping
-        total_rewards = np.clip(total_rewards, -5.0, 5.0)
+        total_rewards = torch.clamp(total_rewards, -5.0, 5.0)
         
         return total_rewards
     
     @abstractmethod
-    def _compute_potentials(self, states: np.ndarray) -> np.ndarray:
+    def _compute_potentials(self, states: torch.Tensor) -> torch.Tensor:
         """Calculate potential-based shaping values."""
         pass
     
-    def _scale_rewards(self, rewards: np.ndarray) -> np.ndarray:
+    def _scale_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
         """
         Scale raw rewards. Default is to scale by max magnitude (energy delta).
         Override for custom scaling (e.g. +1/-1).
         """
         from goodharts.configs.default_config import TRAINING_DEFAULTS
-        # Use centralized default scaling
         scale = TRAINING_DEFAULTS.get('reward_scale', 0.1)
         return rewards * scale
         
-    def _calculate_potential_from_target(self, states: np.ndarray, target_mask: np.ndarray) -> np.ndarray:
-        """Helper to calculate inverse distance potential to targets."""
+    def _calculate_potential_from_target(self, states: torch.Tensor, 
+                                          target_mask: torch.Tensor) -> torch.Tensor:
+        """Helper to calculate inverse distance potential to targets (vectorized)."""
         n, c, h, w = states.shape
-        dist_map = _get_distance_map(h, w)
+        dist_map = _get_distance_map_torch(h, w, states.device)
         
-        # Vectorized min distance
-        potentials = np.zeros(n, dtype=np.float32)
+        # Broadcast dist_map to (n, h, w) and mask non-targets with inf
+        dist_map_expanded = dist_map.unsqueeze(0).expand(n, -1, -1)  # (n, h, w)
         
-        # Find envs with targets
-        has_target = target_mask.any(axis=(1, 2))
-        if has_target.any():
-            # Mask distance map where target is present
-            masked_dist = np.where(target_mask[has_target], dist_map, np.inf)
-            min_dists = masked_dist.reshape(masked_dist.shape[0], -1).min(axis=1)
-            
-            # Inverse potential: 0.1 / (dist + 0.5)
-            # Max value (at dist=0) = 0.2
-            # Value at dist=1 = 0.067
-            # This ensures shaping is weak (<10% of consumption reward) and tapers hard.
-            potentials[has_target] = 0.1 / (min_dists + 0.5)
-            
+        # Where target_mask is True, use distance; else use inf
+        masked_dist = torch.where(target_mask, dist_map_expanded, self._inf_tensor)
+        
+        # Compute min distance per env (flatten spatial dims, then min)
+        min_dist = masked_dist.view(n, -1).min(dim=1).values  # (n,)
+        
+        # Inverse potential: 0.1 / (dist + 0.5), handle inf as 0
+        potentials = 0.1 / (min_dist + 0.5)
+        potentials = torch.where(torch.isinf(min_dist), 
+                                  torch.zeros_like(potentials), 
+                                  potentials)
+        
         return potentials
 
 
 class GroundTruthRewards(RewardComputer):
-    """
-    Standard ground truth rewards.
-    """
-    def _compute_potentials(self, states: np.ndarray) -> np.ndarray:
+    """Standard ground truth rewards."""
+    def _compute_potentials(self, states: torch.Tensor) -> torch.Tensor:
         target = states[:, 2, :, :] > 0.5
         return self._calculate_potential_from_target(states, target)
 
 
 class HandholdRewards(RewardComputer):
-    """
-    Handhold rewards for easier learning.
-    """
-    def _scale_rewards(self, rewards: np.ndarray) -> np.ndarray:
-        scaled = np.zeros_like(rewards)
+    """Handhold rewards for easier learning."""
+    def _scale_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
+        scaled = torch.zeros_like(rewards)
         scaled[rewards > 0] = 1.0   # Food
         scaled[rewards < 0] = -1.0  # Poison
         return scaled
 
-    def _compute_potentials(self, states: np.ndarray) -> np.ndarray:
+    def _compute_potentials(self, states: torch.Tensor) -> torch.Tensor:
         target = states[:, 2, :, :] > 0.5
         return self._calculate_potential_from_target(states, target)
 
@@ -204,8 +210,8 @@ class ProxyJammedRewards(RewardComputer):
     Rewards for proxy_jammed mode (information asymmetry).
     Agent sees interestingness, rewarded for energy delta.
     """
-    def _compute_potentials(self, states: np.ndarray) -> np.ndarray:
-        interestingness = states[:, 2:, :, :].max(axis=1)
+    def _compute_potentials(self, states: torch.Tensor) -> torch.Tensor:
+        interestingness = states[:, 2:, :, :].max(dim=1).values
         target = interestingness > 0.5
         return self._calculate_potential_from_target(states, target)
 
@@ -215,17 +221,16 @@ class ProxyRewards(RewardComputer):
     Rewards for proxy mode (main Goodhart failure case).
     Agent sees interestingness, rewarded for interestingness consumption.
     """
-    def _scale_rewards(self, rewards: np.ndarray) -> np.ndarray:
-        scaled = np.zeros_like(rewards)
+    def _scale_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
+        scaled = torch.zeros_like(rewards)
         scaled[rewards > 0] = 1.0
         scaled[rewards < 0] = 0.9
         return scaled
         
-    def _compute_potentials(self, states: np.ndarray) -> np.ndarray:
-        interestingness = states[:, 2:, :, :].max(axis=1)
+    def _compute_potentials(self, states: torch.Tensor) -> torch.Tensor:
+        interestingness = states[:, 2:, :, :].max(dim=1).values
         target = interestingness > 0.5
         return self._calculate_potential_from_target(states, target)
-
 
 @dataclass
 class ModeSpec:

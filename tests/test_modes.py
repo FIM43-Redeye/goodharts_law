@@ -126,19 +126,21 @@ class TestRewardComputer:
         computer = RewardComputer.create('proxy_jammed', jammed_spec, gamma=0.99)
         assert isinstance(computer, ProxyJammedRewards)
     
-    def test_reward_computer_compute_returns_array(self, config, gt_spec):
-        """compute() should return shaped rewards as array."""
-        computer = RewardComputer.create('ground_truth', gt_spec, gamma=0.99)
+    def test_reward_computer_compute_returns_tensor(self, config, gt_spec):
+        """compute() should return shaped rewards as torch tensor."""
+        import torch
+        device = torch.device('cpu')
+        computer = RewardComputer.create('ground_truth', gt_spec, gamma=0.99, device=device)
         
         n_envs = 4
         view_size = gt_spec.view_size
         n_channels = gt_spec.num_channels
         
-        # Create dummy observations
-        states = np.random.randn(n_envs, n_channels, view_size, view_size).astype(np.float32)
-        next_states = np.random.randn(n_envs, n_channels, view_size, view_size).astype(np.float32)
-        raw_rewards = np.random.randn(n_envs).astype(np.float32)
-        dones = np.zeros(n_envs, dtype=np.float32)
+        # Create dummy observations as tensors
+        states = torch.randn(n_envs, n_channels, view_size, view_size, device=device)
+        next_states = torch.randn(n_envs, n_channels, view_size, view_size, device=device)
+        raw_rewards = torch.randn(n_envs, device=device)
+        dones = torch.zeros(n_envs, device=device)
         
         # Initialize potentials
         computer.initialize(states)
@@ -147,17 +149,19 @@ class TestRewardComputer:
         shaped = computer.compute(raw_rewards, states, next_states, dones)
         
         assert shaped.shape == (n_envs,)
-        assert shaped.dtype == np.float32
+        assert shaped.dtype == torch.float32
     
     def test_reward_scaling_normalizes(self, config, gt_spec):
         """Reward scaling should reduce magnitude of raw rewards."""
-        computer = RewardComputer.create('ground_truth', gt_spec, gamma=0.99)
+        import torch
+        device = torch.device('cpu')
+        computer = RewardComputer.create('ground_truth', gt_spec, gamma=0.99, device=device)
         
         # Large raw rewards (typical energy deltas: +15 food, -10 poison)
-        raw_rewards = np.array([15.0, -10.0, 0.0, 1.0], dtype=np.float32)
+        raw_rewards = torch.tensor([15.0, -10.0, 0.0, 1.0], device=device)
         
         scaled = computer._scale_rewards(raw_rewards)
         
         # Scaled should have smaller magnitude than raw (divides by 10)
-        assert np.abs(scaled).max() < np.abs(raw_rewards).max(), \
-            f"Scaled rewards should have smaller magnitude, raw max={np.abs(raw_rewards).max()}, scaled max={np.abs(scaled).max()}"
+        assert scaled.abs().max() < raw_rewards.abs().max(), \
+            f"Scaled rewards should have smaller magnitude"
