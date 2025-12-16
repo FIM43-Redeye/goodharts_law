@@ -357,6 +357,8 @@ class PPOTrainer:
             # Environment step - TorchVecEnv takes torch actions, VecEnv takes numpy
             if self._torch_env:
                 next_states, rewards, dones = self.vec_env.step(actions)
+                # Sync device before .cpu() calls - critical for TPU
+                sync_device(self.device)
                 # Convert to numpy for reward computer and buffers
                 rewards_np = rewards.cpu().numpy()
                 dones_np = dones.cpu().numpy()
