@@ -199,9 +199,10 @@ class HandholdRewards(RewardComputer):
         return self._calculate_potential_from_target(states, target)
 
 
-class ProxyRewards(RewardComputer):
+class ProxyJammedRewards(RewardComputer):
     """
-    Proxy rewards based on 'interestingness'.
+    Rewards for proxy_jammed mode (information asymmetry).
+    Agent sees interestingness, rewarded for energy delta.
     """
     def _compute_potentials(self, states: np.ndarray) -> np.ndarray:
         interestingness = states[:, 2:, :, :].max(axis=1)
@@ -209,9 +210,10 @@ class ProxyRewards(RewardComputer):
         return self._calculate_potential_from_target(states, target)
 
 
-class IllAdjustedRewards(RewardComputer):
+class ProxyRewards(RewardComputer):
     """
-    Ill-adjusted proxy rewards.
+    Rewards for proxy mode (main Goodhart failure case).
+    Agent sees interestingness, rewarded for interestingness consumption.
     """
     def _scale_rewards(self, rewards: np.ndarray) -> np.ndarray:
         scaled = np.zeros_like(rewards)
@@ -272,19 +274,19 @@ def _get_modes(config: dict) -> dict[str, ModeSpec]:
             freeze_energy_in_training=True,
             behavior_requirement='ground_truth',
         ),
-        'proxy': ModeSpec(
-            name='proxy',
+        'proxy_jammed': ModeSpec(
+            name='proxy_jammed',
             observation_channels=proxy_channels,
             reward_type='energy_delta',
-            reward_strategy=ProxyRewards,
+            reward_strategy=ProxyJammedRewards,
             freeze_energy_in_training=True,
             behavior_requirement='proxy_metric',
         ),
-        'proxy_ill_adjusted': ModeSpec(
-            name='proxy_ill_adjusted',
+        'proxy': ModeSpec(
+            name='proxy',
             observation_channels=proxy_channels,
             reward_type='interestingness',
-            reward_strategy=IllAdjustedRewards,
+            reward_strategy=ProxyRewards,
             freeze_energy_in_training=True,
             behavior_requirement='proxy_metric',
         ),

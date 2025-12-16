@@ -217,7 +217,7 @@ def run_comparative_verification(steps: int = 1000, runs: int = 3):
         return [{'behavior_class': 'proxy', 'count': n}]
         
     def setup_learned_ill(n):
-        return [{'behavior_class': 'proxy_ill_adjusted', 'count': n}]
+        return [{'behavior_class': 'proxy_jammed', 'count': n}]
 
     results['Learned Ground Truth'] = run_survival_test(setup_learned_gt, 'Learned Ground Truth (PPO)', steps, runs)
     results['Learned Proxy'] = run_survival_test(setup_learned_proxy, 'Learned Proxy (PPO)', steps, runs)

@@ -25,8 +25,8 @@ python main.py --learned
 | Mode | Observation | Reward | Use Case |
 |------|-------------|--------|----------|
 | `ground_truth` | One-hot cell types | Energy delta | Baseline: full information |
-| `proxy` | Interestingness | Energy delta | Proxy observation, true reward |
-| `proxy_ill_adjusted` | Interestingness | Interestingness | Fully misaligned |
+| `proxy` | Interestingness | Interestingness | **Main Goodhart failure mode** |
+| `proxy_jammed` | Interestingness | Energy delta | Information asymmetry (bonus) |
 
 ---
 
@@ -107,11 +107,28 @@ No "stay in place" action—agents must always move.
 - Separate value head (attached to BaseCNN features)
 - Value function clipping
 
+### Modular Architecture
+
+The PPO implementation is split into focused modules in `ppo/`:
+
+```
+ppo/
+├── trainer.py      # PPOTrainer: orchestrates the training loop
+├── algorithms.py   # Pure functions: compute_gae(), ppo_update()
+└── models.py       # ValueHead, Profiler utilities
+```
+
+- **trainer.py**: `PPOTrainer` class handles environment creation, experience collection, logging, and checkpointing. Subclassable for multi-agent extensions.
+
+- **algorithms.py**: Stateless functions for GAE computation and the PPO clipped update. Easy to test and reuse.
+
+- **models.py**: `ValueHead` (MLP for value function) and `Profiler` (timing breakdown).
+
 ### Hyperparameters (from config.toml)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `learning_rate` | 0.001 | Adam optimizer LR |
+| `learning_rate` | 0.0003 | Adam optimizer LR |
 | `gamma` | 0.99 | Discount factor |
 | `gae_lambda` | 0.95 | GAE smoothing |
 | `eps_clip` | 0.2 | PPO clipping epsilon |
@@ -253,7 +270,11 @@ device = "cuda"
 
 | File | Purpose |
 |------|---------|
-| `train_ppo.py` | Main PPO training loop with GAE |
+| `train_ppo.py` | CLI entry point for PPO training |
+| `ppo/trainer.py` | PPOTrainer class - main training loop |
+| `ppo/algorithms.py` | GAE computation & PPO update functions |
+| `ppo/models.py` | ValueHead, Profiler utilities |
+| `reward_shaping.py` | Potential-based reward shaping |
 | `train_dashboard.py` | Multi-mode live visualization |
 | `train_log.py` | Structured CSV/JSON logging |
 | `collect.py` | Expert demonstration collection |

@@ -37,8 +37,8 @@ class LearnedBehavior(BehaviorStrategy):
                          1.0 = sample from softmax probs
                          High (2.0+) = more random
         """
-        if mode not in ('ground_truth', 'ground_truth_handhold', 'proxy', 'proxy_ill_adjusted'):
-            raise ValueError(f"mode must be 'ground_truth', 'ground_truth_handhold', 'proxy', or 'proxy_ill_adjusted', got '{mode}'")
+        if mode not in ('ground_truth', 'ground_truth_handhold', 'proxy', 'proxy_jammed'):
+            raise ValueError(f"mode must be 'ground_truth', 'ground_truth_handhold', 'proxy', or 'proxy_jammed', got '{mode}'")
         
         self.name = name
         self._mode = mode
@@ -253,9 +253,9 @@ LEARNED_PRESETS: dict[str, dict] = {
         'model_path': 'models/ppo_proxy.pth',
         'color': (255, 100, 255),  # Light magenta
     },
-    'proxy_ill_adjusted': {
-        'mode': 'proxy',
-        'model_path': 'models/ppo_proxy_ill_adjusted.pth',
+    'proxy_jammed': {
+        'mode': 'proxy_jammed',
+        'model_path': 'models/ppo_proxy_jammed.pth',
         'color': (138, 43, 226),  # Blue-violet
     },
 }
@@ -269,7 +269,7 @@ def create_learned_behavior(preset: str = 'ground_truth', **kwargs) -> LearnedBe
     sensible defaults that can be overridden via kwargs.
     
     Args:
-        preset: One of 'ground_truth', 'proxy', 'proxy_ill_adjusted'
+        preset: One of 'ground_truth', 'proxy', 'proxy_jammed'
         **kwargs: Override preset values (model_path, epsilon, temperature, etc.)
         
     Returns:

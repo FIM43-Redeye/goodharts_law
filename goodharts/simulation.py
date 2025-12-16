@@ -206,8 +206,9 @@ class Simulation:
         for i, agent in enumerate(self.agents):
             # Check for death/reset
             if dones[i]:
-                # Infer reason from reward (poison penalty is very negative: -150)
-                if rewards[i] <= -100:
+                # Infer reason from reward
+                # Poison penalty is -10, death penalty adds -10, so poisoned death ~ -20
+                if rewards[i] <= -15:
                     reason = "Poisoned"
                 elif agent.energy <= 0:
                     reason = "Starvation"
