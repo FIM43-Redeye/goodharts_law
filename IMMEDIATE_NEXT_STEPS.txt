@@ -1,0 +1,43 @@
+# IMMEDIATE NEXT STEPS - Performance Optimization
+
+## COMPLETED
+
+### 1. Torch-Native GPU Environment - DONE
+Created TorchVecEnv with 3.46x training speedup (18,847 vs 5,440 steps/sec at 256 envs).
+Usage: `--torch-env` flag
+
+### 2. TPU Support - DONE
+Added unified device handling for CUDA/TPU/CPU swapping.
+
+**Usage:**
+```bash
+# On Colab TPU, set environment:
+export GOODHARTS_DEVICE=tpu
+
+# Or in Python:
+device = get_device('tpu')
+```
+
+**What was added:**
+- `is_xla_available()` - check if torch_xla installed
+- `is_tpu(device)` - check if device is TPU
+- `sync_device(device)` - xm.mark_step() on TPU, cuda.synchronize() on CUDA
+- `get_device('tpu')` - get TPU device
+- Auto-skip torch.compile on TPU (XLA uses own JIT)
+
+**To test on Colab:**
+1. Create TPU runtime notebook
+2. `pip install torch-xla[tpu]`
+3. `pip install -e .` (your package)
+4. Run training with `GOODHARTS_DEVICE=tpu`
+
+---
+
+## FUTURE CONSIDERATIONS
+
+### 3. Torch-Native Reward Computation
+Could further reduce CPU-GPU transfers by porting reward shaping to torch.
+Currently ~3.46x speedup already achieved, so likely diminishing returns.
+
+### 4. JAX Environment (Alternative)
+If torch-native has issues, JAX is the alternative for XLA-native env.
