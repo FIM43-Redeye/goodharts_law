@@ -129,7 +129,7 @@ def ppo_update(
                 features = policy.get_features(mb_states)
                 values = value_head(features).squeeze()
                 
-                dist = Categorical(logits=logits)
+                dist = Categorical(logits=logits, validate_args=False)
                 new_log_probs = dist.log_prob(mb_actions)
                 entropy = dist.entropy()
                 
