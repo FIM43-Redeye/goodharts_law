@@ -65,6 +65,13 @@ class PPOConfig:
     tensorboard: bool = False  # Enable TensorBoard logging (works on Colab)
     skip_warmup: bool = False  # Skip JIT warmup (use when global warmup was done)
     use_torch_env: bool = False  # Use GPU-native TorchVecEnv (faster on powerful GPUs)
+    hyper_verbose: bool = False  # Debug mode: print at every major step
+
+
+def _vprint(msg: str, verbose: bool):
+    """Verbose print helper."""
+    if verbose:
+        print(f"[VERBOSE] {msg}", flush=True)
 
 
 class PPOTrainer:
@@ -139,35 +146,46 @@ class PPOTrainer:
         np.random.seed(seed)
         torch.manual_seed(seed)
         
+        v = cfg.hyper_verbose
+        _vprint("_setup() starting", v)
+        
         print(f"\n[PPO] Starting training: {cfg.mode}")
         print(f"   Device: {self.device}, Envs: {cfg.n_envs}")
         if is_tpu(self.device):
             print("   Note: TPU uses XLA - first step compiles the graph (may take a few minutes)")
         
         # Apply hardware optimizations
+        _vprint("Applying system optimizations...", v)
         apply_system_optimizations(self.device, verbose=True)
         
         # Load configs
+        _vprint("Loading configs...", v)
         sim_config = get_config()
         train_cfg = get_training_config()
         
         # Observation spec
+        _vprint("Creating observation spec...", v)
         self.spec = sim_config['get_observation_spec'](cfg.mode)
         n_actions = num_actions(1)
         
-        # Environment - use GPU-native TorchVecEnv if requested and CUDA available
-        if cfg.use_torch_env and self.device.type == 'cuda':
+        # Environment - use GPU-native TorchVecEnv if requested (works on CUDA and TPU)
+        _vprint("Creating environment...", v)
+        if cfg.use_torch_env and self.device.type in ('cuda', 'xla'):
             self.vec_env = create_torch_vec_env(n_envs=cfg.n_envs, obs_spec=self.spec, device=self.device)
             self._torch_env = True
-            print(f"   Env: TorchVecEnv (GPU-native)")
+            env_type = "TorchVecEnv (TPU-native)" if is_tpu(self.device) else "TorchVecEnv (GPU-native)"
+            print(f"   Env: {env_type}")
         else:
             self.vec_env = create_vec_env(n_envs=cfg.n_envs, obs_spec=self.spec)
             self._torch_env = False
+        _vprint("Environment created", v)
         print(f"   View: {self.vec_env.view_size}x{self.vec_env.view_size}, Channels: {self.vec_env.n_channels}")
         
         # Networks
+        _vprint("Creating networks...", v)
         self.policy = create_brain(cfg.brain_type, self.spec, output_size=n_actions).to(self.device)
         self.value_head = ValueHead(input_size=self.policy.hidden_size).to(self.device)
+        _vprint("Networks created and moved to device", v)
 
         # AMP
         self.device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
@@ -301,6 +319,7 @@ class PPOTrainer:
     def _training_loop(self):
         """Main training loop."""
         cfg = self.config
+        v = cfg.hyper_verbose  # Verbose debug mode
         
         # Experience buffers
         states_buffer = []
@@ -311,11 +330,19 @@ class PPOTrainer:
         values_buffer = []
         
         # Initial state
+        _vprint("Resetting environment for initial state...", v)
         states = self.vec_env.reset()
+        _vprint("Environment reset done", v)
         # Reward computer uses numpy, convert if TorchVecEnv
+        if self._torch_env:
+            _vprint("Syncing device before cpu()...", v)
+            sync_device(self.device)
+            _vprint("Converting states to numpy...", v)
         states_np = states.cpu().numpy() if self._torch_env else states
+        _vprint("Initializing reward computer...", v)
         self.reward_computer.initialize(states_np)
         episode_rewards = np.zeros(cfg.n_envs)
+        _vprint("Training loop ready to start", v)
         
         # Dashboard aggregation (per-update)
         # We track how many episodes finished during this collection phase
@@ -324,6 +351,7 @@ class PPOTrainer:
         update_food_sum = 0
         update_poison_sum = 0
         
+        step_in_update = 0
         start_time = time.perf_counter()
         
         while self.total_steps < cfg.total_timesteps:
@@ -334,6 +362,9 @@ class PPOTrainer:
                 print(f"\n[PPO] Stop signal received!")
                 break
             
+            if v:
+                _vprint(f"Step {self.total_steps}: collecting experience...", v)
+            
             # Collect experience
             with torch.no_grad():
                 # Convert states to torch if using NumPy env
@@ -342,6 +373,8 @@ class PPOTrainer:
                 else:
                     states_t = torch.from_numpy(states).float().to(self.device)
                 
+                if v:
+                    _vprint(f"Step {self.total_steps}: running inference...", v)
                 with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                     logits = self.policy(states_t)
                     features = self.policy.get_features(states_t)
