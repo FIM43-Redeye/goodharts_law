@@ -120,6 +120,7 @@ def train_ppo(
             tensorboard=kwargs.get('tensorboard', False),
             skip_warmup=kwargs.get('skip_warmup', False),
             use_torch_env=kwargs.get('use_torch_env', False),
+            hyper_verbose=kwargs.get('hyper_verbose', False),
         )
         
         trainer = PPOTrainer(config, dashboard=dashboard)
@@ -180,6 +181,8 @@ def main():
                         help='Enable TensorBoard logging (works on Colab)')
     parser.add_argument('--torch-env', action='store_true',
                         help='Use GPU-native TorchVecEnv (faster on powerful GPUs)')
+    parser.add_argument('--hyper-verbose', action='store_true',
+                        help='Debug mode: print at every major step (for TPU debugging)')
     args = parser.parse_args()
     
     # Determine steps_per_env for update calculation
@@ -255,6 +258,7 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
                     n_minibatches=n_minibatches,
                     tensorboard=args.tensorboard,
                     use_torch_env=args.torch_env,
+                    hyper_verbose=args.hyper_verbose,
                 )
         
         t = threading.Thread(target=sequential_training, daemon=True)
@@ -292,6 +296,7 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
                     'tensorboard': args.tensorboard,
                     'skip_warmup': True,
                     'use_torch_env': args.torch_env,
+                    'hyper_verbose': args.hyper_verbose,
                 },
                 daemon=True
             )
@@ -337,6 +342,7 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
                     'tensorboard': args.tensorboard,
                     'skip_warmup': True,
                     'use_torch_env': args.torch_env,
+                    'hyper_verbose': args.hyper_verbose,
                 }
             )
             threads.append(t)
@@ -363,6 +369,7 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
                 n_minibatches=n_minibatches,
                 tensorboard=args.tensorboard,
                 use_torch_env=args.torch_env,
+                hyper_verbose=args.hyper_verbose,
             )
 
 
