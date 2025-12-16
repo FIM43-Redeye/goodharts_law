@@ -29,7 +29,7 @@ respawn = true  # Respawn consumed resources
 # =============================================================================
 # Each [[agents]] block spawns agents of that type.
 # Available types: OmniscientSeeker, ProxySeeker, 
-#                  ground_truth, proxy, proxy_ill_adjusted (presets)
+#                  ground_truth, proxy, proxy_jammed (presets)
 
 [[agents]]
 type = "OmniscientSeeker"

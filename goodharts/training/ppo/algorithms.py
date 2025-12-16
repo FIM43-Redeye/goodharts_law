@@ -112,10 +112,9 @@ def ppo_update(
             end = start + minibatch_size
             mb_inds = indices[start:end]
             
-            # Progress reporting
-            if verbose:
-                # \033[K clears the line
-                print(f"     [GPU] Epoch {epoch+1}/{k_epochs} | Batch {mb_idx+1}/{n_minibatches} ({(mb_idx+1)/n_minibatches*100:.0f}%)", end='\r')
+            # Progress reporting (minimal - only show epoch completion)
+            # if verbose and mb_idx == n_minibatches - 1:
+            #     print(f"     [GPU] Epoch {epoch+1}/{k_epochs} complete", end='\r')
             
             # Slice minibatch
             mb_states = old_states_d[mb_inds]

@@ -327,13 +327,21 @@ class VecEnv:
                    self.agent_y[consumed_mask], 
                    self.agent_x[consumed_mask]] = CellType.EMPTY.value
         
-        # Respawn logic
-        # For shared grid, we just place item back on THAT grid.
-        # PPO default was: 1 item eaten -> 1 item spawned.
-        for i in np.where(food_mask)[0]:
-            self._place_items(self.grid_indices[i], CellType.FOOD.value, 1)
-        for i in np.where(poison_mask)[0]:
-            self._place_items(self.grid_indices[i], CellType.POISON.value, 1)
+        # Respawn logic (OPTIMIZED: batch by grid instead of per-agent)
+        # Count how many food/poison each grid needs to respawn
+        food_eaters_grids = self.grid_indices[food_mask]
+        poison_eaters_grids = self.grid_indices[poison_mask]
+        
+        # Use unique with counts to batch respawns per grid
+        if len(food_eaters_grids) > 0:
+            unique_grids, counts = np.unique(food_eaters_grids, return_counts=True)
+            for grid_id, count in zip(unique_grids, counts):
+                self._place_items(grid_id, CellType.FOOD.value, count)
+        
+        if len(poison_eaters_grids) > 0:
+            unique_grids, counts = np.unique(poison_eaters_grids, return_counts=True)
+            for grid_id, count in zip(unique_grids, counts):
+                self._place_items(grid_id, CellType.POISON.value, count)
         
         return rewards
     

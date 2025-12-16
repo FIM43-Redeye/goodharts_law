@@ -11,6 +11,14 @@ import numpy as np
 import torch
 
 
+# Enable persistent kernel cache for torch.compile
+# This avoids ~300s recompilation on every run
+# Cache is GPU-specific (device name + compute capability in cache key)
+_CACHE_DIR = os.path.expanduser("~/.cache/torch_inductor")
+os.makedirs(_CACHE_DIR, exist_ok=True)
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", _CACHE_DIR)
+
+
 # Lock to serialize torch.compile() calls across threads.
 # Dynamo has global state that is not thread-safe during compilation.
 # This only affects startup; compiled models run in parallel fine.
@@ -165,19 +173,43 @@ class PPOTrainer:
                 orig_value_head = self.value_head
                 
                 try:
-                    self.policy = torch.compile(self.policy)
-                    self.value_head = torch.compile(self.value_head)
+                    self.policy = torch.compile(self.policy, dynamic=True)
+                    self.value_head = torch.compile(self.value_head, dynamic=True)
                     
-                    # Explicit JIT Warmup to avoid silence during first update
-                    print(f"   [JIT] Warming up torch.compile... (this may take a minute)")
+                    # Explicit JIT Warmup - MUST use actual training batch size
+                    # Otherwise torch.compile recompiles on first real batch (85s+ forward, 270s+ backward!)
+                    warmup_batch = (cfg.n_envs * cfg.steps_per_env) // cfg.n_minibatches
+                    
+                    print(f"   [JIT] Warming up torch.compile (batch={warmup_batch})...")
                     warmup_start = time.time()
-                    dummy_obs = torch.zeros((1, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size), device=self.device)
-                    with torch.no_grad():
-                        with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                            # Trigger compilation
-                            self.policy(dummy_obs)
-                            features = self.policy.get_features(dummy_obs)
-                            self.value_head(features)
+                    
+                    dummy_obs = torch.zeros(
+                        (warmup_batch, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size), 
+                        device=self.device, requires_grad=False
+                    )
+                    dummy_actions = torch.zeros(warmup_batch, dtype=torch.long, device=self.device)
+                    dummy_returns = torch.zeros(warmup_batch, device=self.device)
+                    
+                    # Forward warmup (with autocast if using AMP)
+                    with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                        logits = self.policy(dummy_obs)
+                        features = self.policy.get_features(dummy_obs)
+                        values = self.value_head(features).squeeze()
+                        
+                        # Compute dummy loss (triggers backward graph compilation)
+                        from torch.distributions import Categorical
+                        dist = Categorical(logits=logits)
+                        log_probs = dist.log_prob(dummy_actions)
+                        dummy_loss = -log_probs.mean() + F.mse_loss(values, dummy_returns)
+                    
+                    # Backward warmup (compiles gradient kernels)
+                    dummy_loss.backward()
+                    
+                    # Clear gradients and CUDA cache
+                    self.policy.zero_grad()
+                    self.value_head.zero_grad()
+                    torch.cuda.empty_cache() if self.device.type == 'cuda' else None
+                    
                     print(f"   [JIT] Compilation complete ({time.time() - warmup_start:.1f}s)")
                     
                 except RuntimeError as e:

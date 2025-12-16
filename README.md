@@ -38,8 +38,8 @@ This project explores a fundamental AI safety concern: **what happens when agent
 | Mode | Observation | Reward Signal | Purpose |
 |------|-------------|---------------|---------|
 | `ground_truth` | One-hot cell types | Energy delta (+food, -poison) | Baseline: full information |
-| `proxy` | Interestingness values | Energy delta | Proxy observation, true reward |
-| `proxy_ill_adjusted` | Interestingness values | Interestingness gain | Fully misaligned proxy |
+| `proxy` | Interestingness values | Interestingness gain | **Main Goodhart failure mode** |
+| `proxy_jammed` | Interestingness values | Energy delta | Information asymmetry (bonus) |
 
 ---
 
@@ -53,9 +53,10 @@ goodharts_law/
 ├── pyproject.toml              # Package metadata & dependencies
 │
 ├── goodharts/                  # Main package
-│   ├── simulation.py           # Orchestrates agents in VecEnv
-│   ├── visualization.py        # Matplotlib visualization
+│   ├── simulation.py           # Visual demo: agents in shared-grid VecEnv
+│   ├── visualization.py        # Matplotlib-based live visualization
 │   ├── config.py               # TOML config loader with caching
+│   ├── modes.py                # Mode registry (ObservationSpec, ModeSpec, RewardComputer)
 │   │
 │   ├── behaviors/              # Agent decision-making
 │   │   ├── base.py             # BehaviorStrategy ABC + ROLE_COLORS
@@ -73,11 +74,15 @@ goodharts_law/
 │   │   └── vec_env.py          # High-performance vectorized environment
 │   │
 │   ├── configs/
-│   │   ├── default_config.py   # CellType enum, get_config(), defaults
-│   │   └── observation_spec.py # ObservationSpec & ModeSpec definitions
+│   │   └── default_config.py   # CellType enum, get_config(), defaults
 │   │
 │   ├── training/
-│   │   ├── train_ppo.py        # PPO with GAE (vectorized, ~6000+ sps)
+│   │   ├── train_ppo.py        # CLI wrapper for PPO training
+│   │   ├── ppo/                # Modular PPO implementation
+│   │   │   ├── trainer.py      # PPOTrainer class (main training loop)
+│   │   │   ├── algorithms.py   # GAE computation & PPO update
+│   │   │   └── models.py       # ValueHead, Profiler utilities
+│   │   ├── reward_shaping.py   # Potential-based reward shaping
 │   │   ├── train_dashboard.py  # Live multi-mode training dashboard
 │   │   ├── train_log.py        # Structured CSV/JSON logging
 │   │   ├── train.py            # Behavior cloning (deprecated)
@@ -94,7 +99,7 @@ goodharts_law/
 │       ├── logging_config.py   # Logging setup
 │       └── numba_utils.py      # JIT acceleration utilities
 │
-├── tests/                      # pytest test suite (27 tests)
+├── tests/                      # pytest test suite
 ├── docs/                       # Additional documentation
 ├── models/                     # Saved model weights
 ├── logs/                       # Training logs (CSV/JSON)
@@ -261,7 +266,7 @@ All cell types are defined in `configs/default_config.py` with intrinsic propert
 | EMPTY | 0 | Dark blue | 0.0 | — |
 | WALL | 1 | Gray | 0.0 | — |
 | FOOD | 2 | Teal | **1.0** | +15 |
-| POISON | 3 | Coral | **0.9** | -150 |
+| POISON | 3 | Coral | **0.9** | -10 |
 | PREY | 4 | Cyan | 0.3 | — |
 | PREDATOR | 5 | Red | 1.0 | +25 |
 
@@ -361,7 +366,7 @@ The proxy-seeker optimizes exactly what we told it to (highest signal), but this
 The agent lacks access to ground truth—a common scenario when we can't fully specify what we want. In the real world, we often can't give AI systems complete information about human values.
 
 ### 3. Distributional Shift
-The `proxy_ill_adjusted` mode shows what happens when even the *reward signal* is misaligned. The agent learns to seek "interesting" things regardless of their actual value—optimizing a proxy of a proxy.
+The `proxy` mode shows what happens when even the *reward signal* is misaligned. The agent learns to seek "interesting" things regardless of their actual value—optimizing a proxy of a proxy.
 
 ### 4. Meta-Lesson: We Fell Into Our Own Trap
 During development, we initially used behavior cloning (training CNNs to mimic expert heuristics). This failed because:

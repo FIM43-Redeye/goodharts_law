@@ -77,11 +77,11 @@ def test_ground_truth_food_poison_distinguishable(config):
 def test_property_based_encoding_extensible(config):
     """Any CellTypeInfo property should be usable as an observation channel."""
     # This tests extensibility - energy_reward is another property
-    # Create a custom observation spec with energy_reward channel
-    from goodharts.configs.observation_spec import ObservationSpec
+    # ObservationSpec is already imported at the top from goodharts.modes
     
     # Verify that property_names includes expected properties
     property_names = CellType.FOOD.property_names()
     assert 'interestingness' in property_names
     assert 'energy_reward' in property_names
     assert 'energy_penalty' in property_names
+

@@ -207,6 +207,7 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
                     log_to_file=True,
                     use_amp=use_amp,
                     compile_models=compile_models,
+                    n_minibatches=n_minibatches,
                 )
         
         t = threading.Thread(target=sequential_training, daemon=True)

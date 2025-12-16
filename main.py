@@ -45,7 +45,7 @@ def parse_args():
                         help='Path to TOML config file (CLI flags override config)')
     # Brain-view specific options (CLI overrides)
     parser.add_argument('--agent', type=str, default=None,
-                        choices=['ground_truth', 'ground_truth_handhold', 'proxy', 'proxy_ill_adjusted'],
+                        choices=['ground_truth', 'ground_truth_handhold', 'proxy', 'proxy_jammed'],
                         help='Agent type for brain-view (preset name)')
     parser.add_argument('--model', type=str, default=None,
                         help='Path to model weights')
