@@ -471,7 +471,11 @@ class PPOTrainer:
                 
                 # Get bootstrap value
                 with torch.no_grad():
-                    states_t = torch.from_numpy(states).float().to(self.device)
+                    # Handle both TorchVecEnv (Tensor) and VecEnv (numpy)
+                    if self._torch_env:
+                        states_t = states.float()  # Already on device
+                    else:
+                        states_t = torch.from_numpy(states).float().to(self.device)
                     features = self.policy.get_features(states_t)
                     next_value = self.value_head(features).squeeze().cpu().numpy()
                 
