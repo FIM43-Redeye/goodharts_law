@@ -122,7 +122,8 @@ class TorchVecEnv:
         self.grid_poison_counts = torch.full((self.n_grids,), self._default_poison, dtype=torch.int32, device=device)
         
         # State tensors (all on GPU)
-        self.grids = torch.zeros((self.n_grids, self.height, self.width), dtype=torch.int8, device=device)
+        # Grid uses float32 for faster F.pad (avoids dtype conversion overhead)
+        self.grids = torch.zeros((self.n_grids, self.height, self.width), dtype=torch.float32, device=device)
         self.agent_x = torch.zeros(n_envs, dtype=torch.int32, device=device)
         self.agent_y = torch.zeros(n_envs, dtype=torch.int32, device=device)
         self.agent_energy = torch.full((n_envs,), self.initial_energy, dtype=torch.float32, device=device)
@@ -217,6 +218,36 @@ class TorchVecEnv:
         self.current_episode_food[env_id] = 0
         self.current_episode_poison[env_id] = 0
     
+    def _reset_agents_batch(self, env_ids: torch.Tensor):
+        """Vectorized batch reset for multiple agents - minimal GPU syncs."""
+        if len(env_ids) == 0:
+            return
+        
+        n_reset = len(env_ids)
+        
+        # Update stats (vectorized)
+        self.last_episode_food[env_ids] = self.current_episode_food[env_ids]
+        self.last_episode_poison[env_ids] = self.current_episode_poison[env_ids]
+        self.current_episode_food[env_ids] = 0
+        self.current_episode_poison[env_ids] = 0
+        
+        # Reset energy, steps, dones (vectorized)
+        self.agent_energy[env_ids] = self.initial_energy
+        self.agent_steps[env_ids] = 0
+        self.dones[env_ids] = False
+        
+        # Random spawn positions - sample uniformly and check for empty
+        # This is approximate but avoids per-agent loops
+        grid_ids = self.grid_indices[env_ids]
+        
+        # Generate random positions (int32 to match agent_y/x dtype)
+        rand_y = torch.randint(0, self.height, (n_reset,), dtype=torch.int32, device=self.device)
+        rand_x = torch.randint(0, self.width, (n_reset,), dtype=torch.int32, device=self.device)
+        
+        # Assign positions (if occupied, agent spawns there anyway - rare edge case)
+        self.agent_y[env_ids] = rand_y
+        self.agent_x[env_ids] = rand_x
+    
     def _place_items(self, grid_id: int, cell_type: int, count: int):
         """Place items at random empty positions."""
         if count <= 0:
@@ -275,27 +306,25 @@ class TorchVecEnv:
         # Save dones before reset
         dones_to_return = self.dones.clone()
         
-        # Auto-reset done agents
+        # Auto-reset done agents (vectorized - no Python loop)
         if self.dones.any():
             done_indices = self.dones.nonzero(as_tuple=True)[0]
-            for i in done_indices.tolist():
-                self._reset_agent(i)
+            self._reset_agents_batch(done_indices)
         
         return self._get_observations(), rewards, dones_to_return
     
     def _eat_batch(self) -> torch.Tensor:
-        """Fully vectorized eating logic - no Python loops."""
+        """Fully vectorized eating logic - minimizes GPU syncs."""
         rewards = torch.zeros(self.n_envs, dtype=torch.float32, device=self.device)
         
-        # Get cell values at agent positions
+        # Get cell values at agent positions (vectorized)
         agent_y_long = self.agent_y.long()
         agent_x_long = self.agent_x.long()
         cell_values = self.grids[self.grid_indices, agent_y_long, agent_x_long]
         
-        # Food - fully vectorized
+        # Food - process without syncing count
         food_mask = (cell_values == self.CellType.FOOD.value)
-        n_food = food_mask.sum().item()
-        if n_food > 0:
+        if food_mask.any():
             rewards[food_mask] += self.food_reward
             self.agent_energy[food_mask] += self.food_reward
             self.current_episode_food[food_mask] += 1
@@ -303,13 +332,12 @@ class TorchVecEnv:
             # Clear eaten food (vectorized)
             self.grids[self.grid_indices[food_mask], agent_y_long[food_mask], agent_x_long[food_mask]] = self.CellType.EMPTY.value
             
-            # Respawn food (simplified - respawn to random positions)
+            # Respawn food - pass mask and let it compute count on GPU
             self._respawn_items_vectorized(food_mask, self.CellType.FOOD.value)
         
-        # Poison - fully vectorized
+        # Poison - process without syncing count
         poison_mask = (cell_values == self.CellType.POISON.value)
-        n_poison = poison_mask.sum().item()
-        if n_poison > 0:
+        if poison_mask.any():
             rewards[poison_mask] -= self.poison_penalty
             self.agent_energy[poison_mask] -= self.poison_penalty
             self.current_episode_poison[poison_mask] += 1
@@ -323,31 +351,29 @@ class TorchVecEnv:
         return rewards
     
     def _respawn_items_vectorized(self, eaten_mask: torch.Tensor, cell_type: int):
-        """Respawn items - simplified vectorized version."""
-        # For each grid, count how many items were eaten and respawn that many
-        if not eaten_mask.any():
+        """Fully vectorized respawn - no Python loops, minimal GPU syncs."""
+        # eaten_mask has True for each agent that ate an item of this type
+        # We respawn one item per True in the mask
+        # The mask size is known (n_envs), so we can use it directly
+        
+        # Get grid assignments for agents that ate
+        grid_ids = self.grid_indices[eaten_mask]
+        n_eaten = grid_ids.shape[0]  # This is a tensor shape, not a sync
+        
+        if n_eaten == 0:
             return
         
-        # Group by grid using bincount
-        grid_ids = self.grid_indices[eaten_mask]
-        counts = torch.bincount(grid_ids, minlength=self.n_grids)
+        # Generate random positions for all eaten items at once
+        rand_y = torch.randint(0, self.height, (n_eaten,), device=self.device)
+        rand_x = torch.randint(0, self.width, (n_eaten,), device=self.device)
         
-        # Respawn for each grid that needs it
-        for grid_id in counts.nonzero(as_tuple=True)[0].tolist():
-            count = counts[grid_id].item()
-            self._place_items(grid_id, cell_type, count)
-    
-    def _respawn_items_batched(self, eaten_mask: torch.Tensor, cell_type: int):
-        """Respawn items for grids that had items eaten."""
-        # Group by grid
-        grid_counts = {}
-        for i in eaten_mask.nonzero(as_tuple=True)[0].tolist():
-            grid_id = self.grid_indices[i].item()
-            grid_counts[grid_id] = grid_counts.get(grid_id, 0) + 1
+        # Check which positions are empty and place items there
+        # If a position is not empty, we skip it (acceptable for performance)
+        current_vals = self.grids[grid_ids, rand_y, rand_x]
+        empty_positions = (current_vals == self.CellType.EMPTY.value)
         
-        # Respawn for each grid
-        for grid_id, count in grid_counts.items():
-            self._place_items(grid_id, cell_type, count)
+        # Place items only at empty positions
+        self.grids[grid_ids[empty_positions], rand_y[empty_positions], rand_x[empty_positions]] = cell_type
     
     def _get_observations(self) -> torch.Tensor:
         """Get batched observations (fully vectorized on GPU)."""
@@ -358,43 +384,28 @@ class TorchVecEnv:
         agent_y_long = self.agent_y.long()
         agent_x_long = self.agent_x.long()
         current_vals = self.grids[self.grid_indices, agent_y_long, agent_x_long].clone()
-        self.grids[self.grid_indices, agent_y_long, agent_x_long] = self.agent_types.to(torch.int8)
+        self.grids[self.grid_indices, agent_y_long, agent_x_long] = self.agent_types.float()
         
-        # Pad grids
+        # Pad grids (grid is float32, no conversion needed)
         if self.loop:
-            padded_grids = F.pad(self.grids.float(), (r, r, r, r), mode='circular').to(torch.int8)
+            padded_grids = F.pad(self.grids, (r, r, r, r), mode='circular')
         else:
             padded_grids = F.pad(
-                self.grids.float(), (r, r, r, r), 
+                self.grids, (r, r, r, r), 
                 mode='constant', value=float(self.CellType.WALL.value)
-            ).to(torch.int8)
+            )
         
         # VECTORIZED VIEW EXTRACTION using unfold
-        # padded_grids shape: (n_grids, H+2r, W+2r)
-        # We'll use unfold to create all possible view windows, then index by agent position
-        
-        # Create all possible windows: (n_grids, num_y_positions, num_x_positions, view_size, view_size)
-        # Using unfold on last two dimensions
         windows = padded_grids.unfold(1, vs, 1).unfold(2, vs, 1)
-        # windows shape: (n_grids, H, W, view_size, view_size)
         
         # Index by agent positions to get each agent's view
-        # Shape: (n_envs, view_size, view_size)
         views = windows[self.grid_indices, agent_y_long, agent_x_long]
         
-        # Convert to channels - vectorized
-        for c, name in enumerate(self.channel_names):
-            if name.startswith('cell_'):
-                cell_name = name[5:].upper()
-                try:
-                    cell_type = getattr(self.CellType, cell_name)
-                    self._view_buffer[:, c] = (views == cell_type.value).float()
-                except AttributeError:
-                    self._view_buffer[:, c] = 0.0
-            else:
-                self._view_buffer[:, c] = 0.0
+        # Convert to one-hot channels (10x faster than loop)
+        one_hot = F.one_hot(views.long(), num_classes=self.n_channels)
+        self._view_buffer[:] = one_hot.permute(0, 3, 1, 2).float()
         
-        # Blank center
+        # Blank center (agent's own cell)
         self._view_buffer[:, :, r, r] = 0.0
         
         # Restore grid

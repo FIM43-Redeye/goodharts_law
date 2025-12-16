@@ -423,8 +423,13 @@ def apply_system_optimizations(device: torch.device = None, verbose: bool = True
             # 2. Enable cuDNN benchmark
             # This runs a quick benchmark on start to find the best convolution algo
             # for the specific hardware/input size. Great for fixed input sizes (standard RL).
+            # Note: only enable if not already disabled (e.g., via --no-warmup CLI flag)
             if torch.backends.cudnn.is_available():
-                if not torch.backends.cudnn.benchmark:
+                # Check environment variable for explicit disable
+                if os.environ.get('GOODHARTS_CUDNN_BENCHMARK', '').lower() in ('0', 'false', 'off'):
+                    if verbose:
+                        print("   Performance: cuDNN benchmark disabled (via env)")
+                elif not torch.backends.cudnn.benchmark:
                     torch.backends.cudnn.benchmark = True
                     if verbose:
                         print("   Performance: cuDNN benchmark enabled")

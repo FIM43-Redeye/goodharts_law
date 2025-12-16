@@ -46,11 +46,12 @@ class TestComputeGAE:
         """GAE should return correct shapes."""
         n_steps = 10
         n_envs = 4
+        device = torch.device('cpu')
         
-        rewards = [np.ones(n_envs) for _ in range(n_steps)]
-        values = [np.zeros(n_envs) for _ in range(n_steps)]
-        dones = [np.zeros(n_envs) for _ in range(n_steps)]
-        next_value = np.zeros(n_envs)
+        rewards = [torch.ones(n_envs, device=device) for _ in range(n_steps)]
+        values = [torch.zeros(n_envs, device=device) for _ in range(n_steps)]
+        dones = [torch.zeros(n_envs, device=device) for _ in range(n_steps)]
+        next_value = torch.zeros(n_envs, device=device)
         
         advantages, returns = compute_gae(rewards, values, dones, next_value)
         
@@ -61,33 +62,34 @@ class TestComputeGAE:
         """Positive rewards with zero values should give positive advantages."""
         n_steps = 5
         n_envs = 2
+        device = torch.device('cpu')
         
-        rewards = [np.ones(n_envs) for _ in range(n_steps)]
-        values = [np.zeros(n_envs) for _ in range(n_steps)]
-        dones = [np.zeros(n_envs) for _ in range(n_steps)]
-        next_value = np.zeros(n_envs)
+        rewards = [torch.ones(n_envs, device=device) for _ in range(n_steps)]
+        values = [torch.zeros(n_envs, device=device) for _ in range(n_steps)]
+        dones = [torch.zeros(n_envs, device=device) for _ in range(n_steps)]
+        next_value = torch.zeros(n_envs, device=device)
         
         advantages, returns = compute_gae(rewards, values, dones, next_value)
         
         # All advantages should be positive (rewards > values everywhere)
-        assert np.all(advantages > 0), "Positive rewards should yield positive advantages"
+        assert torch.all(advantages > 0), "Positive rewards should yield positive advantages"
     
     def test_gae_done_resets_advantage(self):
         """Done flag should reset advantage accumulation."""
         n_steps = 4
         n_envs = 1
+        device = torch.device('cpu')
         
         # Reward pattern: [1, 1, 1, 1] but done after step 1
-        rewards = [np.array([1.0]) for _ in range(n_steps)]
-        values = [np.array([0.0]) for _ in range(n_steps)]
-        dones = [np.array([0.0]), np.array([1.0]), np.array([0.0]), np.array([0.0])]
-        next_value = np.array([0.0])
+        rewards = [torch.tensor([1.0], device=device) for _ in range(n_steps)]
+        values = [torch.tensor([0.0], device=device) for _ in range(n_steps)]
+        dones = [torch.tensor([0.0], device=device), torch.tensor([1.0], device=device), 
+                 torch.tensor([0.0], device=device), torch.tensor([0.0], device=device)]
+        next_value = torch.tensor([0.0], device=device)
         
         advantages, returns = compute_gae(rewards, values, dones, next_value, gamma=0.99)
         
         # After done, advantage for step 1 should only consider immediate reward
-        # (bootstrapped future is zeroed by done mask)
-        # This is a structural test - exact values depend on gamma/lambda
         assert advantages[1, 0] <= advantages[0, 0], \
             "Advantage after done should not accumulate from future"
     
@@ -95,16 +97,17 @@ class TestComputeGAE:
         """Returns should equal advantages plus values."""
         n_steps = 5
         n_envs = 2
+        device = torch.device('cpu')
         
-        rewards = [np.random.randn(n_envs) for _ in range(n_steps)]
-        values = [np.random.randn(n_envs) for _ in range(n_steps)]
-        dones = [np.zeros(n_envs) for _ in range(n_steps)]
-        next_value = np.random.randn(n_envs)
+        rewards = [torch.randn(n_envs, device=device) for _ in range(n_steps)]
+        values = [torch.randn(n_envs, device=device) for _ in range(n_steps)]
+        dones = [torch.zeros(n_envs, device=device) for _ in range(n_steps)]
+        next_value = torch.randn(n_envs, device=device)
         
         advantages, returns = compute_gae(rewards, values, dones, next_value)
         
-        expected_returns = advantages + np.stack(values)
-        np.testing.assert_allclose(returns, expected_returns, rtol=1e-5)
+        expected_returns = advantages + torch.stack(values)
+        assert torch.allclose(returns, expected_returns, rtol=1e-5)
 
 
 class TestPPOUpdate:
@@ -124,19 +127,20 @@ class TestPPOUpdate:
     def test_ppo_update_returns_losses(self, setup):
         """PPO update should return loss metrics."""
         policy, value_head, optimizer = setup
+        device = torch.device('cpu')
         
         batch_size = 32
-        states = np.random.randn(batch_size, 4).astype(np.float32)
-        actions = np.random.randint(0, 8, batch_size)
-        log_probs = np.random.randn(batch_size).astype(np.float32)
-        returns = np.random.randn(batch_size).astype(np.float32)
-        advantages = np.random.randn(batch_size).astype(np.float32)
-        old_values = np.random.randn(batch_size).astype(np.float32)
+        states = torch.randn(batch_size, 4, device=device)
+        actions = torch.randint(0, 8, (batch_size,), device=device)
+        log_probs = torch.randn(batch_size, device=device)
+        returns = torch.randn(batch_size, device=device)
+        advantages = torch.randn(batch_size, device=device)
+        old_values = torch.randn(batch_size, device=device)
         
         p_loss, v_loss, entropy, ev = ppo_update(
             policy, value_head, optimizer,
             states, actions, log_probs, returns, advantages, old_values,
-            device=torch.device('cpu'),
+            device=device,
             k_epochs=1,
             n_minibatches=1
         )
@@ -149,22 +153,23 @@ class TestPPOUpdate:
     def test_ppo_update_modifies_weights(self, setup):
         """PPO update should modify network weights."""
         policy, value_head, optimizer = setup
+        device = torch.device('cpu')
         
         # Record initial weights
         initial_weights = policy.fc.weight.clone().detach()
         
         batch_size = 64
-        states = np.random.randn(batch_size, 4).astype(np.float32)
-        actions = np.random.randint(0, 8, batch_size)
-        log_probs = np.zeros(batch_size, dtype=np.float32)  # Force ratio = 1
-        returns = np.ones(batch_size, dtype=np.float32)
-        advantages = np.ones(batch_size, dtype=np.float32)  # Positive advantage
-        old_values = np.zeros(batch_size, dtype=np.float32)
+        states = torch.randn(batch_size, 4, device=device)
+        actions = torch.randint(0, 8, (batch_size,), device=device)
+        log_probs = torch.zeros(batch_size, device=device)  # Force ratio = 1
+        returns = torch.ones(batch_size, device=device)
+        advantages = torch.ones(batch_size, device=device)  # Positive advantage
+        old_values = torch.zeros(batch_size, device=device)
         
         ppo_update(
             policy, value_head, optimizer,
             states, actions, log_probs, returns, advantages, old_values,
-            device=torch.device('cpu'),
+            device=device,
             k_epochs=2,
             n_minibatches=1
         )
@@ -176,19 +181,20 @@ class TestPPOUpdate:
     def test_ppo_update_entropy_is_nonnegative(self, setup):
         """Entropy should always be non-negative."""
         policy, value_head, optimizer = setup
+        device = torch.device('cpu')
         
         batch_size = 32
-        states = np.random.randn(batch_size, 4).astype(np.float32)
-        actions = np.random.randint(0, 8, batch_size)
-        log_probs = np.random.randn(batch_size).astype(np.float32)
-        returns = np.random.randn(batch_size).astype(np.float32)
-        advantages = np.random.randn(batch_size).astype(np.float32)
-        old_values = np.random.randn(batch_size).astype(np.float32)
+        states = torch.randn(batch_size, 4, device=device)
+        actions = torch.randint(0, 8, (batch_size,), device=device)
+        log_probs = torch.randn(batch_size, device=device)
+        returns = torch.randn(batch_size, device=device)
+        advantages = torch.randn(batch_size, device=device)
+        old_values = torch.randn(batch_size, device=device)
         
         _, _, entropy, _ = ppo_update(
             policy, value_head, optimizer,
             states, actions, log_probs, returns, advantages, old_values,
-            device=torch.device('cpu'),
+            device=device,
             k_epochs=1,
             n_minibatches=1
         )

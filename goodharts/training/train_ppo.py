@@ -175,8 +175,8 @@ def main():
                         help='Disable automatic mixed precision')
     parser.add_argument('--minibatches', type=int, default=None,
                         help='Number of minibatches per epoch (default: from config)')
-    parser.add_argument('--no-compile', action='store_true',
-                        help='Disable torch.compile (required for parallel multi-mode training)')
+    parser.add_argument('--no-warmup', action='store_true',
+                        help='Skip warmup (disables torch.compile and cuDNN benchmark for faster startup but slower training)')
     parser.add_argument('--tensorboard', '-tb', action='store_true',
                         help='Enable TensorBoard logging (works on Colab)')
     parser.add_argument('--torch-env', action='store_true',
@@ -214,11 +214,15 @@ def main():
     entropy_coef = args.entropy if args.entropy is not None else train_cfg.get('entropy_coef', 0.02)
     n_minibatches = args.minibatches if args.minibatches is not None else train_cfg.get('n_minibatches', 4)
     
-    # Determine compile_models setting
-    # Note: With _warmup_compile(), parallel training is safe - warmup runs single-threaded,
-    # then all threads use cached kernels
-    if args.no_compile:
+    # Determine warmup/compile settings
+    # --no-warmup disables torch.compile AND cuDNN benchmark for fastest startup (but slower training)
+    if args.no_warmup:
         compile_models = False
+        # Set env var to prevent device.py from re-enabling cuDNN benchmark
+        os.environ['GOODHARTS_CUDNN_BENCHMARK'] = '0'
+        import torch
+        torch.backends.cudnn.benchmark = False
+        print("   Warmup disabled: torch.compile and cuDNN benchmark OFF")
     else:
         compile_models = True
     
@@ -259,6 +263,7 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
                     tensorboard=args.tensorboard,
                     use_torch_env=args.torch_env,
                     hyper_verbose=args.hyper_verbose,
+                    skip_warmup=not compile_models,  # Skip warmup when --no-warmup
                 )
         
         t = threading.Thread(target=sequential_training, daemon=True)
@@ -370,6 +375,7 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
                 tensorboard=args.tensorboard,
                 use_torch_env=args.torch_env,
                 hyper_verbose=args.hyper_verbose,
+                skip_warmup=not compile_models,  # Skip warmup when --no-warmup
             )
 
 
