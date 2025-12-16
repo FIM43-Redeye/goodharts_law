@@ -230,7 +230,7 @@ class PPOTrainer:
                             
                             # Compute dummy loss (triggers backward graph compilation)
                             from torch.distributions import Categorical
-                            dist = Categorical(logits=logits)
+                            dist = Categorical(logits=logits, validate_args=False)
                             log_probs = dist.log_prob(dummy_actions)
                             dummy_loss = -log_probs.mean() + F.mse_loss(values, dummy_returns)
                         
@@ -334,10 +334,7 @@ class PPOTrainer:
         states = self.vec_env.reset()
         _vprint("Environment reset done", v)
         # Reward computer uses numpy, convert if TorchVecEnv
-        if self._torch_env:
-            _vprint("Syncing device before cpu()...", v)
-            sync_device(self.device)
-            _vprint("Converting states to numpy...", v)
+        # Note: .cpu() implicitly syncs on TPU/XLA
         states_np = states.cpu().numpy() if self._torch_env else states
         _vprint("Initializing reward computer...", v)
         self.reward_computer.initialize(states_np)
@@ -380,7 +377,7 @@ class PPOTrainer:
                     features = self.policy.get_features(states_t)
                     values = self.value_head(features).squeeze().cpu().numpy()
                     
-                    dist = Categorical(logits=logits)
+                    dist = Categorical(logits=logits, validate_args=False)
                     actions = dist.sample()
                     log_probs = dist.log_prob(actions)
                     action_probs = F.softmax(logits, dim=1).cpu().numpy()
@@ -390,9 +387,8 @@ class PPOTrainer:
             # Environment step - TorchVecEnv takes torch actions, VecEnv takes numpy
             if self._torch_env:
                 next_states, rewards, dones = self.vec_env.step(actions)
-                # Sync device before .cpu() calls - critical for TPU
-                sync_device(self.device)
                 # Convert to numpy for reward computer and buffers
+                # Note: .cpu() implicitly syncs on TPU/XLA
                 rewards_np = rewards.cpu().numpy()
                 dones_np = dones.cpu().numpy()
                 next_states_np = next_states.cpu().numpy()
