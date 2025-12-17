@@ -36,6 +36,9 @@ class LogPayload:
     
     # Timing info
     sps: float
+    
+    # Validation metrics (optional, only present on validation runs)
+    validation_metrics: Optional[dict] = None
 
 
 class AsyncLogger:
@@ -119,6 +122,11 @@ class AsyncLogger:
             self.tb_writer.add_scalar('metrics/explained_variance', p.explained_var, p.total_steps)
             if p.episode_stats:
                 self.tb_writer.add_scalar('reward/episode', p.episode_stats['reward'], p.total_steps)
+            # Validation metrics
+            if p.validation_metrics:
+                self.tb_writer.add_scalar('validation/reward', p.validation_metrics['reward'], p.total_steps)
+                self.tb_writer.add_scalar('validation/food', p.validation_metrics['food'], p.total_steps)
+                self.tb_writer.add_scalar('validation/poison', p.validation_metrics['poison'], p.total_steps)
             self.tb_writer.flush()
         
         # Dashboard update

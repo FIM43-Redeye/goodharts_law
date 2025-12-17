@@ -127,3 +127,11 @@ use_amp = true              # Enable Automatic Mixed Precision (float16)
 checkpoint_interval = 0     # Save checkpoint every N updates (0 = disabled)
 lr_decay = false            # Enable learning rate decay over training
 lr_decay_factor = 0.1       # Final LR = initial_lr * factor (if lr_decay enabled)
+
+# Validation (periodic eval without exploration)
+validation_interval = 8       # Run every N PPO updates (0 = disabled)
+validation_episodes = 16      # Episodes per validation run
+validation_mode = "training"  # "training" = same env, "fixed" = controlled density
+validation_food = 100         # Fixed mode: food count
+validation_poison = 50        # Fixed mode: poison count
+

@@ -72,6 +72,13 @@ class PPOConfig:
     clean_cache: bool = False
     profile_enabled: bool = True  # Disable with --no-profile for production
     
+    # Validation episodes (periodic eval without exploration)
+    validation_interval: int = 8     # Every N updates (0 = disabled)
+    validation_episodes: int = 16     # Episodes per validation
+    validation_mode: str = "training" # "training" or "fixed"
+    validation_food: int = 100        # Fixed mode: food count
+    validation_poison: int = 50       # Fixed mode: poison count
+    
     @classmethod
     def from_config(cls, mode: str = 'ground_truth', **overrides) -> 'PPOConfig':
         """
@@ -105,6 +112,12 @@ class PPOConfig:
             'value_coef': train_cfg.get('value_coef', 0.5),
             'use_amp': train_cfg.get('use_amp', False),
             'compile_models': train_cfg.get('compile_models', True),
+            # Validation
+            'validation_interval': train_cfg.get('validation_interval', 8),
+            'validation_episodes': train_cfg.get('validation_episodes', 16),
+            'validation_mode': train_cfg.get('validation_mode', 'training'),
+            'validation_food': train_cfg.get('validation_food', 100),
+            'validation_poison': train_cfg.get('validation_poison', 50),
         }
         
         # Apply overrides (CLI args take precedence)
@@ -679,6 +692,11 @@ class PPOTrainer:
                 explained_var_f = explained_var.item()
                 action_probs = F.softmax(last_logits, dim=1)[0].cpu().numpy().tolist()
                 
+                # Run validation episodes periodically
+                val_metrics = None
+                if cfg.validation_interval > 0 and self.update_count % cfg.validation_interval == 0:
+                    val_metrics = self._run_validation_episodes()
+                
                 # ASYNC LOGGING - queue CPU data only, no GPU access in background
                 log_payload = LogPayload(
                     policy_loss=policy_loss_f,
@@ -693,6 +711,7 @@ class PPOTrainer:
                     episode_stats=ep_stats,
                     profiler_summary=self.profiler.summary(),
                     sps=sps,
+                    validation_metrics=val_metrics,
                 )
                 self.async_logger.log_update(log_payload)
                 self.profiler.reset()
@@ -725,6 +744,89 @@ class PPOTrainer:
             'best_reward': self.best_reward,
         }, checkpoint_path)
         print(f"   Checkpoint saved: {checkpoint_path}")
+    
+    def _run_validation_episodes(self) -> dict:
+        """
+        Run deterministic validation episodes.
+        
+        Returns metrics dict with mean reward, food, and poison.
+        Uses argmax for action selection (no exploration).
+        """
+        cfg = self.config
+        
+        # Select environment based on mode
+        if cfg.validation_mode == "fixed":
+            # Create temporary env with fixed density
+            val_env = create_torch_vec_env(
+                n_envs=cfg.n_envs, 
+                obs_spec=self.spec, 
+                device=self.device
+            )
+            val_env.set_curriculum_ranges(
+                cfg.validation_food, cfg.validation_food,
+                cfg.validation_poison, cfg.validation_poison
+            )
+            val_env.reset()
+        else:
+            # Use training env directly (faster, same randomization)
+            val_env = self.vec_env
+        
+        # Run episodes
+        total_reward = 0.0
+        total_food = 0
+        total_poison = 0
+        episodes_done = 0
+        
+        states = val_env.reset()
+        episode_rewards = torch.zeros(cfg.n_envs, device=self.device)
+        
+        # Run until we have enough completed episodes
+        max_steps = cfg.n_envs * 600  # Safety limit
+        steps = 0
+        
+        with torch.no_grad():
+            while episodes_done < cfg.validation_episodes and steps < max_steps:
+                states_t = states.float()
+                
+                # Deterministic action selection (argmax instead of sample)
+                logits = self.policy(states_t)
+                actions = logits.argmax(dim=-1)
+                
+                next_states, rewards, dones = val_env.step(actions)
+                episode_rewards += rewards
+                
+                # Check for completed episodes
+                done_mask = dones.nonzero(as_tuple=False).squeeze(-1)
+                if done_mask.numel() > 0:
+                    for idx in done_mask:
+                        if episodes_done >= cfg.validation_episodes:
+                            break
+                        total_reward += episode_rewards[idx].item()
+                        total_food += val_env.last_episode_food[idx].item()
+                        total_poison += val_env.last_episode_poison[idx].item()
+                        episodes_done += 1
+                        episode_rewards[idx] = 0.0
+                
+                states = next_states
+                steps += cfg.n_envs
+        
+        # Compute means
+        n = max(episodes_done, 1)
+        metrics = {
+            'reward': total_reward / n,
+            'food': total_food / n,
+            'poison': total_poison / n,
+            'episodes': episodes_done,
+            'mode': cfg.validation_mode,
+        }
+        
+        # Print validation results
+        print(f"   [Validation] reward={metrics['reward']:.2f}, "
+              f"food={metrics['food']:.1f}, poison={metrics['poison']:.1f} "
+              f"({episodes_done} episodes, {cfg.validation_mode} env)")
+        
+        return metrics
+    
     
     def _finalize(self) -> dict:
         """Save final model and return summary."""

@@ -8,6 +8,7 @@ behaviors/__pycache__
 models/
 visualizations/
 logs/
+evaluations/
 
 # C extensions
 *.so
