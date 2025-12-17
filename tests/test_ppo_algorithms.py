@@ -149,10 +149,12 @@ class TestPPOUpdate:
             n_minibatches=1
         )
         
-        assert isinstance(p_loss, float)
-        assert isinstance(v_loss, float)
-        assert isinstance(entropy, float)
-        assert isinstance(ev, float)
+        # ppo_update now returns tensors (for async logging)
+        # .item() calls happen in AsyncLogger background thread
+        assert isinstance(p_loss, torch.Tensor)
+        assert isinstance(v_loss, torch.Tensor)
+        assert isinstance(entropy, torch.Tensor)
+        assert isinstance(ev, torch.Tensor)
     
     def test_ppo_update_modifies_weights(self, setup):
         """PPO update should modify network weights."""
