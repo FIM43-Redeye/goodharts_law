@@ -9,15 +9,16 @@ from torch.utils.data import Dataset
 import numpy as np
 from typing import NamedTuple
 from collections import deque
+from goodharts.utils.device import get_device
 
 
 class Experience(NamedTuple):
     """A single experience tuple from the simulation."""
-    state: np.ndarray      # The agent's view (2D array)
-    action: int            # Action index taken
-    reward: float          # Energy delta or shaped reward
-    next_state: np.ndarray # View after taking action (optional, can be None)
-    done: bool             # Whether episode ended (agent died)
+    state: torch.Tensor | np.ndarray    # The agent's view
+    action: int                         # Action index taken
+    reward: float                       # Energy delta or shaped reward
+    next_state: torch.Tensor | np.ndarray | None # View after taking action
+    done: bool                          # Whether episode ended (agent died)
 
 
 class ReplayBuffer:
@@ -37,14 +38,25 @@ class ReplayBuffer:
         self.buffer: deque[Experience] = deque(maxlen=capacity)
         self.capacity = capacity
     
-    def add(self, state: np.ndarray, action: int, reward: float, 
-            next_state: np.ndarray | None = None, done: bool = False):
+    def add(self, state: torch.Tensor | np.ndarray, action: int, reward: float, 
+            next_state: torch.Tensor | np.ndarray | None = None, done: bool = False):
         """Add a single experience to the buffer."""
+        # Convert to tensor if numpy, or clone if tensor
+        # We store on CPU to save VRAM usually, but user wants full Torch.
+        # We'll store as is. If incoming is GPU tensor, it stays on GPU.
+        # If this causes OOM, we can add .cpu() here.
+        
+        def process_state(s):
+            if s is None: return None
+            if isinstance(s, torch.Tensor):
+                return s.clone()
+            return torch.from_numpy(s).float() # Convert to tensor immediately
+        
         exp = Experience(
-            state=state.copy(),  # Copy to avoid mutation issues
+            state=process_state(state),
             action=action,
             reward=reward,
-            next_state=next_state.copy() if next_state is not None else None,
+            next_state=process_state(next_state),
             done=done
         )
         self.buffer.append(exp)
@@ -59,6 +71,7 @@ class ReplayBuffer:
         Returns:
             List of Experience tuples
         """
+        # Using numpy for random choice of indices is fine
         indices = np.random.choice(len(self.buffer), size=min(batch_size, len(self.buffer)), replace=False)
         return [self.buffer[i] for i in indices]
     
@@ -68,24 +81,35 @@ class ReplayBuffer:
         
         Returns:
             dict with keys: 'states', 'actions', 'rewards', 'dones'
-            (next_states omitted if not needed)
+            (next_states omitted if not needed for standard PPO, added if needed)
         """
         if device is None:
-            from goodharts.utils.device import get_device
             device = get_device(verbose=False)
             
         batch = self.sample(batch_size)
         
-        states = np.stack([e.state for e in batch])
-        actions = np.array([e.action for e in batch])
-        rewards = np.array([e.reward for e in batch])
-        dones = np.array([e.done for e in batch])
+        # Helper to stack
+        def stack_states(states_list):
+            if isinstance(states_list[0], torch.Tensor):
+                return torch.stack(states_list).to(device)
+            else:
+                return torch.from_numpy(np.stack(states_list)).float().to(device)
+
+        states = stack_states([e.state for e in batch])
+        
+        # Ensure correct shape (B, C, H, W)
+        if states.dim() == 3: # (B, H, W)
+             states = states.unsqueeze(1)
+        
+        actions = torch.tensor([e.action for e in batch], dtype=torch.long, device=device)
+        rewards = torch.tensor([e.reward for e in batch], dtype=torch.float, device=device)
+        dones = torch.tensor([e.done for e in batch], dtype=torch.bool, device=device)
         
         return {
-            'states': torch.from_numpy(states).float().unsqueeze(1).to(device),  # (B, 1, H, W)
-            'actions': torch.from_numpy(actions).long().to(device),              # (B,)
-            'rewards': torch.from_numpy(rewards).float().to(device),             # (B,)
-            'dones': torch.from_numpy(dones).bool().to(device),                  # (B,)
+            'states': states,
+            'actions': actions,
+            'rewards': rewards,
+            'dones': dones,
         }
     
     def __len__(self) -> int:
@@ -123,7 +147,10 @@ class SimulationDataset(Dataset):
         """
         exp = self.experiences[idx]
         
-        state_tensor = torch.from_numpy(exp.state).float()
+        if isinstance(exp.state, torch.Tensor):
+            state_tensor = exp.state.float()
+        else:
+            state_tensor = torch.from_numpy(exp.state).float()
         
         # Handle both 2D (H, W) and 3D (C, H, W) states
         if state_tensor.dim() == 2:
@@ -167,6 +194,7 @@ class SimulationDataset(Dataset):
         
         Returns normalized weights that sum to len(dataset).
         """
+        # Convert to numpy for calculation
         rewards = np.array([e.reward for e in self.experiences])
         
         # Shift rewards to be non-negative
@@ -188,31 +216,27 @@ class SimulationDataset(Dataset):
         """
         Compute per-sample weights based on whether targets are visible.
         
-        Samples where food or poison is visible get higher weight,
-        but samples with nothing visible still get a base weight
-        (so agents learn some random exploration behavior).
-        
-        Args:
-            food_channel: Channel index for food in state (default=2)
-            poison_channel: Channel index for poison in state (default=3)
-            visible_multiplier: Weight multiplier for samples with visible targets
-            base_weight: Weight for samples with no visible targets
-            
-        Returns:
-            Weights array, normalized so sum = len(dataset)
+        Samples where food or poison is visible get higher weight.
         """
         weights = []
         
         for exp in self.experiences:
             state = exp.state
             
-            # Check if state has channel dimension
-            if state.ndim == 3:
+            # Helper to check visibility on tensor or numpy
+            is_tensor = isinstance(state, torch.Tensor)
+            shape = state.shape
+            
+            if len(shape) == 3:
                 # Channels are (C, H, W)
-                food_visible = state[food_channel].sum() > 0
-                poison_visible = state[poison_channel].sum() > 0 if poison_channel < state.shape[0] else False
+                if is_tensor:
+                    food_visible = state[food_channel].sum().item() > 0
+                    poison_visible = state[poison_channel].sum().item() > 0 if poison_channel < shape[0] else False
+                else:
+                    food_visible = state[food_channel].sum() > 0
+                    poison_visible = state[poison_channel].sum() > 0 if poison_channel < shape[0] else False
             else:
-                # Old 2D format - can't determine visibility
+                # Old 2D format
                 food_visible = False
                 poison_visible = False
             
@@ -231,12 +255,6 @@ class SimulationDataset(Dataset):
     def compute_combined_weights(self, visibility_mult: float = 5.0) -> np.ndarray:
         """
         Combine reward and visibility weighting.
-        
-        This gives high weight to samples that:
-        1. Have positive reward (ate food)
-        2. Have visible targets (can learn to navigate)
-        
-        Samples with neither still get small weight for exploration.
         """
         reward_weights = self.compute_reward_weights()
         vis_weights = self.compute_visibility_weights(visible_multiplier=visibility_mult)

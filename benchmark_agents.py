@@ -6,7 +6,6 @@ without visual overhead. Uses the vectorized environment for high-throughput eva
 """
 import argparse
 import torch
-import numpy as np
 import time
 from pathlib import Path
 from torch.distributions import Categorical
@@ -14,7 +13,7 @@ import torch.nn.functional as F
 
 from goodharts.configs.default_config import get_config
 from goodharts.behaviors.brains import create_brain
-from goodharts.environments.vec_env import create_vec_env
+from goodharts.environments.torch_env import create_torch_vec_env
 from goodharts.utils.device import get_device
 
 def benchmark(
@@ -33,7 +32,7 @@ def benchmark(
     else:
         device = get_device()
     
-    print(f"\n🚀 Benchmarking Agent: {Path(model_path).name}")
+    print(f"\n[Benchmark] Agent: {Path(model_path).name}")
     print(f"   Mode: {mode}")
     print(f"   Device: {device}")
     print(f"   Episodes: {n_episodes}")
@@ -44,17 +43,17 @@ def benchmark(
     try:
         spec = config['get_observation_spec'](mode)
     except Exception as e:
-        print(f"❌ Error loading observation spec for mode '{mode}': {e}")
+        print(f"[ERROR] Loading observation spec for mode '{mode}': {e}")
         return
 
     # Create Environment
     print(f"   Environment: {spec.view_size}x{spec.view_size} View, {spec.num_channels} Channels")
-    vec_env = create_vec_env(n_envs=n_envs, obs_spec=spec, config=config)
+    vec_env = create_torch_vec_env(n_envs=n_envs, obs_spec=spec, config=config, device=device)
     
 
     # Define LegacyCNN for backward compatibility with older/smaller models
     class LegacyCNN(torch.nn.Module):
-        def __init__(self, input_shape, output_size):
+        def __init__(self, input_shape, output_size, input_channels):
             super().__init__()
             self.input_shape = input_shape
             self.conv1 = torch.nn.Conv2d(input_channels, 16, kernel_size=3, padding=1)
@@ -88,26 +87,26 @@ def benchmark(
         state_dict = torch.load(model_path, map_location=device)
         policy.load_state_dict(state_dict)
         policy.eval()
-        print("   ✅ Model loaded successfully (Current Architecture)")
+        print("   [OK] Model loaded successfully (Current Architecture)")
         loaded = True
     except RuntimeError as e:
         # Check for size mismatch error which indicates legacy model
         if "size mismatch" in str(e):
-            print("   ⚠️ Architecture mismatch detected. Trying Legacy architecture...")
+            print("   [WARN] Architecture mismatch detected. Trying Legacy architecture...")
             try:
                 # Instantiate Legacy Architecture
-                policy = LegacyCNN(spec.input_shape, n_actions).to(device)
+                policy = LegacyCNN(spec.input_shape, n_actions, input_channels).to(device)
                 policy.load_state_dict(state_dict)
                 policy.eval()
-                print("   ✅ Legacy Model loaded successfully")
+                print("   [OK] Legacy Model loaded successfully")
                 loaded = True
             except Exception as e2:
-                print(f"❌ Failed to load as Legacy model: {e2}")
+                print(f"[ERROR] Failed to load as Legacy model: {e2}")
         else:
-            print(f"❌ Error loading model: {e}")
+            print(f"[ERROR] Loading model: {e}")
             
     if not loaded:
-        print("❌ Could not load model.")
+        print("[ERROR] Could not load model.")
         return
 
     # Metrics
@@ -123,53 +122,44 @@ def benchmark(
     completed_episodes = 0
     t_start = time.time()
     
-    current_rewards = np.zeros(n_envs)
-    current_food = np.zeros(n_envs)
-    current_steps = np.zeros(n_envs)
-    
-    # Track which environments have 'active' episode data
-    # (Because VecEnv might have started a new episode that we won't finish)
-    # We only count fully completed episodes.
+    current_rewards = torch.zeros(n_envs, device=device)
+    current_steps = torch.zeros(n_envs, device=device)
     
     while completed_episodes < n_episodes:
         # Get action
         with torch.no_grad():
-            obs_t = torch.from_numpy(obs).float().to(device)
+            obs_t = obs.float()
             logits = policy(obs_t)
             dist = Categorical(logits=logits)
             action = dist.sample()
             
-        action_np = action.cpu().numpy()
-        
         # Step
-        next_obs, rewards, dones = vec_env.step(action_np)
+        next_obs, rewards, dones = vec_env.step(action)
         
         # Update trackers
         current_rewards += rewards
         current_steps += 1
         
         if dones.any():
-            done_indices = np.where(dones)[0]
+            done_indices = dones.nonzero(as_tuple=True)[0]
             for idx in done_indices:
                 if completed_episodes < n_episodes:
+                    idx_item = idx.item()
                     # Record stats
-                    episode_rewards.append(current_rewards[idx])
+                    episode_rewards.append(current_rewards[idx_item].item())
                     # Get final food count from env
-                    episode_food.append(vec_env.current_episode_food[idx])
-                    episode_steps.append(current_steps[idx])
+                    episode_food.append(vec_env.last_episode_food[idx_item].item())
+                    episode_steps.append(current_steps[idx_item].item())
                     
                     # Did it die or timeout?
-                    # VecEnv dones are (energy <= 0) | (steps >= max_steps)
-                    if vec_env.agent_energy[idx] <= 0:
+                    if vec_env.agent_energy[idx_item] <= 0:
                         died_count += 1
                         
                     completed_episodes += 1
                     print(".", end="", flush=True)
             
-            # Reset done environments
-            # Reset trackers
+            # Reset trackers for done environments
             current_rewards[dones] = 0
-            current_food[dones] = 0
             current_steps[dones] = 0
             
             vec_env.reset(done_indices)
@@ -180,6 +170,7 @@ def benchmark(
     print("\n")
     
     # Results
+    import numpy as np
     avg_reward = np.mean(episode_rewards)
     std_reward = np.std(episode_rewards)
     avg_food = np.mean(episode_food)
@@ -188,10 +179,10 @@ def benchmark(
     survival_rate = (1 - (died_count / len(episode_rewards))) * 100
     
     print("="*60)
-    print(f"📊 BENCHMARK RESULTS ({completed_episodes} episodes)")
+    print(f"[RESULTS] BENCHMARK ({completed_episodes} episodes)")
     print("="*60)
-    print(f"Reward:        {avg_reward:6.1f} ± {std_reward:4.1f}")
-    print(f"Food Eaten:    {avg_food:6.1f} ± {std_food:4.1f}")
+    print(f"Reward:        {avg_reward:6.1f} +/- {std_reward:4.1f}")
+    print(f"Food Eaten:    {avg_food:6.1f} +/- {std_food:4.1f}")
     print(f"Steps Alive:   {avg_steps:6.1f} / {vec_env.max_steps}")
     print(f"Survival Rate: {survival_rate:6.1f}%")
     print(f"Throughput:    {np.sum(episode_steps) / elapsed:.0f} steps/sec")

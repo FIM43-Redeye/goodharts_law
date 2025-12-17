@@ -185,9 +185,9 @@ class TestTorchEnv(unittest.TestCase):
         self.assertEqual(obs.shape, (self.n_envs, self.spec.num_channels, self.spec.view_size, self.spec.view_size))
         self.assertEqual(obs.device.type, 'cuda')
         
-        # Check that we have agents on the grid
-        agent_mask = (env.grids == env.CellType.PREY.value) | (env.grids == env.CellType.PREDATOR.value)
-        self.assertTrue(agent_mask.any())
+        # Check that agent positions are valid (TorchVecEnv tracks agents separately, not in grid)
+        self.assertTrue((env.agent_x >= 0).all() and (env.agent_x < env.width).all())
+        self.assertTrue((env.agent_y >= 0).all() and (env.agent_y < env.height).all())
 
     def test_movement_and_energy(self):
         """Verify agents lose energy when moving."""

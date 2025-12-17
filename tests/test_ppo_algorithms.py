@@ -11,21 +11,25 @@ from goodharts.training.ppo.algorithms import compute_gae, ppo_update
 
 
 class SimplePolicy(nn.Module):
-    """Minimal policy network for testing."""
+    """Minimal policy network for testing - matches Brain interface."""
     
     def __init__(self, obs_dim=4, n_actions=8, hidden=32):
         super().__init__()
         self.fc = nn.Linear(obs_dim, hidden)
-        self.out = nn.Linear(hidden, n_actions)
+        self.fc_out = nn.Linear(hidden, n_actions)
         self._features = None
     
     def forward(self, x):
         self._features = torch.relu(self.fc(x))
-        return self.out(self._features)
+        return self.fc_out(self._features)
     
     def get_features(self, x):
-        _ = self.forward(x)
+        self._features = torch.relu(self.fc(x))
         return self._features
+    
+    def logits_from_features(self, features):
+        """Matches Brain interface - compute logits from pre-computed features."""
+        return self.fc_out(features)
 
 
 class SimpleValueHead(nn.Module):

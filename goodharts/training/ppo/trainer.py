@@ -9,22 +9,11 @@ import time
 import threading
 import numpy as np
 import torch
-
-
-
-# Note: TORCHINDUCTOR_CACHE_DIR is set in train_ppo.py before torch is imported
-# This ensures the cache persists across runs
-
-
-# Lock to serialize torch.compile() calls across threads.
-# Dynamo has global state that is not thread-safe during compilation.
-# This only affects startup; compiled models run in parallel fine.
-_COMPILE_LOCK = threading.Lock()
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.distributions import Categorical
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from goodharts.configs.default_config import get_config
@@ -32,41 +21,96 @@ from goodharts.config import get_training_config
 from goodharts.utils.device import get_device, apply_system_optimizations, is_tpu, sync_device
 from goodharts.behaviors.brains import create_brain
 from goodharts.behaviors.action_space import num_actions
-from goodharts.environments.vec_env import create_vec_env
 from goodharts.environments.torch_env import create_torch_vec_env
 from goodharts.training.train_log import TrainingLogger
+from goodharts.modes import RewardComputer
 
 from .models import Profiler, ValueHead
 from .algorithms import compute_gae, ppo_update
-from goodharts.modes import RewardComputer
+
+
+# Note: TORCHINDUCTOR_CACHE_DIR is set in train_ppo.py before torch is imported
+# This ensures the cache persists across runs
+
+# Lock to serialize torch.compile() calls across threads.
+# Dynamo has global state that is not thread-safe during compilation.
+# This only affects startup; compiled models run in parallel fine.
+_COMPILE_LOCK = threading.Lock()
 
 
 @dataclass
 class PPOConfig:
-    """Configuration for PPO training."""
+    """
+    Configuration for PPO training.
+    
+    Use PPOConfig.from_config() to load defaults from config.toml,
+    with CLI arguments as optional overrides.
+    """
     mode: str = 'ground_truth'
     brain_type: str = 'base_cnn'
     n_envs: int = 64
     total_timesteps: int = 100_000
-    lr: float = 5e-4
+    lr: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
     eps_clip: float = 0.2
     k_epochs: int = 4
     steps_per_env: int = 128
     n_minibatches: int = 4
-    entropy_coef: float = 0.0
+    entropy_coef: float = 0.01
     value_coef: float = 0.5
     output_path: str = 'models/ppo_agent.pth'
     log_to_file: bool = True
     log_dir: str = 'logs'
     use_amp: bool = False
-    compile_models: bool = True  # Set to False when training multiple models in parallel
-    tensorboard: bool = False  # Enable TensorBoard logging (works on Colab)
-    skip_warmup: bool = False  # Skip JIT warmup (use when global warmup was done)
-    use_torch_env: bool = False  # Use GPU-native TorchVecEnv (faster on powerful GPUs)
-    hyper_verbose: bool = False  # Debug mode: print at every major step
-    clean_cache: bool = False  # Delete existing compilation cache before starting
+    compile_models: bool = True
+    tensorboard: bool = False
+    skip_warmup: bool = False
+    use_torch_env: bool = True
+    hyper_verbose: bool = False
+    clean_cache: bool = False
+    
+    @classmethod
+    def from_config(cls, mode: str = 'ground_truth', **overrides) -> 'PPOConfig':
+        """
+        Create PPOConfig from config.toml with optional CLI overrides.
+        
+        Config file provides defaults; explicit kwargs override them.
+        This allows CLI args to be truly optional.
+        
+        Args:
+            mode: Training mode (ground_truth, proxy, etc.)
+            **overrides: Any PPOConfig fields to override
+            
+        Returns:
+            PPOConfig with values from config file + overrides
+        """
+        train_cfg = get_training_config()
+        
+        # Build config from file defaults
+        config_values = {
+            'mode': mode,
+            'brain_type': train_cfg.get('brain_type', 'base_cnn'),
+            'n_envs': train_cfg.get('n_envs', 64),
+            'lr': train_cfg.get('learning_rate', 3e-4),
+            'gamma': train_cfg.get('gamma', 0.99),
+            'gae_lambda': train_cfg.get('gae_lambda', 0.95),
+            'eps_clip': train_cfg.get('eps_clip', 0.2),
+            'k_epochs': train_cfg.get('k_epochs', 4),
+            'steps_per_env': train_cfg.get('steps_per_env', 128),
+            'n_minibatches': train_cfg.get('n_minibatches', 4),
+            'entropy_coef': train_cfg.get('entropy_coef', 0.01),
+            'value_coef': train_cfg.get('value_coef', 0.5),
+            'use_amp': train_cfg.get('use_amp', False),
+            'compile_models': train_cfg.get('compile_models', True),
+        }
+        
+        # Apply overrides (CLI args take precedence)
+        for key, value in overrides.items():
+            if value is not None:  # Only override if explicitly set
+                config_values[key] = value
+        
+        return cls(**config_values)
 
 
 def _vprint(msg: str, verbose: bool):
@@ -169,16 +213,11 @@ class PPOTrainer:
         self.spec = sim_config['get_observation_spec'](cfg.mode)
         n_actions = num_actions(1)
         
-        # Environment - use GPU-native TorchVecEnv if requested (works on CUDA and TPU)
-        _vprint("Creating environment...", v)
-        if cfg.use_torch_env and self.device.type in ('cuda', 'xla'):
-            self.vec_env = create_torch_vec_env(n_envs=cfg.n_envs, obs_spec=self.spec, device=self.device)
-            self._torch_env = True
-            env_type = "TorchVecEnv (TPU-native)" if is_tpu(self.device) else "TorchVecEnv (GPU-native)"
-            print(f"   Env: {env_type}")
-        else:
-            self.vec_env = create_vec_env(n_envs=cfg.n_envs, obs_spec=self.spec)
-            self._torch_env = False
+        # Environment - ALWAYS use GPU-native TorchVecEnv
+        _vprint("Creating TorchVecEnv...", v)
+        self.vec_env = create_torch_vec_env(n_envs=cfg.n_envs, obs_spec=self.spec, device=self.device)
+        env_type = "TorchVecEnv (TPU-native)" if is_tpu(self.device) else "TorchVecEnv (GPU-native)"
+        print(f"   Env: {env_type}")
         _vprint("Environment created", v)
         print(f"   View: {self.vec_env.view_size}x{self.vec_env.view_size}, Channels: {self.vec_env.n_channels}")
         
@@ -197,38 +236,10 @@ class PPOTrainer:
         # Skip on TPU - XLA uses its own JIT compilation
         with _COMPILE_LOCK:
             if cfg.compile_models and hasattr(torch, 'compile') and not is_tpu(self.device):
-                # Try to load cached compilation artifacts (skips recompilation)
-                cache_path = os.path.expanduser(f"~/.cache/torch_compile_{cfg.brain_type}_{cfg.n_envs}_{cfg.n_minibatches}.bin")
-                cache_loaded = False
-                if cfg.clean_cache and os.path.exists(cache_path):
-                    try:
-                        os.remove(cache_path)
-                        print(f"   [JIT] Cleared cache: {cache_path}", flush=True)
-                    except OSError:
-                        pass
-
-                cache_loaded = False
-                if os.path.exists(cache_path):
-                    try:
-                        import pickle
-                        with open(cache_path, 'rb') as f:
-                            cached_artifacts = pickle.load(f)
-                        torch.compiler.load_cache_artifacts(cached_artifacts)
-                        cache_loaded = True
-                        print(f"   [JIT] Loaded cached compilation artifacts", flush=True)
-                    except Exception as e:
-                        # Silently ignored by torch? We must be more aggressive.
-                        print(f"   [JIT] Cache load failed ({e}), deleting corrupted cache", flush=True)
-                        try:
-                            os.remove(cache_path)
-                        except OSError:
-                            pass
-                        torch.compiler.reset()  # Reset compiler state just in case
                 
                 # Keep references to originals in case compilation fails
                 orig_policy = self.policy
                 orig_value_head = self.value_head
-                
                 try:
                     # Note: NOT using dynamic=True because we warmup with exact batch size
                     # Fixed-shape kernels should cache properly across runs
@@ -258,7 +269,6 @@ class PPOTrainer:
                             values = self.value_head(features).squeeze(-1)
                             
                             # Compute dummy loss (triggers backward graph compilation)
-                            from torch.distributions import Categorical
                             dist = Categorical(logits=logits, validate_args=False)
                             log_probs = dist.log_prob(dummy_actions)
                             dummy_loss = -log_probs.mean() + F.mse_loss(values, dummy_returns)
@@ -273,21 +283,6 @@ class PPOTrainer:
                         
                         warmup_time = time.time() - warmup_start
                         print(f"   [JIT] Compilation complete ({warmup_time:.1f}s)", flush=True)
-                        
-                        # Save cache artifacts for next run (if not already loaded from cache)
-                        # CRITICAL: Always save if warmup took time, even if we thought we loaded a cache.
-                        # If warmup took > 5s, the loaded cache was obviously broken/incomplete.
-                        if warmup_time > 5.0:  # Only cache if compilation took a while
-                            try:
-                                artifacts = torch.compiler.save_cache_artifacts()
-                                import pickle
-                                tmp_path = cache_path + ".tmp"
-                                with open(tmp_path, 'wb') as f:
-                                    pickle.dump(artifacts, f)
-                                os.rename(tmp_path, cache_path)
-                                print(f"   [JIT] Saved compilation cache ({os.path.getsize(cache_path) // 1024}KB)", flush=True)
-                            except Exception as e:
-                                print(f"   [JIT] Warning: Could not save cache ({e})", flush=True)
                     
                 except RuntimeError as e:
                     # Fallback if compilation fails (common in complex multi-threaded setups)
@@ -418,16 +413,10 @@ class PPOTrainer:
         states = self.vec_env.reset()
         _vprint("Environment reset done", v)
         
-        # Initialize reward computer (torch-native for TorchVecEnv)
+        # Initialize reward computer
         _vprint("Initializing reward computer...", v)
-        if self._torch_env:
-            self.reward_computer.initialize(states)  # stays on GPU
-            episode_rewards = torch.zeros(cfg.n_envs, device=self.device)
-        else:
-            # CPU path: convert to tensor for component that expects tensor
-            states_t = torch.from_numpy(states).float().to(self.device)
-            self.reward_computer.initialize(states_t)
-            episode_rewards = np.zeros(cfg.n_envs)
+        self.reward_computer.initialize(states)  # stays on GPU
+        episode_rewards = torch.zeros(cfg.n_envs, device=self.device)
         _vprint("Training loop ready to start", v)
         
         # Dashboard aggregation (per-update)
@@ -458,11 +447,8 @@ class PPOTrainer:
             
             # Collect experience
             with torch.no_grad():
-                # Convert states to torch if using NumPy env
-                if self._torch_env:
-                    states_t = states.float()  # Already on device
-                else:
-                    states_t = torch.from_numpy(states).float().to(self.device)
+                # States are already tensors on device
+                states_t = states.float()
                 
                 if v:
                     _vprint(f"Step {self.total_steps}: running inference...", v)
@@ -480,107 +466,39 @@ class PPOTrainer:
             self.profiler.tick("Inference")
             
             # Environment step
-            # Environment step
-            if self._torch_env:
-                # GPU-native path: everything stays on GPU
-                # CRITICAL: Snapshot state BEFORE step because env may mutate it in-place!
-                current_states = states.clone()
-                
-                next_states, rewards, dones = self.vec_env.step(actions)
-                
-                # Compute shaped rewards (torch-native, stays on GPU)
-                shaped_rewards = self.reward_computer.compute(
-                    rewards, current_states, next_states, dones
-                )
-                
-                # Store experience as tensors
-                states_buffer.append(current_states)
-                actions_buffer.append(actions) # Actions are new tensors from sampling
-                log_probs_buffer.append(log_probs.detach())
-                rewards_buffer.append(shaped_rewards) # Rewards are usually new tensors
-                dones_buffer.append(dones.clone()) # Dones might be reused, but usually new. Clone to be safe?
-                values_buffer.append(values)
-                
-                self.total_steps += cfg.n_envs
-                episode_rewards += rewards  # Tensor addition
-            else:
-                # NumPy path (deprecated, kept for VecEnv compatibility)
-                actions_np = actions.cpu().numpy()
-                next_states, rewards, dones = self.vec_env.step(actions_np)
-                
-                # Convert to tensors for reward computation
-                rewards_t = torch.from_numpy(rewards).float().to(self.device)
-                states_t = torch.from_numpy(states).float().to(self.device)
-                next_states_t = torch.from_numpy(next_states).float().to(self.device)
-                dones_t = torch.from_numpy(dones).to(self.device)
-                
-                shaped_rewards = self.reward_computer.compute(
-                    rewards_t, states_t, next_states_t, dones_t
-                )
-                
-                # Store as tensors (unified path)
-                states_buffer.append(states_t)
-                actions_buffer.append(actions)  # Keep original tensor on device!
-                log_probs_buffer.append(log_probs.detach())
-                rewards_buffer.append(shaped_rewards)
-                dones_buffer.append(dones_t)
-                values_buffer.append(values)
-                
-                self.total_steps += cfg.n_envs
-                episode_rewards += rewards
+            # GPU-native path: everything stays on GPU
+            # CRITICAL: Snapshot state BEFORE step because env may mutate it in-place!
+            current_states = states.clone()
+            
+            next_states, rewards, dones = self.vec_env.step(actions)
+            
+            # Compute shaped rewards (torch-native, stays on GPU)
+            shaped_rewards = self.reward_computer.compute(
+                rewards, current_states, next_states, dones
+            )
+            
+            # Store experience as tensors
+            states_buffer.append(current_states)
+            actions_buffer.append(actions) # Actions are new tensors from sampling
+            log_probs_buffer.append(log_probs.detach())
+            rewards_buffer.append(shaped_rewards) # Rewards are usually new tensors
+            dones_buffer.append(dones.clone()) # Dones might be reused, but usually new. Clone to be safe?
+            values_buffer.append(values)
+            
+            self.total_steps += cfg.n_envs
+            episode_rewards += rewards  # Tensor addition
+            
             self.profiler.tick("Env Step")
             
             # Track episode stats (defer logging to avoid Sync)
-            if self._torch_env:
-                # Accumulate rewards
-                # episode_rewards += rewards (already done above)
-                
-                # Snapshot current state for logging
-                # We store full tensors to avoid boolean indexing syncs
-                finished_dones_buffer.append(dones)
-                finished_rewards_buffer.append(episode_rewards.clone())
-                
-                # Reset rewards for done agents (Sync-free)
-                # episode_rewards = episode_rewards * (1 - dones)
-                episode_rewards *= (~dones)
-                
-            else:
-                # CPU path - legacy logic
-                done_indices = torch.where(dones_t)[0]
-                if len(done_indices) > 0:
-                    done_rewards = episode_rewards[done_indices].cpu().numpy()
-                    done_food = np.array([self.vec_env.last_episode_food[i] for i in done_indices.cpu().numpy()])
-                    done_poison = np.array([self.vec_env.last_episode_poison[i] for i in done_indices.cpu().numpy()])
-                    
-                    for j, i in enumerate(done_indices.cpu().numpy()):
-                        self.episode_count += 1
-                        r, f, p = float(done_rewards[j]), int(done_food[j]), int(done_poison[j])
-                        
-                        update_episodes_count += 1
-                        update_reward_sum += r
-                        update_food_sum += f
-                        update_poison_sum += p
-                        
-                        if r > self.best_reward:
-                            self.best_reward = r
-                        
-                        if self.logger:
-                            grid_id = self.vec_env.grid_indices[i]
-                            food_density = self.vec_env.grid_food_counts[grid_id]
-                            avg_food = (self.min_food + self.max_food) / 2
-                            self.logger.log_episode(
-                                episode=self.episode_count,
-                                reward=r,
-                                length=500,
-                                food_eaten=f,
-                                poison_eaten=p,
-                                food_density=food_density,
-                                curriculum_progress=(avg_food - self.min_food) / (self.max_food - self.min_food + 1e-8),
-                                action_prob_std=0.0,
-                            )
-                        
-                        episode_rewards[i] = 0.0
-
+            # Snapshot current state for logging
+            # We store full tensors to avoid boolean indexing syncs
+            finished_dones_buffer.append(dones)
+            finished_rewards_buffer.append(episode_rewards.clone())
+            
+            # Reset rewards for done agents (Sync-free)
+            # episode_rewards = episode_rewards * (1 - dones)
+            episode_rewards *= (~dones)
             
             states = next_states
             
@@ -588,16 +506,13 @@ class PPOTrainer:
             if len(states_buffer) >= cfg.steps_per_env:
                 self.profiler.tick("Collection")
                 
-                # Get bootstrap value (keep on GPU for torch path)
+                # Get bootstrap value (keep on GPU)
                 with torch.no_grad():
-                    if self._torch_env:
-                        states_t = states.float()
-                    else:
-                        states_t = torch.from_numpy(states).float().to(self.device)
+                    states_t = states.float()
                     features = self.policy.get_features(states_t)
                     next_value = self.value_head(features).squeeze(-1)
                 
-                # Compute GAE - unified function handles both numpy and torch
+                # Compute GAE
                 advantages, returns = compute_gae(
                     rewards_buffer, values_buffer, dones_buffer,
                     next_value, cfg.gamma, cfg.gae_lambda, device=self.device
@@ -605,7 +520,7 @@ class PPOTrainer:
                 self.profiler.tick("GAE Calc")
                 
                 # PROCESS LOGGING (Batch Sync)
-                if self._torch_env:
+                if True: # Always runs now
                     # Stack buffers (steps, envs)
                     all_step_dones = torch.stack(finished_dones_buffer)
                     all_step_rewards = torch.stack(finished_rewards_buffer)

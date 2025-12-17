@@ -67,6 +67,21 @@ class Brain(Protocol):
             Feature tensor of shape (batch, hidden_size)
         """
         ...
+    
+    def logits_from_features(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Compute action logits from pre-computed features.
+        
+        This enables PPO to compute features once and reuse them for both
+        action logits and value estimation, avoiding duplicate forward passes.
+        
+        Args:
+            features: Feature tensor from get_features(), shape (batch, hidden_size)
+        
+        Returns:
+            Action logits of shape (batch, output_size)
+        """
+        ...
 
 
 # =============================================================================

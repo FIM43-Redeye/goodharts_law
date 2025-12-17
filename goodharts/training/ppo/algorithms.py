@@ -124,8 +124,10 @@ def ppo_update(
             mb_old_values = old_values_d[mb_inds]
             
             with autocast(device_type=device_type, enabled=use_amp):
-                logits = policy(mb_states)
+                # CRITICAL: Compute features ONCE and reuse for both logits and values
+                # Using interface method keeps this architecture-agnostic
                 features = policy.get_features(mb_states)
+                logits = policy.logits_from_features(features)
                 values = value_head(features).squeeze()
                 
                 dist = Categorical(logits=logits, validate_args=False)

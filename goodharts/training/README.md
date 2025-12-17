@@ -274,7 +274,6 @@ device = "cuda"
 | `ppo/trainer.py` | PPOTrainer class - main training loop |
 | `ppo/algorithms.py` | GAE computation & PPO update functions |
 | `ppo/models.py` | ValueHead, Profiler utilities |
-| `reward_shaping.py` | Potential-based reward shaping |
 | `train_dashboard.py` | Multi-mode live visualization |
 | `train_log.py` | Structured CSV/JSON logging |
 | `collect.py` | Expert demonstration collection |

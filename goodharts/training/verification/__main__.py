@@ -20,13 +20,13 @@ def check_gpu():
     print("=" * 60)
     
     if torch.cuda.is_available():
-        print(f"✓ CUDA available")
+        print(f"[OK] CUDA available")
         print(f"  Device count: {torch.cuda.device_count()}")
         for i in range(torch.cuda.device_count()):
             print(f"  Device {i}: {torch.cuda.get_device_name(i)}")
         print(f"  Current device: {torch.cuda.current_device()}")
     else:
-        print("✗ CUDA not available")
+        print("[X] CUDA not available")
         if hasattr(torch.version, 'hip') and torch.version.hip:
             print(f"  (ROCm detected: {torch.version.hip})")
         print("  Training will use CPU")
@@ -65,12 +65,11 @@ def main():
     
     # Final verdict
     if gt_acc >= 0.75:
-        print("✓ Models appear to be trained correctly")
+        print("[OK] Models appear to be trained correctly")
         print("  Run 'python main.py --learned' for visual demo")
     else:
-        print("⚠ Models may need retraining")
+        print("[WARN] Models may need retraining")
         print("  Run 'python -m goodharts.training.train_ppo --mode both --epochs 100'")
-
 
 if __name__ == "__main__":
     main()

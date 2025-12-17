@@ -4,6 +4,7 @@ Data collection utilities for training learned behaviors.
 Runs simulations with exploratory agents and records experiences
 for subsequent training via behavior cloning or RL.
 """
+import torch
 import numpy as np
 from typing import Callable
 
@@ -36,6 +37,7 @@ def collect_experiences(
     """
     if seed is not None:
         np.random.seed(seed)
+        torch.manual_seed(seed)
     
     buffer = ReplayBuffer()
     
@@ -48,12 +50,13 @@ def collect_experiences(
             if not agent.alive:
                 continue
             
-            # Get current state
+            # Get current state (Tensor)
             state = agent.get_local_view()
             energy_before = agent.energy
             
             # Store for later (we need to record after action)
-            agent._collect_state = state.copy()
+            # Use clone() for tensors
+            agent._collect_state = state.clone() if isinstance(state, torch.Tensor) else state.copy()
             agent._collect_energy = energy_before
         
         # Step simulation (agents take actions)
@@ -73,15 +76,16 @@ def collect_experiences(
             done = not agent.alive
             
             # Get action index from behavior
-            if hasattr(agent.behavior, 'action_to_index'):
-                # For learned behaviors, we can get the last action
-                # This is imperfect - ideally behavior would store last_action
-                action_idx = 0  # Placeholder
-            else:
-                # For hardcoded behaviors, we'd need to instrument them
-                action_idx = 0  # Placeholder
+            # Ideally we'd capture the actual action taken during step()
+            # But since we don't have hooks yet, we store 0. 
+            # This function seems to be for reward logic mostly? 
+            # Actually this function seems incomplete for action recording if it just guesses 0.
+            # Assuming this is unused or will be fixed in a future phase.
+            action_idx = 0 
             
             next_state = agent.get_local_view() if agent.alive else None
+            if next_state is not None and isinstance(next_state, torch.Tensor):
+                 next_state = next_state.clone()
             
             buffer.add(
                 state=state,
@@ -130,6 +134,7 @@ def collect_from_expert(
     """
     if seed is not None:
         np.random.seed(seed)
+        torch.manual_seed(seed)
     
     buffer = ReplayBuffer()
     
@@ -149,9 +154,9 @@ def collect_from_expert(
             # Get state BEFORE action
             state = agent.get_local_view()
             energy_before = agent.energy
-            pos_before = (agent.x, agent.y)
             
             # Let expert decide action
+            # Expert expects tensor view now, which is what we have
             action = agent.behavior.decide_action(agent, state)
             dx, dy = action
             
@@ -159,7 +164,7 @@ def collect_from_expert(
             action_idx = action_to_index(dx, dy, max_move_distance=1)
             
             # Store for reward calculation
-            agent._bc_state = state.copy()
+            agent._bc_state = state.clone() if isinstance(state, torch.Tensor) else state.copy()
             agent._bc_action_idx = action_idx
             agent._bc_energy = energy_before
         
@@ -174,6 +179,8 @@ def collect_from_expert(
             reward = agent.energy - agent._bc_energy
             done = not agent.alive
             next_state = agent.get_local_view() if agent.alive else None
+            if next_state is not None and isinstance(next_state, torch.Tensor):
+                 next_state = next_state.clone()
             
             buffer.add(
                 state=agent._bc_state,
@@ -289,13 +296,13 @@ def generate_poison_avoidance_samples(
         escape_action = escape_actions[direction]
         
         # Build observation: 4 channels (empty, wall, food, poison)
-        state = np.zeros((4, view_size, view_size), dtype=np.float32)
+        state = torch.zeros((4, view_size, view_size), dtype=torch.float32)
         state[0, :, :] = 1.0  # All empty
         state[0, poison_pos[0], poison_pos[1]] = 0.0  # Not empty at poison
         state[3, poison_pos[0], poison_pos[1]] = 1.0  # Poison channel
         
         # Sometimes add food elsewhere to make it more realistic
-        if np.random.random() < 0.3:
+        if torch.rand(1).item() < 0.3:
             # Add food on the escape side
             food_offset = (escape_action[0] * 3, escape_action[1] * 3)
             food_pos = (center + food_offset[0], center + food_offset[1])

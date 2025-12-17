@@ -2,14 +2,14 @@
 Simulation orchestrator for Goodhart's Law demonstration.
 
 Manages the valid vectorized environment and agents.
-Refactored to use VecEnv (with shared_grid=True) replacing the legacy World/Organism.
+Refactored to use TorchVecEnv (with shared_grid=True) replacing the legacy World/Organism.
 """
+import torch
 from goodharts.behaviors.learned import LEARNED_PRESETS
-from goodharts.environments.vec_env import create_vec_env
+from goodharts.environments import create_vec_env
 from goodharts.behaviors import get_behavior, create_learned_behavior
 from goodharts.utils.logging_config import get_logger
 from goodharts.modes import ObservationSpec, get_mode_for_requirement
-import numpy as np
 
 
 logger = get_logger("simulation")
@@ -36,15 +36,15 @@ class AgentWrapper:
 
     @property
     def x(self):
-        return self.vec_env.agent_x[self.idx]
+        return self.vec_env.agent_x[self.idx].item()
     
     @property
     def y(self):
-        return self.vec_env.agent_y[self.idx]
+        return self.vec_env.agent_y[self.idx].item()
         
     @property
     def energy(self):
-        return self.vec_env.agent_energy[self.idx]
+        return self.vec_env.agent_energy[self.idx].item()
         
     @property
     def alive(self):
@@ -55,25 +55,16 @@ class AgentWrapper:
 
     def get_observation(self):
         # Helper mostly for brain viz getting scalars
-        # We can reconstruct what Organism.get_observation returned if needed
-        # But mostly we need specific channels
-        
-        # We will need to mock Observation if dependent. 
-        # For now, just return a dummy if needed, but behaviors use get_local_view which we provide.
         pass
 
-    def get_local_view(self, mode: str | None = None) -> np.ndarray:
+    def get_local_view(self, mode: str | None = None):
         # This is inefficient if called individually (re-extracts entire batch).
         # Should be used sparingly (e.g. brain visualizer).
         # For main loop, we use batch extraction.
         
         # We need to trigger the full batch extraction
         all_obs = self.vec_env._get_observations()
-        # But we need to filter for the specific mode...
-        # VecEnv only supports ONE ObsSpec (one set of channels).
-        # We assume VecEnv was initialized with a superset of channels needed?
-        # Or we rely on VecEnv ObsSpec matching the agent requirements?
-        # In Shared World, all agents share the ObsSpec.
+        # Returns Tensor (C, H, W) on device
         return all_obs[self.idx]
 
 
@@ -90,8 +81,9 @@ class Simulation:
     """
     
     def __init__(self, config: dict):
-        logger.info("Initializing Simulation (Vectorized)")
+        logger.info("Initializing Simulation (Vectorized - PyTorch)")
         self.config: dict = config
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # 1. Setup Agents Configuration
         agents_setup = []
@@ -110,6 +102,8 @@ class Simulation:
             for _ in range(count):
                 if b_class_name in LEARNED_PRESETS:
                     behavior = create_learned_behavior(b_class_name, **behavior_kwargs)
+                    if hasattr(behavior, 'agent'):
+                        behavior.agent.to(self.device)
                 else:
                     BehaviorClass = get_behavior(b_class_name)
                     behavior = BehaviorClass(**behavior_kwargs)
@@ -124,14 +118,11 @@ class Simulation:
         num_agents = len(behaviors)
         
         # 2. Initialize VecEnv
-        # We need an ObservationSpec that covers all agents?
-        # For now, we pick a default or 'ground_truth' which usually covers everything.
-        # Or better: Union of requirements?
-        # Simpler: 'ground_truth' mode spec usually has all channels.
         req = 'ground_truth'
         mode = get_mode_for_requirement(req, config)
         spec = ObservationSpec.for_mode(mode, config)
         
+        # Uses TorchVecEnv via the updated import
         self.vec_env = create_vec_env(
             n_envs=num_agents, 
             obs_spec=spec, 
@@ -150,14 +141,14 @@ class Simulation:
         self.stats = {
             'deaths': [],  # list of {'step': int, 'id': int, 'reason': str}
             'energy_history': {a.id: [] for a in self.agents},
-            'heatmap': {'all': np.zeros((self.vec_env.height, self.vec_env.width))},
+            'heatmap': {'all': torch.zeros((self.vec_env.height, self.vec_env.width), device=self.device)},
             'suspicion_history': {a.id: [] for a in self.agents}
         }
         
     @property
     def world(self):
         # For backward compatibility with visualizer
-        return self # We expose 'width', 'height', 'grid' directly?
+        return self 
         
     @property
     def width(self):
@@ -170,13 +161,17 @@ class Simulation:
     @property
     def grid(self):
         # Visualization expects a grid
+        # Return cpu numpy for now to avoid breaking visualizer?
+        # Or return tensor and let others handle it?
+        # existing code: grids[0]
+        # TorchEnv grids is (N, H, W)
         return self.vec_env.grids[0]
 
     def step(self):
         """Advance simulation by one timestep."""
         self.step_count += 1
         
-        # 1. Get Observations (Vectorized)
+        # 1. Get Observations (Vectorized Tensor)
         obs_batch = self.vec_env._get_observations() # (N, C, H, W)
         
         # 2. Decide Actions (Loop over behaviors)
@@ -184,11 +179,10 @@ class Simulation:
         for i, agent in enumerate(self.agents):
             try:
                 # AgentWrapper passes itself as 'agent'
-                # Obs is (C, H, W)
+                # Obs is (C, H, W) tensor
                 dx, dy = agent.behavior.decide_action(agent, obs_batch[i])
                 
                 # Convert (dx, dy) to action index for VecEnv
-                # We assume behavior uses same Action Space logic
                 from goodharts.behaviors.action_space import action_to_index
                 action_idx = action_to_index(dx, dy)
                 actions.append(action_idx)
@@ -196,24 +190,41 @@ class Simulation:
                 logger.error(f"Error in agent {i} decide_action: {e}")
                 actions.append(0) # No-Op
         
-        actions_np = np.array(actions, dtype=np.int32)
+        actions_tensor = torch.tensor(actions, dtype=torch.int32, device=self.vec_env.device)
         
         # 3. Step VecEnv
-        # returns next_obs, rewards, dones
-        _, rewards, dones = self.vec_env.step(actions_np)
+        # returns next_obs, rewards, dones (all tensors)
+        _, rewards, dones = self.vec_env.step(actions_tensor)
         
         # 4. Process Events (Deaths, Stats)
+        # We iterate to log events - might be slow for huge N, but fine for sim viz
+        # Move relevant tensors to CPU once if needed, or index scalar
+        
+        # Accessing single scalars from CUDA tensor is slow due to synchronization
+        # But for 'simulation mode' (visualized), we tolerate it.
+        # For training mode, we wouldn't use this class (Trainer uses VecEnv directly).
+        
+        rewards_cpu = rewards.cpu().numpy()
+        dones_cpu = dones.cpu().numpy()
+        
+        # Helper to get energy efficiently? 
+        # Actually agent.energy accesses .item() which syncs.
+        
         for i, agent in enumerate(self.agents):
             # Check for death/reset
-            if dones[i]:
-                # Infer reason from reward
-                # Poison penalty is -10, death penalty adds -10, so poisoned death ~ -20
-                if rewards[i] <= -15:
+            if dones_cpu[i]:
+                current_energy = agent.energy # This is post-reset (so it's full)
+                # We need PRE-reset energy to know if it starved.
+                # But VecEnv auto-resets.
+                # If reward was very negative, it was poison or starvation.
+                
+                # Poison penalty is -10 (plus move cost), death -10.
+                if rewards_cpu[i] <= -15:
                     reason = "Poisoned"
-                elif agent.energy <= 0:
+                elif rewards_cpu[i] <= -9: # Death penalty
                     reason = "Starvation"
                 else:
-                    reason = "Old Age"
+                    reason = "Old Age" # Not really implemented yet
                 
                 # Log death
                 b_name = str(agent.behavior)
@@ -233,32 +244,29 @@ class Simulation:
                  self.stats['energy_history'][agent.id] = []
             self.stats['energy_history'][agent.id].append(agent.energy)
             
-            # Suspicion (NOT tracked by VecEnv, logic was in Organism)
-            # We skip suspicion for now or need to reimplement logic?
-            # It required checking Proxy vs Ground Truth.
-            # Skipping for efficiency unless critical.
-            
-            # Update Heatmap
+            # Update Heatmap (Torch tensors on device)
             # Global heatmap
             self.stats['heatmap']['all'][agent.y, agent.x] += 1
             
-            # Per-behavior heatmap (initialize lazily)
+            # Per-behavior heatmap
             b_name = str(agent.behavior)
             if b_name.startswith('<'):
                 b_name = type(agent.behavior).__name__
             
             if b_name not in self.stats['heatmap']:
-                self.stats['heatmap'][b_name] = np.zeros((self.vec_env.height, self.vec_env.width))
+                self.stats['heatmap'][b_name] = torch.zeros((self.vec_env.height, self.vec_env.width), device=self.device)
             self.stats['heatmap'][b_name][agent.y, agent.x] += 1
 
         if self.step_count % 100 == 0:
             logger.info(f"Completed step {self.step_count}. Agents running: {len(self.agents)}")
 
-    def get_render_grid(self) -> np.ndarray:
+    def get_render_grid(self):
         """
         Get the environmental grid for rendering (no agent overlay).
+        Converts to NumPy for matplotlib compatibility.
         """
-        return self.vec_env.grids[0].copy()
+        import numpy as np
+        return self.vec_env.grids[0].cpu().numpy().copy()
     
     def get_agent_positions(self) -> list[tuple[int, int, tuple[int, int, int]]]:
         """
