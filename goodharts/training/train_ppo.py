@@ -121,6 +121,7 @@ def train_ppo(
             skip_warmup=kwargs.get('skip_warmup', False),
             use_torch_env=kwargs.get('use_torch_env', False),
             hyper_verbose=kwargs.get('hyper_verbose', False),
+            clean_cache=kwargs.get('clean_cache', False),
         )
         
         trainer = PPOTrainer(config, dashboard=dashboard)
@@ -183,6 +184,8 @@ def main():
                         help='Use GPU-native TorchVecEnv (faster on powerful GPUs)')
     parser.add_argument('--hyper-verbose', action='store_true',
                         help='Debug mode: print at every major step (for TPU debugging)')
+    parser.add_argument('--clean-cache', action='store_true',
+                        help='Delete existing compilation cache before starting')
     args = parser.parse_args()
     
     # Determine steps_per_env for update calculation
@@ -264,6 +267,7 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
                     use_torch_env=args.torch_env,
                     hyper_verbose=args.hyper_verbose,
                     skip_warmup=not compile_models,  # Skip warmup when --no-warmup
+                    clean_cache=args.clean_cache,
                 )
         
         t = threading.Thread(target=sequential_training, daemon=True)
@@ -300,6 +304,7 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
                     'n_minibatches': n_minibatches,
                     'tensorboard': args.tensorboard,
                     'skip_warmup': True,
+                    'clean_cache': args.clean_cache,
                     'use_torch_env': args.torch_env,
                     'hyper_verbose': args.hyper_verbose,
                 },
@@ -346,6 +351,7 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
                     'n_minibatches': n_minibatches,
                     'tensorboard': args.tensorboard,
                     'skip_warmup': True,
+                    'clean_cache': args.clean_cache,
                     'use_torch_env': args.torch_env,
                     'hyper_verbose': args.hyper_verbose,
                 }
@@ -376,6 +382,7 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
                 use_torch_env=args.torch_env,
                 hyper_verbose=args.hyper_verbose,
                 skip_warmup=not compile_models,  # Skip warmup when --no-warmup
+                clean_cache=args.clean_cache,
             )
 
 

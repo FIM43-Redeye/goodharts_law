@@ -22,7 +22,9 @@ def _build_action_deltas(device: torch.device) -> torch.Tensor:
     actions = build_action_space(1)  # Get action list
     deltas = []
     for action in actions:
-        if hasattr(action, 'dx') and hasattr(action, 'dy'):
+        if isinstance(action, (tuple, list)) and len(action) >= 2:
+            deltas.append([action[0], action[1]])
+        elif hasattr(action, 'dx') and hasattr(action, 'dy'):
             deltas.append([action.dx, action.dy])
         else:
             deltas.append([0, 0])  # No-op or unknown
@@ -301,7 +303,11 @@ class TorchVecEnv:
         self.dones = (self.agent_energy <= 0) | (self.agent_steps >= self.max_steps)
         
         # Death penalty
-        rewards = torch.where(self.dones, rewards - 10.0, rewards)
+        # Death penalty (ONLY for starvation, not timeout)
+        rewards = torch.where(self.agent_energy <= 0, rewards - 10.0, rewards)
+        
+        # Movement cost (living penalty) - crucial for sparse reward learning!
+        rewards -= self.energy_move_cost
         
         # Save dones before reset
         dones_to_return = self.dones.clone()
@@ -314,7 +320,7 @@ class TorchVecEnv:
         return self._get_observations(), rewards, dones_to_return
     
     def _eat_batch(self) -> torch.Tensor:
-        """Fully vectorized eating logic - minimizes GPU syncs."""
+        """Fully vectorized eating logic - minimized syncs (no .any() checks)."""
         rewards = torch.zeros(self.n_envs, dtype=torch.float32, device=self.device)
         
         # Get cell values at agent positions (vectorized)
@@ -322,58 +328,121 @@ class TorchVecEnv:
         agent_x_long = self.agent_x.long()
         cell_values = self.grids[self.grid_indices, agent_y_long, agent_x_long]
         
-        # Food - process without syncing count
+        # Food - unconditional execution with masking (avoids .any() sync)
         food_mask = (cell_values == self.CellType.FOOD.value)
-        if food_mask.any():
-            rewards[food_mask] += self.food_reward
-            self.agent_energy[food_mask] += self.food_reward
-            self.current_episode_food[food_mask] += 1
-            
-            # Clear eaten food (vectorized)
-            self.grids[self.grid_indices[food_mask], agent_y_long[food_mask], agent_x_long[food_mask]] = self.CellType.EMPTY.value
-            
-            # Respawn food - pass mask and let it compute count on GPU
-            self._respawn_items_vectorized(food_mask, self.CellType.FOOD.value)
         
-        # Poison - process without syncing count
+        # Apply food effects masked
+        rewards = torch.where(food_mask, rewards + self.food_reward, rewards)
+        
+        # Only update energy/count where food was eaten
+        # We can use index_addish logic or just masked update since we have per-agent state
+        self.agent_energy = torch.where(food_mask, self.agent_energy + self.food_reward, self.agent_energy)
+        self.current_episode_food = torch.where(food_mask, self.current_episode_food + 1, self.current_episode_food)
+        
+        # Clear eaten food (mask write)
+        # We need grid_indices for scatter
+        # scatter_ or index_put_ works with masks?
+        # grids[ind, y, x] = val works with boolean mask indexing, but that causes sync for indices?
+        # No, grids[...] = val is purely GPU if indices are GPU tensors.
+        # But `grids[grid_indices[food_mask], ...]` creates dynamic shape -> sync?
+        # YES. `grid_indices[food_mask]` is dynamic shape.
+        # FIX: Use `torch.where` on the WHOLE grid update? Too expensive (copy whole grid).
+        # Better: masked_scatter?
+        # Actually, `self.grids[self.grid_indices, agent_y_long, agent_x_long] = selected_vals`
+        # We can construct the "new value" for the cell:
+        # new_val = where(food_mask, EMPTY, old_val)
+        # Then write back to ALL agent positions.
+        # (Overwriting non-food cells with themselves is fine/identity).
+        
+        new_cell_values = torch.where(food_mask, torch.tensor(self.CellType.EMPTY.value, device=self.device, dtype=torch.float32), cell_values)
+        self.grids[self.grid_indices, agent_y_long, agent_x_long] = new_cell_values
+        
+        # Respawn food - pass mask, internal logic must be sync-free
+        self._respawn_items_vectorized(food_mask, self.CellType.FOOD.value)
+        
+        # Poison - same pattern
+        # Re-read cell values? No, we just updated them to empty if food.
+        # If it was poison, it wasn't food, so it's still poison in 'new_cell_values'?
+        # Wait, if we overwrote with new_cell_values, we need to base poison check on ORIGINAL cell_values.
+        
         poison_mask = (cell_values == self.CellType.POISON.value)
-        if poison_mask.any():
-            rewards[poison_mask] -= self.poison_penalty
-            self.agent_energy[poison_mask] -= self.poison_penalty
-            self.current_episode_poison[poison_mask] += 1
-            
-            # Clear eaten poison (vectorized)
-            self.grids[self.grid_indices[poison_mask], agent_y_long[poison_mask], agent_x_long[poison_mask]] = self.CellType.EMPTY.value
-            
-            # Respawn poison
-            self._respawn_items_vectorized(poison_mask, self.CellType.POISON.value)
+        
+        rewards = torch.where(poison_mask, rewards - self.poison_penalty, rewards)
+        self.agent_energy = torch.where(poison_mask, self.agent_energy - self.poison_penalty, self.agent_energy)
+        self.current_episode_poison = torch.where(poison_mask, self.current_episode_poison + 1, self.current_episode_poison)
+        
+        # Clear poison (if eaten)
+        # Update our local 'new_cell_values' to reflect poison removal too
+        # If it was poison, become EMPTY. Else keep what it was (EMPTY or WALL etc)
+        # Note: 'new_cell_values' currently has EMPTY where food was, and ORIGINAL where food wasn't.
+        # We want to apply poison clearing on top.
+        
+        final_cell_values = torch.where(poison_mask, torch.tensor(self.CellType.EMPTY.value, device=self.device, dtype=torch.float32), new_cell_values)
+        
+        # Write back (updates both food and poison removals in one go)
+        self.grids[self.grid_indices, agent_y_long, agent_x_long] = final_cell_values
+        
+        self._respawn_items_vectorized(poison_mask, self.CellType.POISON.value)
         
         return rewards
     
     def _respawn_items_vectorized(self, eaten_mask: torch.Tensor, cell_type: int):
-        """Fully vectorized respawn - no Python loops, minimal GPU syncs."""
-        # eaten_mask has True for each agent that ate an item of this type
-        # We respawn one item per True in the mask
-        # The mask size is known (n_envs), so we can use it directly
+        """
+        Fully vectorized respawn - shape-static-ish (masked) to avoid ghosts.
+        Uses nonzero() for writing but avoids CPU syncs (no shape checks).
+        """
+        # grid_ids: We use self.grid_indices directly (static shape N_envs)
+        N = self.n_envs
+        K = 20 # Reduced from 100 (sufficient for 99% success)
         
-        # Get grid assignments for agents that ate
-        grid_ids = self.grid_indices[eaten_mask]
-        n_eaten = grid_ids.shape[0]  # This is a tensor shape, not a sync
+        # Generate K candidates for ALL envs: (N, K)
+        rand_y = torch.randint(0, self.height, (N, K), device=self.device)
+        rand_x = torch.randint(0, self.width, (N, K), device=self.device)
         
-        if n_eaten == 0:
-            return
+        # Check candidates
+        grid_read_ids = self.grid_indices.unsqueeze(1)
+        vals = self.grids[grid_read_ids, rand_y, rand_x]
         
-        # Generate random positions for all eaten items at once
-        rand_y = torch.randint(0, self.height, (n_eaten,), device=self.device)
-        rand_x = torch.randint(0, self.width, (n_eaten,), device=self.device)
+        # Find valid (empty) spots
+        is_empty = (vals == self.CellType.EMPTY.value)  # (N, K) bool
         
-        # Check which positions are empty and place items there
-        # If a position is not empty, we skip it (acceptable for performance)
-        current_vals = self.grids[grid_ids, rand_y, rand_x]
-        empty_positions = (current_vals == self.CellType.EMPTY.value)
+        # Select first valid candidate (argmax returns index of first True)
+        first_valid_idx = is_empty.int().argmax(dim=1)  # (N,) indices in [0, K-1]
         
-        # Place items only at empty positions
-        self.grids[grid_ids[empty_positions], rand_y[empty_positions], rand_x[empty_positions]] = cell_type
+        # Check validity (did we find ANY?)
+        # Efficient check: gather the value at the chosen index
+        range_n = torch.arange(N, device=self.device)
+        
+        # Extract chosen coords
+        chosen_y = rand_y[range_n, first_valid_idx]
+        chosen_x = rand_x[range_n, first_valid_idx]
+        
+        # Verify if the chosen candidate is valid
+        # We need to re-check 'is_empty' at the chosen index
+        # Or implicitly: has_valid = is_empty.any(dim=1)
+        has_valid = is_empty.any(dim=1) # (N,) bool
+        
+        # FINAL WRITE MASK
+        # We write IF:
+        # 1. It was eaten (eaten_mask)
+        # 2. We found a valid spot (has_valid)
+        do_write = eaten_mask & has_valid
+        
+        # Sync-free Write:
+        # Use nonzero() to get indices, but DO NOT READ size on CPU.
+        # Just use the result for advanced indexing.
+        # This keeps execution on GPU.
+        
+        write_indices = do_write.nonzero(as_tuple=True)[0]
+        
+        # Advanced indexing with tensors filter writes to only valid items
+        # grids[grid_ids[idx], y[idx], x[idx]] = val
+        
+        target_grids = self.grid_indices[write_indices]
+        target_y = chosen_y[write_indices]
+        target_x = chosen_x[write_indices]
+        
+        self.grids[target_grids, target_y, target_x] = float(cell_type)
     
     def _get_observations(self) -> torch.Tensor:
         """Get batched observations (fully vectorized on GPU)."""

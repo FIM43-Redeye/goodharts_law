@@ -53,6 +53,33 @@ class UpdateLog:
             self.timestamp = datetime.now().isoformat()
 
 
+
+class ExtendedJSONEncoder(json.JSONEncoder):
+    """JSON Encoder that handles NumPy and PyTorch types."""
+    def default(self, obj):
+        try:
+            import numpy as np
+            if isinstance(obj, (np.integer, np.int64, np.int32)):
+                return int(obj)
+            if isinstance(obj, (np.floating, np.float32, np.float64)):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+        except ImportError:
+            pass
+        
+        try:
+            import torch
+            if isinstance(obj, torch.Tensor):
+                if obj.numel() == 1:
+                    return obj.item()
+                return obj.tolist()
+        except ImportError:
+            pass
+            
+        return super().default(obj)
+
+
 class TrainingLogger:
     """
     Structured logging for training runs.
@@ -179,8 +206,8 @@ class TrainingLogger:
         )
         
         row = asdict(log)
-        # Convert list to string for CSV
-        row['action_probs'] = json.dumps(action_probs)
+        # Convert list to string for CSV - safe with ExtendedJSONEncoder
+        row['action_probs'] = json.dumps(action_probs, cls=ExtendedJSONEncoder)
         self._append_csv(self.updates_path, row)
     
     def finalize(self, best_efficiency: float, final_model_path: str):
@@ -207,7 +234,7 @@ class TrainingLogger:
         }
         
         with open(self.summary_path, 'w') as f:
-            json.dump(summary, f, indent=2)
+            json.dump(summary, f, indent=2, cls=ExtendedJSONEncoder)
         
         print(f"Training summary: {self.summary_path}")
         return summary
