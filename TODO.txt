@@ -65,7 +65,7 @@ The cool stuff! Can agents discover deceptive strategies on their own?
 
 ### High Priority
 - [x] Add validation episodes to RL training (periodic eval without exploration)
-- [ ] Make dropout/weight_decay configurable in TOML
+- [?] Make dropout/weight_decay configurable in TOML (Likely unnecessary)
 
 ### Performance Optimizations
 - [ ] Staggered multi-mode training for better GPU utilization

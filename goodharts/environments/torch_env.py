@@ -87,6 +87,18 @@ class TorchVecEnv:
         self.n_channels = obs_spec.num_channels
         self.channel_names = obs_spec.channel_names
         
+        # Mode-aware observation encoding
+        # Detect proxy mode: uses 'interestingness' instead of cell-type one-hot
+        self.is_proxy_mode = 'interestingness' in self.channel_names
+        
+        # Build interestingness lookup table: cell_value -> interestingness
+        # Used for proxy mode observations
+        cell_types = CellType.all_types()
+        n_cell_types = len(cell_types)
+        self._interestingness_lut = torch.zeros(n_cell_types, dtype=torch.float32, device=device)
+        for ct in cell_types:
+            self._interestingness_lut[ct.value] = ct.interestingness
+        
         # Agent settings
         self.initial_energy = config.get('ENERGY_START', 50.0)
         self.energy_move_cost = config.get('ENERGY_MOVE_COST', 0.1)
@@ -445,7 +457,12 @@ class TorchVecEnv:
         self.grids[target_grids, target_y, target_x] = float(cell_type)
     
     def _get_observations(self) -> torch.Tensor:
-        """Get batched observations (fully vectorized on GPU)."""
+        """Get batched observations (fully vectorized on GPU).
+        
+        Mode-aware encoding:
+        - Ground truth: One-hot encoding of cell types (channels = cell types)
+        - Proxy modes: Channels 0-1 are empty/wall, channels 2+ are interestingness
+        """
         r = self.view_radius
         vs = self.view_size
         
@@ -468,11 +485,33 @@ class TorchVecEnv:
         windows = padded_grids.unfold(1, vs, 1).unfold(2, vs, 1)
         
         # Index by agent positions to get each agent's view
-        views = windows[self.grid_indices, agent_y_long, agent_x_long]
+        views = windows[self.grid_indices, agent_y_long, agent_x_long]  # (n_envs, vs, vs)
         
-        # Convert to one-hot channels (10x faster than loop)
-        one_hot = F.one_hot(views.long(), num_classes=self.n_channels)
-        self._view_buffer[:] = one_hot.permute(0, 3, 1, 2).float()
+        if self.is_proxy_mode:
+            # PROXY MODE: Hide ground truth, show interestingness
+            # Channel 0: is_empty (binary)
+            # Channel 1: is_wall (binary)  
+            # Channels 2+: interestingness value (same across all these channels)
+            
+            views_long = views.long()
+            
+            # Binary channels for empty/wall
+            self._view_buffer[:, 0, :, :] = (views_long == self.CellType.EMPTY.value).float()
+            self._view_buffer[:, 1, :, :] = (views_long == self.CellType.WALL.value).float()
+            
+            # Interestingness channel (lookup from cell values)
+            # Clamp to valid indices to avoid index errors
+            clamped_views = views_long.clamp(0, len(self._interestingness_lut) - 1)
+            interestingness = self._interestingness_lut[clamped_views]  # (n_envs, vs, vs)
+            
+            # Fill channels 2+ with interestingness (single vectorized op, no loop)
+            n_interest_channels = self.n_channels - 2
+            # Expand interestingness to (n_envs, n_interest_channels, vs, vs) and write
+            self._view_buffer[:, 2:, :, :] = interestingness.unsqueeze(1).expand(-1, n_interest_channels, -1, -1)
+        else:
+            # GROUND TRUTH MODE: One-hot encoding of cell types
+            one_hot = F.one_hot(views.long(), num_classes=self.n_channels)
+            self._view_buffer[:] = one_hot.permute(0, 3, 1, 2).float()
         
         # Blank center (agent's own cell)
         self._view_buffer[:, :, r, r] = 0.0

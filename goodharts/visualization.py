@@ -330,8 +330,14 @@ def update_brain_frame(frame, sim, viz, args):
     # We need to know which channel is which
     channel_names = sim.vec_env.channel_names
     
+    # Convert to CPU/Numpy for RGBA construction
+    if isinstance(obs, torch.Tensor):
+        obs_cpu = obs.cpu().numpy()
+    else:
+        obs_cpu = obs
+    
     # Initialize RGB image (White background for empty? No, black typically)
-    c, h, w = obs.shape
+    c, h, w = obs_cpu.shape
     rgb_img = np.full((h, w, 3), 0, dtype=np.uint8) 
     
     # Dynamic Legend tracking
@@ -349,7 +355,8 @@ def update_brain_frame(frame, sim, viz, args):
         
         if channel_name in channel_names:
             idx = channel_names.index(channel_name)
-            mask = obs[idx] > 0.5
+            # Use CPU observation for masking
+            mask = obs_cpu[idx] > 0.5
             if mask.any():
                 rgb_img[mask] = c_type.color
                 
@@ -379,8 +386,14 @@ def update_brain_frame(frame, sim, viz, args):
     # Forward pass through model to trigger hooks
     brain = agent.behavior.get_brain() if hasattr(agent.behavior, 'get_brain') else None
     if brain:
-        device = next(brain.parameters()).device
-        obs_tensor = torch.from_numpy(obs).float().unsqueeze(0).to(device)
+        first_param = next(brain.parameters())
+        device = first_param.device
+        dtype = first_param.dtype
+        
+        if isinstance(obs, torch.Tensor):
+            obs_tensor = obs.to(device=device, dtype=dtype).unsqueeze(0)
+        else:
+            obs_tensor = torch.from_numpy(obs).to(device=device, dtype=dtype).unsqueeze(0)
         
         with torch.no_grad():
             logits = brain(obs_tensor)

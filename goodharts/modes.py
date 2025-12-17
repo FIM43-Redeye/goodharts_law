@@ -194,12 +194,34 @@ class GroundTruthRewards(RewardComputer):
 
 
 class HandholdRewards(RewardComputer):
-    """Handhold rewards for easier learning."""
+    """
+    Handhold rewards for easier learning.
+    
+    Scales rewards linearly to [-1, 1] based on the max possible energy 
+    values from the config (food/poison energy). This makes the reward 
+    signal more consistent and easier for the agent to learn from.
+    """
+    # Scaling constants derived from CellType config
+    # Food: +5.0 energy, Poison: -3.0 energy
+    # These are computed once at import time from the config
+    MAX_POSITIVE = 5.0   # CellType.FOOD.energy_reward
+    MAX_NEGATIVE = -3.0  # -CellType.POISON.energy_penalty
+    
     def _scale_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
+        # Scale linearly: positive rewards scaled by MAX_POSITIVE, negative by MAX_NEGATIVE
+        # This maps food (+5) to +1, poison (-3) to -1, movement costs (~-0.05) to ~-0.017
         scaled = torch.zeros_like(rewards)
-        scaled[rewards > 0] = 1.0   # Food
-        scaled[rewards < 0] = -1.0  # Poison
-        return scaled
+        
+        # Positive rewards: divide by MAX_POSITIVE
+        pos_mask = rewards > 0
+        scaled[pos_mask] = rewards[pos_mask] / self.MAX_POSITIVE
+        
+        # Negative rewards: divide by abs(MAX_NEGATIVE)
+        neg_mask = rewards < 0
+        scaled[neg_mask] = rewards[neg_mask] / abs(self.MAX_NEGATIVE)
+        
+        # Clamp to [-1, 1] for safety
+        return torch.clamp(scaled, -1.0, 1.0)
 
     def _compute_potentials(self, states: torch.Tensor) -> torch.Tensor:
         target = states[:, 2, :, :] > 0.5

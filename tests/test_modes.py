@@ -151,17 +151,23 @@ class TestRewardComputer:
         assert shaped.shape == (n_envs,)
         assert shaped.dtype == torch.float32
     
-    def test_reward_scaling_normalizes(self, config, gt_spec):
-        """Reward scaling should reduce magnitude of raw rewards."""
+    def test_reward_scaling_normalizes(self, config):
+        """HandholdRewards should scale rewards to [-1, 1] range."""
         import torch
         device = torch.device('cpu')
-        computer = RewardComputer.create('ground_truth', gt_spec, gamma=0.99, device=device)
         
-        # Large raw rewards (typical energy deltas: +15 food, -10 poison)
-        raw_rewards = torch.tensor([15.0, -10.0, 0.0, 1.0], device=device)
+        # Use handhold mode which actually scales rewards
+        hh_spec = ObservationSpec.for_mode('ground_truth_handhold', config)
+        computer = RewardComputer.create('ground_truth_handhold', hh_spec, gamma=0.99, device=device)
+        
+        # Test typical energy deltas
+        # Food gives +5, poison gives -3, movement costs are ~-0.05
+        raw_rewards = torch.tensor([5.0, -3.0, 0.0, -0.05], device=device)
         
         scaled = computer._scale_rewards(raw_rewards)
         
-        # Scaled should have smaller magnitude than raw (divides by 10)
-        assert scaled.abs().max() < raw_rewards.abs().max(), \
-            f"Scaled rewards should have smaller magnitude"
+        # Food (+5) should scale to +1, poison (-3) to -1, movement to ~-0.017
+        assert scaled[0].item() == pytest.approx(1.0), "Food should scale to +1"
+        assert scaled[1].item() == pytest.approx(-1.0), "Poison should scale to -1"
+        assert scaled[2].item() == 0.0, "Zero should stay zero"
+        assert -0.1 < scaled[3].item() < 0, "Movement cost should be small negative"
