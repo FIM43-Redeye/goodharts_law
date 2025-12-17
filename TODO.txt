@@ -64,7 +64,7 @@ The cool stuff! Can agents discover deceptive strategies on their own?
 ## Technical Debt
 
 ### High Priority
-- [ ] Add validation episodes to RL training (periodic eval without exploration)
+- [x] Add validation episodes to RL training (periodic eval without exploration)
 - [ ] Make dropout/weight_decay configurable in TOML
 
 ### Performance Optimizations
@@ -94,4 +94,4 @@ The cool stuff! Can agents discover deceptive strategies on their own?
 - [x] Reimplement environment on GPU (JAX/Warp) for massive parallelization
       (Current bottleneck is Python/NumPy for env, GPU for neural net.
        Full GPU would unlock 100k+ sps.)
-       Proceeded to do this anyway, the perf gain was actually worth it
+       Proceeded to do this anyway, the perf gain was actually worth it (10x+!)

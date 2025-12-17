@@ -234,9 +234,9 @@ python -m goodharts.training.train_ppo --n-envs 128 --timesteps 200000
 ### Training Performance
 
 With the vectorized environment and optimized PPO updates:
-- **~4,000-6,000 steps/second** on GPU (AMD RX 7700S)
-- **~1,500-2,500 steps/second** on CPU
-- 100,000 timesteps completes in ~15-25 seconds
+- **~24K steps/second** on GPU (AMD RX 7700S)
+- **~TODO steps/second** on CPU
+- 100,000 timesteps complete in ~15-25 seconds
 
 ### Training Output
 
