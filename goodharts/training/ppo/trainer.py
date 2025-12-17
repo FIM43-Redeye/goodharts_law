@@ -70,6 +70,7 @@ class PPOConfig:
     use_torch_env: bool = True
     hyper_verbose: bool = False
     clean_cache: bool = False
+    profile_enabled: bool = True  # Disable with --no-profile for production
     
     @classmethod
     def from_config(cls, mode: str = 'ground_truth', **overrides) -> 'PPOConfig':
@@ -371,8 +372,8 @@ class PPOTrainer:
             except ImportError:
                 print("   TensorBoard: Not available (install tensorboard package)")
         
-        # Profiler
-        self.profiler = Profiler(self.device)
+        # Profiler (disable with --no-profile to remove GPU sync overhead)
+        self.profiler = Profiler(self.device, enabled=cfg.profile_enabled)
         
         # Async logger - handles all I/O in background thread to avoid GPU stalls
         self.async_logger = AsyncLogger(

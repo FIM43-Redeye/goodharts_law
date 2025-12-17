@@ -147,6 +147,8 @@ def main():
                         help='Override minibatches per epoch')
     parser.add_argument('--no-warmup', action='store_true',
                         help='Skip warmup (faster startup but slower training)')
+    parser.add_argument('--no-profile', action='store_true',
+                        help='Disable profiling (removes GPU sync overhead, faster for production)')
     parser.add_argument('--tensorboard', '-tb', action='store_true',
                         help='Enable TensorBoard logging')
     parser.add_argument('--hyper-verbose', action='store_true',
@@ -197,6 +199,10 @@ def main():
         import torch
         torch.backends.cudnn.benchmark = False
         print("   Warmup disabled: torch.compile and cuDNN benchmark OFF")
+    
+    # Handle --no-profile (critical for high steps_per_env configs)
+    if args.no_profile:
+        overrides['profile_enabled'] = False
     
     modes_to_train = all_modes if args.mode == 'all' else [args.mode]
     

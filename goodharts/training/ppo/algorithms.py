@@ -22,41 +22,56 @@ def compute_gae(
     """
     Compute Generalized Advantage Estimation (GAE).
     
-    All inputs should be torch tensors on the same device.
+    Optimized: Pre-stacks lists into tensors to minimize Python overhead.
+    The recurrence relation still requires sequential processing, but now
+    operates on GPU tensors directly with minimal Python interpreter overhead.
     
     Args:
-        rewards: List of reward tensors, shape [(n_envs,), ...]
-        values: List of value tensors, shape [(n_envs,), ...]
-        dones: List of done flag tensors, shape [(n_envs,), ...]
+        rewards: List of reward tensors, shape [(n_envs,), ...] length T
+        values: List of value tensors, shape [(n_envs,), ...] length T
+        dones: List of done flag tensors, shape [(n_envs,), ...] length T
         next_value: Bootstrap value for final state, shape (n_envs,)
         gamma: Discount factor
         gae_lambda: GAE lambda parameter
         device: Torch device (inferred from rewards if not provided)
         
     Returns:
-        advantages: Shape (steps, n_envs)
-        returns: Shape (steps, n_envs)
+        advantages: Shape (T, n_envs)
+        returns: Shape (T, n_envs)
     """
-    device = device or rewards[0].device
-    steps = len(rewards)
-    n_envs = rewards[0].shape[0]
+    # Stack lists into tensors (moves all data to contiguous GPU memory)
+    # Shape: (T, n_envs) for all
+    rewards_t = torch.stack(rewards)      # (T, n_envs)
+    values_t = torch.stack(values)        # (T, n_envs)
+    dones_t = torch.stack(dones).float()  # (T, n_envs)
     
-    advantages = torch.zeros((steps, n_envs), device=device, dtype=torch.float32)
+    device = device or rewards_t.device
+    T, n_envs = rewards_t.shape
+    
+    # Pre-compute masks: 1 where episode continues, 0 where it ends
+    masks = 1.0 - dones_t  # (T, n_envs)
+    
+    # Build next_values tensor: values shifted by 1, with bootstrap at end
+    # next_values[t] = values[t+1] for t < T-1, next_value for t = T-1
+    next_values = torch.cat([values_t[1:], next_value.unsqueeze(0)], dim=0)  # (T, n_envs)
+    
+    # Compute all TD residuals (deltas) in one vectorized operation
+    # delta[t] = r[t] + gamma * V(s[t+1]) * mask[t] - V(s[t])
+    deltas = rewards_t + gamma * next_values * masks - values_t  # (T, n_envs)
+    
+    # GAE recurrence: A[t] = delta[t] + gamma * lambda * mask[t] * A[t+1]
+    # Must iterate backwards since each step depends on the next
+    # But now we're iterating over tensor slices, not Python objects
+    advantages = torch.zeros_like(deltas)  # (T, n_envs)
+    gae_coef = gamma * gae_lambda
     lastgae = torch.zeros(n_envs, device=device, dtype=torch.float32)
     
-    for t in reversed(range(steps)):
-        if t == steps - 1:
-            nextvalues = next_value
-        else:
-            nextvalues = values[t + 1]
-        
-        mask = 1.0 - dones[t].float()
-        delta = rewards[t] + gamma * nextvalues * mask - values[t]
-        lastgae = delta + gamma * gae_lambda * mask * lastgae
+    for t in range(T - 1, -1, -1):
+        lastgae = deltas[t] + gae_coef * masks[t] * lastgae
         advantages[t] = lastgae
     
     # Returns = Advantages + Values
-    returns = advantages + torch.stack(values)
+    returns = advantages + values_t
     
     return advantages, returns
 
