@@ -100,12 +100,8 @@ def train_ppo(
     finally:
         with _TRAINING_LOCK:
             _TRAINING_COUNTER -= 1
-            # Last thread cleans up stop signal
-            if _TRAINING_COUNTER == 0 and os.path.exists('.training_stop_signal'):
-                try:
-                    os.remove('.training_stop_signal')
-                except OSError:
-                    pass
+        # Note: Stop signal cleanup is handled by the sequential training loops,
+        # NOT here. This allows the signal to persist across trainer boundaries.
 
 
 def main():
@@ -230,6 +226,14 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool)
     if sequential:
         def sequential_training():
             for mode in modes_to_train:
+                # Check if stop was requested before starting next run
+                if os.path.exists('.training_stop_signal'):
+                    print(f"[Sequential] Stop signal detected, skipping remaining modes")
+                    try:
+                        os.remove('.training_stop_signal')
+                    except OSError:
+                        pass
+                    break
                 train_ppo(
                     mode=mode,
                     dashboard=dashboard,
@@ -316,6 +320,14 @@ def _run_without_dashboard(modes_to_train: list, overrides: dict, sequential: bo
         if len(modes_to_train) > 1:
             print(f"\nSequential training: {len(modes_to_train)} modes")
         for mode in modes_to_train:
+            # Check if stop was requested before starting next run
+            if os.path.exists('.training_stop_signal'):
+                print(f"[Sequential] Stop signal detected, skipping remaining modes")
+                try:
+                    os.remove('.training_stop_signal')
+                except OSError:
+                    pass
+                break
             train_ppo(
                 mode=mode,
                 output_path=f'models/ppo_{mode}.pth',

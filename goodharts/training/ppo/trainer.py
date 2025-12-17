@@ -448,7 +448,7 @@ class PPOTrainer:
         while self.total_steps < cfg.total_timesteps:
             self.profiler.start()
             
-            # Check stop signal
+            # Check stop signal (don't clear it - let outer loop handle that)
             if os.path.exists('.training_stop_signal'):
                 print(f"\n[PPO] Stop signal received!")
                 break
@@ -670,14 +670,21 @@ class PPOTrainer:
                         'poison': update_poison_sum / update_episodes_count
                     }
                 
-                # ASYNC LOGGING - queue payload, no GPU sync or I/O here
-                # All .item() calls, file writes, console prints happen in background thread
+                # SYNC POINT: Convert GPU tensors to CPU floats (single sync)
+                # This keeps all CUDA ops on main thread; background thread only does I/O
+                policy_loss_f = policy_loss.item()
+                value_loss_f = value_loss.item()
+                entropy_f = entropy.item()
+                explained_var_f = explained_var.item()
+                action_probs = F.softmax(last_logits, dim=1)[0].cpu().numpy().tolist()
+                
+                # ASYNC LOGGING - queue CPU data only, no GPU access in background
                 log_payload = LogPayload(
-                    policy_loss=policy_loss,
-                    value_loss=value_loss,
-                    entropy=entropy,
-                    explained_var=explained_var,
-                    action_probs_tensor=last_logits.detach(),  # Keep on GPU
+                    policy_loss=policy_loss_f,
+                    value_loss=value_loss_f,
+                    entropy=entropy_f,
+                    explained_var=explained_var_f,
+                    action_probs=action_probs,
                     update_count=self.update_count,
                     total_steps=self.total_steps,
                     best_reward=self.best_reward,

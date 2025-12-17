@@ -72,6 +72,7 @@ class TrainingDashboard:
         
         # UI State
         self.paused = False
+        self.dirty = False  # Set when new data arrives, cleared after redraw
         self.fig = None
         self.axes: dict[str, dict[str, Any]] = {}
         self.artists: dict[str, dict[str, Any]] = {}
@@ -88,6 +89,7 @@ class TrainingDashboard:
         """
         try:
             self.update_queue.put_nowait((mode, update_type, data))
+            self.dirty = True  # Signal that redraw is needed
         except queue.Full:
             pass
     
@@ -154,14 +156,16 @@ class TrainingDashboard:
             except queue.Empty:
                 break
     
-    def _smooth(self, data: list[float], alpha: float = 0.9) -> list[float]:
-        """Apply exponential moving average smoothing."""
+    def _smooth(self, data: list[float], alpha: float = 0.9, max_points: int = 500) -> list[float]:
+        """Apply exponential moving average smoothing (limited to last N points)."""
         if not data:
             return []
+        # Limit to recent data to avoid O(n) growth that starves training thread
+        if len(data) > max_points:
+            data = data[-max_points:]
         smoothed = []
         last = data[0]
         for val in data:
-            # Simple EMA
             last = last * alpha + val * (1 - alpha)
             smoothed.append(last)
         return smoothed
@@ -310,11 +314,16 @@ class TrainingDashboard:
         self.btn_stop.on_clicked(request_stop)
         
     def _update_frame(self, frame):
-        """Update graphs."""
+        """Update graphs (only if new data has arrived)."""
         if self.paused:
             return []
-            
+        
+        # Skip all work if no new data (key optimization for training speed)
+        if not self.dirty:
+            return []
+        
         self._process_updates()
+        self.dirty = False  # Clear flag after processing
         
         artists_to_draw = []
         
@@ -322,17 +331,20 @@ class TrainingDashboard:
             artists = self.artists[mode]
             axes = self.axes[mode]
             
-            # Common X-axis (Updates)
+            # Common X-axis (Updates) - limit to recent data window
             n_updates = len(run.rewards)
             if n_updates < 2:
                 continue
-                
-            x_data = list(range(n_updates))
+            
+            # Window for display (matches _smooth max_points)
+            max_points = 500
+            start_idx = max(0, n_updates - max_points)
+            x_data = list(range(start_idx, n_updates))
             
             # 1. Rewards
-            y_rew = self._smooth(run.rewards, 0.9)
+            y_rew = self._smooth(run.rewards, 0.9, max_points)
             artists['reward'].set_data(x_data, y_rew)
-            axes['reward'].set_xlim(0, n_updates + 5)
+            axes['reward'].set_xlim(start_idx, n_updates + 5)
             # Auto-scale Y with padding
             if y_rew:
                 mn, mx = min(y_rew), max(y_rew)
@@ -340,38 +352,40 @@ class TrainingDashboard:
                 axes['reward'].set_ylim(mn - rng*0.1, mx + rng*0.1)
                 
             # 2. Policy Loss
-            y_pol = self._smooth(run.policy_losses, 0.9)
+            y_pol = self._smooth(run.policy_losses, 0.9, max_points)
             artists['policy'].set_data(x_data, y_pol)
-            axes['pol_loss'].set_xlim(0, n_updates + 5)
+            axes['pol_loss'].set_xlim(start_idx, n_updates + 5)
             if y_pol:
                 mn, mx = min(y_pol), max(y_pol)
                 rng = mx - mn if mx != mn else 1.0
                 axes['pol_loss'].set_ylim(mn - rng*0.1, mx + rng*0.1)
 
             # 3. Value Loss
-            y_val = self._smooth(run.value_losses, 0.9)
+            y_val = self._smooth(run.value_losses, 0.9, max_points)
             artists['value'].set_data(x_data, y_val)
-            axes['val_loss'].set_xlim(0, n_updates + 5)
+            axes['val_loss'].set_xlim(start_idx, n_updates + 5)
             if y_val:
                 mn, mx = min(y_val), max(y_val)
                 rng = mx - mn if mx != mn else 1.0
                 axes['val_loss'].set_ylim(mn - rng*0.1, mx + rng*0.1)
                 
-            # 3. Entropy
-            artists['entropy'].set_data(x_data, run.entropies)
-            axes['entropy'].set_xlim(0, n_updates + 5)
+            # 4. Entropy (window but no smoothing needed)
+            ent_data = run.entropies[-max_points:] if len(run.entropies) > max_points else run.entropies
+            ent_x = x_data if len(ent_data) == len(x_data) else list(range(start_idx, start_idx + len(ent_data)))
+            artists['entropy'].set_data(ent_x, ent_data)
+            axes['entropy'].set_xlim(start_idx, n_updates + 5)
             
-            # 4. Explained Variance
-            y_ev = self._smooth(run.explained_variances, 0.9)
+            # 5. Explained Variance
+            y_ev = self._smooth(run.explained_variances, 0.9, max_points)
             artists['ev'].set_data(x_data, y_ev)
-            axes['ev'].set_xlim(0, n_updates + 5)
+            axes['ev'].set_xlim(start_idx, n_updates + 5)
             
-            # 5. Behavior
-            y_food = self._smooth(run.food_history, 0.9)
-            y_pois = self._smooth(run.poison_history, 0.9)
+            # 6. Behavior
+            y_food = self._smooth(run.food_history, 0.9, max_points)
+            y_pois = self._smooth(run.poison_history, 0.9, max_points)
             artists['food'].set_data(x_data, y_food)
             artists['poison'].set_data(x_data, y_pois)
-            axes['beh'].set_xlim(0, n_updates + 5)
+            axes['beh'].set_xlim(start_idx, n_updates + 5)
             # Scale
             all_beh = y_food + y_pois
             if all_beh:
@@ -410,7 +424,7 @@ class TrainingDashboard:
         self.ani = FuncAnimation(
             self.fig,
             self._update_frame,
-            interval=200, 
+            interval=500,  # 2 FPS instead of 5 - reduces GIL contention with training thread
             blit=False,
             cache_frame_data=False
         )
