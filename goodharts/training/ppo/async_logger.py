@@ -1,30 +1,28 @@
 """
 Async logging for PPO training.
 
-Offloads GPU syncs and I/O to a background thread to avoid stalling training.
-The training loop queues GPU tensors directly; the background thread handles
-.item() calls, file writes, console prints, and dashboard updates.
+Offloads I/O (console, file, dashboard) to a background thread.
+GPU sync (.item() calls) happens in main thread to avoid CUDA contention.
 """
 import queue
 import threading
-import time
 from dataclasses import dataclass
-from typing import Optional, Any
+from typing import Optional
 
 import torch
 
 
 @dataclass
 class LogPayload:
-    """Data queued for async logging."""
-    # GPU tensors (will be synced in background thread)
-    policy_loss: torch.Tensor
-    value_loss: torch.Tensor
-    entropy: torch.Tensor
-    explained_var: torch.Tensor
-    action_probs_tensor: torch.Tensor  # Last logits for action probs
+    """Data queued for async logging - all values already synced to CPU."""
+    # Metrics (already synced to CPU floats in main thread)
+    policy_loss: float
+    value_loss: float
+    entropy: float
+    explained_var: float
+    action_probs: list  # Already computed as list[float]
     
-    # Already-synced data (cheap to copy)
+    # Metadata
     update_count: int
     total_steps: int
     best_reward: float
@@ -33,7 +31,7 @@ class LogPayload:
     # Episode stats (already on CPU)
     episode_stats: Optional[dict]  # {'reward': float, 'food': int, 'poison': int}
     
-    # Profiler summary (string, already computed)
+    # Profiler summary (string)
     profiler_summary: str
     
     # Timing info
@@ -44,15 +42,8 @@ class AsyncLogger:
     """
     Thread-safe async logging for PPO training.
     
-    Usage:
-        logger = AsyncLogger(trainer_logger, tb_writer, dashboard, mode)
-        logger.start()
-        
-        # In training loop:
-        logger.log_update(payload)
-        
-        # At end:
-        logger.shutdown()
+    GPU sync happens in main thread; only I/O is offloaded to background.
+    This avoids CUDA contention that caused severe performance regression.
     """
     
     def __init__(
@@ -89,7 +80,7 @@ class AsyncLogger:
             self._thread.join(timeout=timeout)
     
     def _worker(self):
-        """Background thread: processes log queue."""
+        """Background thread: processes log queue (I/O only, no GPU access)."""
         while self._running or not self._queue.empty():
             try:
                 payload = self._queue.get(timeout=0.1)
@@ -102,19 +93,9 @@ class AsyncLogger:
             self._process_payload(payload)
     
     def _process_payload(self, p: LogPayload):
-        """Do all the sync and I/O work for one update."""
-        # GPU -> CPU sync happens here (off critical path)
-        policy_loss = p.policy_loss.item()
-        value_loss = p.value_loss.item()
-        entropy = p.entropy.item()
-        explained_var = p.explained_var.item()
-        
-        # Action probs: softmax and transfer to CPU
-        import torch.nn.functional as F
-        action_probs = F.softmax(p.action_probs_tensor, dim=1)[0].cpu().numpy().tolist()
-        
+        """Do I/O work for one update (no GPU access here)."""
         # Console output
-        print(f"   [{p.mode}] Step {p.total_steps:,}: {p.sps:,.0f} sps | Best R={p.best_reward:.0f} | Ent={entropy:.3f} | ValL={value_loss:.4f} | ExpV={explained_var:.4f}")
+        print(f"   [{p.mode}] Step {p.total_steps:,}: {p.sps:,.0f} sps | Best R={p.best_reward:.0f} | Ent={p.entropy:.3f} | ValL={p.value_loss:.4f} | ExpV={p.explained_var:.4f}")
         print(f"   [Profile] {p.profiler_summary}")
         
         # File logging
@@ -122,29 +103,28 @@ class AsyncLogger:
             self.trainer_logger.log_update(
                 update_num=p.update_count,
                 total_steps=p.total_steps,
-                policy_loss=policy_loss,
-                value_loss=value_loss,
-                entropy=entropy,
-                explained_variance=explained_var,
-                action_probs=action_probs
+                policy_loss=p.policy_loss,
+                value_loss=p.value_loss,
+                entropy=p.entropy,
+                explained_variance=p.explained_var,
+                action_probs=p.action_probs
             )
         
         # TensorBoard logging
         if self.tb_writer:
-            self.tb_writer.add_scalar('loss/policy', policy_loss, p.total_steps)
-            self.tb_writer.add_scalar('loss/value', value_loss, p.total_steps)
-            self.tb_writer.add_scalar('metrics/entropy', entropy, p.total_steps)
-            self.tb_writer.add_scalar('metrics/explained_variance', explained_var, p.total_steps)
+            self.tb_writer.add_scalar('loss/policy', p.policy_loss, p.total_steps)
+            self.tb_writer.add_scalar('loss/value', p.value_loss, p.total_steps)
+            self.tb_writer.add_scalar('metrics/entropy', p.entropy, p.total_steps)
+            self.tb_writer.add_scalar('metrics/explained_variance', p.explained_var, p.total_steps)
             if p.episode_stats:
                 self.tb_writer.add_scalar('reward/episode', p.episode_stats['reward'], p.total_steps)
             self.tb_writer.flush()
         
         # Dashboard update
         if self.dashboard:
-            ep_stats = p.episode_stats
-            payload = {
-                'ppo': (policy_loss, value_loss, entropy, action_probs, explained_var),
-                'episodes': ep_stats,
+            payload_dict = {
+                'ppo': (p.policy_loss, p.value_loss, p.entropy, p.action_probs, p.explained_var),
+                'episodes': p.episode_stats,
                 'steps': p.total_steps
             }
-            self.dashboard.update(p.mode, 'update', payload)
+            self.dashboard.update(p.mode, 'update', payload_dict)
