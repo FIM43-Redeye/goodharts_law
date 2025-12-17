@@ -27,6 +27,7 @@ from goodharts.modes import RewardComputer
 
 from .models import Profiler, ValueHead
 from .algorithms import compute_gae, ppo_update
+from .async_logger import AsyncLogger, LogPayload
 
 
 # Note: TORCHINDUCTOR_CACHE_DIR is set in train_ppo.py before torch is imported
@@ -159,6 +160,7 @@ class PPOTrainer:
         self.logger = None
         self.reward_computer = None
         self.profiler = None
+        self.async_logger = None
         
         # Training state
         self.total_steps = 0
@@ -371,6 +373,15 @@ class PPOTrainer:
         
         # Profiler
         self.profiler = Profiler(self.device)
+        
+        # Async logger - handles all I/O in background thread to avoid GPU stalls
+        self.async_logger = AsyncLogger(
+            trainer_logger=self.logger,
+            tb_writer=self.tb_writer,
+            dashboard=self.dashboard,
+            mode=cfg.mode
+        )
+        self.async_logger.start()
         
         # Curriculum settings - inform VecEnv of ranges (each env randomizes on reset)
         self.min_food = train_cfg.get('min_food', 50)
@@ -637,58 +648,6 @@ class PPOTrainer:
                 finished_dones_buffer = []
                 finished_rewards_buffer = []
                 
-                # Compute action_probs once for logging (only sync here, not every step)
-                action_probs = F.softmax(last_logits, dim=1)[0].cpu().numpy().tolist()
-                
-                # Logging
-                if self.logger:
-                    self.logger.log_update(
-                        update_num=self.update_count,
-                        total_steps=self.total_steps,
-                        policy_loss=policy_loss,
-                        value_loss=value_loss,
-                        entropy=entropy,
-                        explained_variance=explained_var,
-                        action_probs=action_probs
-                    )
-                
-                # TensorBoard logging
-                if self.tb_writer:
-                    self.tb_writer.add_scalar('loss/policy', policy_loss, self.total_steps)
-                    self.tb_writer.add_scalar('loss/value', value_loss, self.total_steps)
-                    self.tb_writer.add_scalar('metrics/entropy', entropy, self.total_steps)
-                    self.tb_writer.add_scalar('metrics/explained_variance', explained_var, self.total_steps)
-                    if update_episodes_count > 0:
-                        avg_reward = update_reward_sum / update_episodes_count
-                        self.tb_writer.add_scalar('reward/episode', avg_reward, self.total_steps)
-                    # Flush for real-time updates in TensorBoard UI
-                    self.tb_writer.flush()
-                
-                # Dashboard update (Unified!)
-                if self.dashboard:
-                    # Prepare episode stats if any finished
-                    ep_stats = None
-                    if update_episodes_count > 0:
-                        ep_stats = {
-                            'reward': update_reward_sum / update_episodes_count,
-                            'food': update_food_sum / update_episodes_count,
-                            'poison': update_poison_sum / update_episodes_count
-                        }
-                    
-                    # Unified payload
-                    payload = {
-                        'ppo': (policy_loss, value_loss, entropy, action_probs, explained_var),
-                        'episodes': ep_stats,
-                        'steps': self.total_steps
-                    }
-                    self.dashboard.update(cfg.mode, 'update', payload)
-                    
-                    # Reset aggregators
-                    update_episodes_count = 0
-                    update_reward_sum = 0.0
-                    update_food_sum = 0
-                    update_poison_sum = 0
-                
                 # Progress - use rolling window for sps (excludes compilation warmup)
                 now = time.perf_counter()
                 update_steps = self.total_steps - last_update_steps
@@ -702,9 +661,39 @@ class PPOTrainer:
                 window_time = sum(t for s, t in sps_window)
                 sps = window_steps / window_time if window_time > 0 else 0
                 
-                print(f"   [{cfg.mode}] Step {self.total_steps:,}: {sps:,.0f} sps | Best R={self.best_reward:.0f} | Ent={entropy:.3f} | ValL={value_loss:.4f} | ExpV={explained_var:.4f}")
-                print(f"   [Profile] {self.profiler.summary()}")
+                # Prepare episode stats
+                ep_stats = None
+                if update_episodes_count > 0:
+                    ep_stats = {
+                        'reward': update_reward_sum / update_episodes_count,
+                        'food': update_food_sum / update_episodes_count,
+                        'poison': update_poison_sum / update_episodes_count
+                    }
+                
+                # ASYNC LOGGING - queue payload, no GPU sync or I/O here
+                # All .item() calls, file writes, console prints happen in background thread
+                log_payload = LogPayload(
+                    policy_loss=policy_loss,
+                    value_loss=value_loss,
+                    entropy=entropy,
+                    explained_var=explained_var,
+                    action_probs_tensor=last_logits.detach(),  # Keep on GPU
+                    update_count=self.update_count,
+                    total_steps=self.total_steps,
+                    best_reward=self.best_reward,
+                    mode=cfg.mode,
+                    episode_stats=ep_stats,
+                    profiler_summary=self.profiler.summary(),
+                    sps=sps,
+                )
+                self.async_logger.log_update(log_payload)
                 self.profiler.reset()
+                
+                # Reset episode aggregators
+                update_episodes_count = 0
+                update_reward_sum = 0.0
+                update_food_sum = 0
+                update_poison_sum = 0
                 
                 last_update_time = now
                 last_update_steps = self.total_steps
@@ -732,6 +721,10 @@ class PPOTrainer:
     def _finalize(self) -> dict:
         """Save final model and return summary."""
         cfg = self.config
+        
+        # Shutdown async logger first - flushes all queued logs
+        if self.async_logger:
+            self.async_logger.shutdown()
         
         torch.save(self.policy.state_dict(), cfg.output_path)
         print(f"\n[PPO] Training complete: {cfg.output_path}")

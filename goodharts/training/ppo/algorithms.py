@@ -181,10 +181,12 @@ def ppo_update(
         else:
             explained_var = torch.tensor(0.0, device=device)
     
-    # Single sync point at the very end
+    # Return TENSORS - .item() sync happens in AsyncLogger background thread
+    # This eliminates GPU stalls in the training loop
     return (
-        (total_policy_loss / n_updates).item(),
-        (total_value_loss / n_updates).item(),
-        (total_entropy / n_updates).item(),
-        explained_var.item()
+        total_policy_loss / n_updates,
+        total_value_loss / n_updates,
+        total_entropy / n_updates,
+        explained_var
     )
+
