@@ -35,10 +35,11 @@ class Profiler:
         print(profiler.summary())
     """
     
-    def __init__(self, device: torch.device = None):
+    def __init__(self, device: torch.device = None, enabled: bool = True):
         self.times: dict[str, float] = {}
         self.counts: dict[str, int] = {}
         self.last_t: float = 0
+        self.enabled = enabled
         if device is None:
             device = get_device()
         # Only synchronize if we are actually using a CUDA device
@@ -52,6 +53,8 @@ class Profiler:
 
     def tick(self, name: str):
         """Record elapsed time since last tick under the given name."""
+        if not self.enabled:
+            return  # No-op for production runs
         if self.sync_cuda:
             torch.cuda.synchronize()
         now = time.perf_counter()

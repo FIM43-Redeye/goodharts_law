@@ -96,7 +96,8 @@ class AsyncLogger:
         """Do I/O work for one update (no GPU access here)."""
         # Console output
         print(f"   [{p.mode}] Step {p.total_steps:,}: {p.sps:,.0f} sps | Best R={p.best_reward:.0f} | Ent={p.entropy:.3f} | ValL={p.value_loss:.4f} | ExpV={p.explained_var:.4f}")
-        print(f"   [Profile] {p.profiler_summary}")
+        if p.profiler_summary and p.profiler_summary != "No data":
+            print(f"   [Profile] {p.profiler_summary}")
         
         # File logging
         if self.trainer_logger:
