@@ -173,7 +173,7 @@ class TrainingDashboard:
         
         # Layout: 1 row per run
         rows = self.n_runs
-        cols = 6  # Reward, Loss, Entropy, Expl Var, Behavior, Action Dist
+        cols = 7  # Reward, Pol Loss, Val Loss, Entropy, Expl Var, Behavior, Action Dist
         
         # Adjust height based on rows
         fig_height = 3 * rows + 1
@@ -205,21 +205,26 @@ class TrainingDashboard:
         self.axes[mode]['reward'] = ax
         self.artists[mode]['reward'] = l_rew
         
-        # 2. Losses
+        # 2. Policy Loss
         ax = self.fig.add_subplot(gs[row_idx, 1])
-        ax.set_title("Losses", fontsize=10, color='silver')
+        ax.set_title("Pol Loss", fontsize=10, color='silver')
         ax.grid(True, alpha=0.15)
         
         l_pol, = ax.plot([], [], 'r-', linewidth=1, label='Pol', alpha=0.8)
-        l_val, = ax.plot([], [], 'g-', linewidth=1, label='Val', alpha=0.8)
-        ax.legend(fontsize=7, loc='upper right', framealpha=0.3)
-        
-        self.axes[mode]['loss'] = ax
+        self.axes[mode]['pol_loss'] = ax
         self.artists[mode]['policy'] = l_pol
+        
+        # 3. Value Loss
+        ax = self.fig.add_subplot(gs[row_idx, 2])
+        ax.set_title("Val Loss", fontsize=10, color='silver')
+        ax.grid(True, alpha=0.15)
+        
+        l_val, = ax.plot([], [], 'g-', linewidth=1, label='Val', alpha=0.8)
+        self.axes[mode]['val_loss'] = ax
         self.artists[mode]['value'] = l_val
         
-        # 3. Entropy
-        ax = self.fig.add_subplot(gs[row_idx, 2])
+        # 4. Entropy
+        ax = self.fig.add_subplot(gs[row_idx, 3])
         ax.set_title("Entropy", fontsize=10, color='silver')
         ax.grid(True, alpha=0.15)
         
@@ -231,8 +236,8 @@ class TrainingDashboard:
         self.axes[mode]['entropy'] = ax
         self.artists[mode]['entropy'] = l_ent
         
-        # 4. Explained Variance
-        ax = self.fig.add_subplot(gs[row_idx, 3])
+        # 5. Explained Variance
+        ax = self.fig.add_subplot(gs[row_idx, 4])
         ax.set_title("Expl. Var.", fontsize=10, color='silver')
         ax.grid(True, alpha=0.15)
         ax.axhline(y=1.0, color='lime', linestyle='--', alpha=0.3)
@@ -243,8 +248,8 @@ class TrainingDashboard:
         self.axes[mode]['ev'] = ax
         self.artists[mode]['ev'] = l_ev
         
-        # 5. Behavior
-        ax = self.fig.add_subplot(gs[row_idx, 4])
+        # 6. Behavior
+        ax = self.fig.add_subplot(gs[row_idx, 5])
         ax.set_title("Behavior", fontsize=10, color='silver')
         ax.grid(True, alpha=0.15)
         
@@ -256,8 +261,8 @@ class TrainingDashboard:
         self.artists[mode]['food'] = l_food
         self.artists[mode]['poison'] = l_poison
         
-        # 6. Action Distribution (Bar Chart)
-        ax = self.fig.add_subplot(gs[row_idx, 5])
+        # 7. Action Distribution (Bar Chart)
+        ax = self.fig.add_subplot(gs[row_idx, 6])
         ax.set_title("Actions", fontsize=10, color='silver')
         ax.grid(False)
         ax.set_ylim(0, 0.6) # reasonable max prob
@@ -334,18 +339,23 @@ class TrainingDashboard:
                 rng = mx - mn if mx != mn else 1.0
                 axes['reward'].set_ylim(mn - rng*0.1, mx + rng*0.1)
                 
-            # 2. Losses
+            # 2. Policy Loss
             y_pol = self._smooth(run.policy_losses, 0.9)
-            y_val = self._smooth(run.value_losses, 0.9)
             artists['policy'].set_data(x_data, y_pol)
-            artists['value'].set_data(x_data, y_val)
-            axes['loss'].set_xlim(0, n_updates + 5)
-            # Combine for scale
-            all_loss = y_pol + y_val
-            if all_loss:
-                mn, mx = min(all_loss), max(all_loss)
+            axes['pol_loss'].set_xlim(0, n_updates + 5)
+            if y_pol:
+                mn, mx = min(y_pol), max(y_pol)
                 rng = mx - mn if mx != mn else 1.0
-                axes['loss'].set_ylim(mn - rng*0.1, mx + rng*0.1)
+                axes['pol_loss'].set_ylim(mn - rng*0.1, mx + rng*0.1)
+
+            # 3. Value Loss
+            y_val = self._smooth(run.value_losses, 0.9)
+            artists['value'].set_data(x_data, y_val)
+            axes['val_loss'].set_xlim(0, n_updates + 5)
+            if y_val:
+                mn, mx = min(y_val), max(y_val)
+                rng = mx - mn if mx != mn else 1.0
+                axes['val_loss'].set_ylim(mn - rng*0.1, mx + rng*0.1)
                 
             # 3. Entropy
             artists['entropy'].set_data(x_data, run.entropies)

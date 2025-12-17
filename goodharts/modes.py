@@ -89,7 +89,7 @@ class RewardComputer(ABC):
     """
     
     def __init__(self, mode: str, spec: 'ObservationSpec', gamma: float = 0.99,
-                 device: torch.device = None):
+                 shaping_coef: float = 0.5, device: torch.device = None):
         """
         Initialize reward computer.
         
@@ -97,11 +97,14 @@ class RewardComputer(ABC):
             mode: Training mode name
             spec: Observation specification
             gamma: Discount factor (for potential-based shaping)
+            gamma: Discount factor (for potential-based shaping)
+            shaping_coef: Magnitude of the potential (e.g. 0.5 for food)
             device: Torch device (auto-detected if None)
         """
         self.mode = mode
         self.spec = spec
         self.gamma = gamma
+        self.shaping_coef = shaping_coef
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.prev_potentials: torch.Tensor = None
         # Cache constant tensor to avoid per-call allocation
@@ -109,11 +112,11 @@ class RewardComputer(ABC):
         
     @classmethod
     def create(cls, mode: str, spec: 'ObservationSpec', gamma: float = 0.99,
-               device: torch.device = None) -> 'RewardComputer':
+               shaping_coef: float = 0.5, device: torch.device = None) -> 'RewardComputer':
         """Factory method to create the appropriate RewardComputer instance."""
         if spec.reward_strategy is None:
              raise ValueError(f"No reward strategy defined for mode: {mode}")
-        return spec.reward_strategy(mode, spec, gamma, device)
+        return spec.reward_strategy(mode, spec, gamma, shaping_coef, device)
     
     def initialize(self, states: torch.Tensor):
         """Initialize potentials for first step."""
@@ -143,7 +146,7 @@ class RewardComputer(ABC):
         
         # 3. Combine and clip
         total_rewards = scaled_rewards + shaping
-        total_rewards = torch.clamp(total_rewards, -5.0, 5.0)
+        total_rewards = torch.clamp(total_rewards, -20.0, 20.0)
         
         return total_rewards
     
@@ -154,12 +157,10 @@ class RewardComputer(ABC):
     
     def _scale_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
         """
-        Scale raw rewards. Default is to scale by max magnitude (energy delta).
+        Scale raw rewards. Default is 1.0 (pass-through).
         Override for custom scaling (e.g. +1/-1).
         """
-        from goodharts.configs.default_config import TRAINING_DEFAULTS
-        scale = TRAINING_DEFAULTS.get('reward_scale', 0.1)
-        return rewards * scale
+        return rewards
         
     def _calculate_potential_from_target(self, states: torch.Tensor, 
                                           target_mask: torch.Tensor) -> torch.Tensor:
@@ -176,8 +177,8 @@ class RewardComputer(ABC):
         # Compute min distance per env (flatten spatial dims, then min)
         min_dist = masked_dist.view(n, -1).min(dim=1).values  # (n,)
         
-        # Inverse potential: 0.1 / (dist + 0.5), handle inf as 0
-        potentials = 0.1 / (min_dist + 0.5)
+        # Inverse potential: coef / (dist + 0.5), handle inf as 0
+        potentials = self.shaping_coef / (min_dist + 0.5)
         potentials = torch.where(torch.isinf(min_dist), 
                                   torch.zeros_like(potentials), 
                                   potentials)

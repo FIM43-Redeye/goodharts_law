@@ -66,6 +66,7 @@ class PPOConfig:
     skip_warmup: bool = False  # Skip JIT warmup (use when global warmup was done)
     use_torch_env: bool = False  # Use GPU-native TorchVecEnv (faster on powerful GPUs)
     hyper_verbose: bool = False  # Debug mode: print at every major step
+    clean_cache: bool = False  # Delete existing compilation cache before starting
 
 
 def _vprint(msg: str, verbose: bool):
@@ -199,6 +200,14 @@ class PPOTrainer:
                 # Try to load cached compilation artifacts (skips recompilation)
                 cache_path = os.path.expanduser(f"~/.cache/torch_compile_{cfg.brain_type}_{cfg.n_envs}_{cfg.n_minibatches}.bin")
                 cache_loaded = False
+                if cfg.clean_cache and os.path.exists(cache_path):
+                    try:
+                        os.remove(cache_path)
+                        print(f"   [JIT] Cleared cache: {cache_path}", flush=True)
+                    except OSError:
+                        pass
+
+                cache_loaded = False
                 if os.path.exists(cache_path):
                     try:
                         import pickle
@@ -208,7 +217,13 @@ class PPOTrainer:
                         cache_loaded = True
                         print(f"   [JIT] Loaded cached compilation artifacts", flush=True)
                     except Exception as e:
-                        print(f"   [JIT] Cache load failed ({e}), will recompile", flush=True)
+                        # Silently ignored by torch? We must be more aggressive.
+                        print(f"   [JIT] Cache load failed ({e}), deleting corrupted cache", flush=True)
+                        try:
+                            os.remove(cache_path)
+                        except OSError:
+                            pass
+                        torch.compiler.reset()  # Reset compiler state just in case
                 
                 # Keep references to originals in case compilation fails
                 orig_policy = self.policy
@@ -240,7 +255,7 @@ class PPOTrainer:
                         with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                             logits = self.policy(dummy_obs)
                             features = self.policy.get_features(dummy_obs)
-                            values = self.value_head(features).squeeze()
+                            values = self.value_head(features).squeeze(-1)
                             
                             # Compute dummy loss (triggers backward graph compilation)
                             from torch.distributions import Categorical
@@ -260,12 +275,16 @@ class PPOTrainer:
                         print(f"   [JIT] Compilation complete ({warmup_time:.1f}s)", flush=True)
                         
                         # Save cache artifacts for next run (if not already loaded from cache)
-                        if not cache_loaded and warmup_time > 5.0:  # Only cache if compilation took a while
+                        # CRITICAL: Always save if warmup took time, even if we thought we loaded a cache.
+                        # If warmup took > 5s, the loaded cache was obviously broken/incomplete.
+                        if warmup_time > 5.0:  # Only cache if compilation took a while
                             try:
                                 artifacts = torch.compiler.save_cache_artifacts()
                                 import pickle
-                                with open(cache_path, 'wb') as f:
+                                tmp_path = cache_path + ".tmp"
+                                with open(tmp_path, 'wb') as f:
                                     pickle.dump(artifacts, f)
+                                os.rename(tmp_path, cache_path)
                                 print(f"   [JIT] Saved compilation cache ({os.path.getsize(cache_path) // 1024}KB)", flush=True)
                             except Exception as e:
                                 print(f"   [JIT] Warning: Could not save cache ({e})", flush=True)
@@ -298,7 +317,7 @@ class PPOTrainer:
             with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                 logits = self.policy(dummy_obs)
                 features = self.policy.get_features(dummy_obs)
-                values = self.value_head(features).squeeze()
+                values = self.value_head(features).squeeze(-1)
                 
                 dist = Categorical(logits=logits, validate_args=False)
                 log_probs = dist.log_prob(dummy_actions)
@@ -320,7 +339,9 @@ class PPOTrainer:
         
         # Reward computer - unified class handles both numpy and torch
         self.reward_computer = RewardComputer.create(
-            cfg.mode, self.spec, cfg.gamma, device=self.device
+            cfg.mode, self.spec, cfg.gamma, 
+            shaping_coef=train_cfg['shaping_food_attract'], 
+            device=self.device
         )
         
         # Logger
@@ -388,6 +409,10 @@ class PPOTrainer:
         dones_buffer = []
         values_buffer = []
         
+        # Async logging buffers (new)
+        finished_dones_buffer = []
+        finished_rewards_buffer = []
+        
         # Initial state
         _vprint("Resetting environment for initial state...", v)
         states = self.vec_env.reset()
@@ -399,7 +424,9 @@ class PPOTrainer:
             self.reward_computer.initialize(states)  # stays on GPU
             episode_rewards = torch.zeros(cfg.n_envs, device=self.device)
         else:
-            self.reward_computer.initialize(states)  # numpy
+            # CPU path: convert to tensor for component that expects tensor
+            states_t = torch.from_numpy(states).float().to(self.device)
+            self.reward_computer.initialize(states_t)
             episode_rewards = np.zeros(cfg.n_envs)
         _vprint("Training loop ready to start", v)
         
@@ -442,7 +469,7 @@ class PPOTrainer:
                 with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                     logits = self.policy(states_t)
                     features = self.policy.get_features(states_t)
-                    values = self.value_head(features).squeeze()
+                    values = self.value_head(features).squeeze(-1)
                     
                     dist = Categorical(logits=logits, validate_args=False)
                     actions = dist.sample()
@@ -453,21 +480,25 @@ class PPOTrainer:
             self.profiler.tick("Inference")
             
             # Environment step
+            # Environment step
             if self._torch_env:
                 # GPU-native path: everything stays on GPU
+                # CRITICAL: Snapshot state BEFORE step because env may mutate it in-place!
+                current_states = states.clone()
+                
                 next_states, rewards, dones = self.vec_env.step(actions)
                 
                 # Compute shaped rewards (torch-native, stays on GPU)
                 shaped_rewards = self.reward_computer.compute(
-                    rewards, states, next_states, dones
+                    rewards, current_states, next_states, dones
                 )
                 
                 # Store experience as tensors
-                states_buffer.append(states)
-                actions_buffer.append(actions)
+                states_buffer.append(current_states)
+                actions_buffer.append(actions) # Actions are new tensors from sampling
                 log_probs_buffer.append(log_probs.detach())
-                rewards_buffer.append(shaped_rewards)
-                dones_buffer.append(dones)
+                rewards_buffer.append(shaped_rewards) # Rewards are usually new tensors
+                dones_buffer.append(dones.clone()) # Dones might be reused, but usually new. Clone to be safe?
                 values_buffer.append(values)
                 
                 self.total_steps += cfg.n_envs
@@ -489,60 +520,32 @@ class PPOTrainer:
                 
                 # Store as tensors (unified path)
                 states_buffer.append(states_t)
-                actions_buffer.append(torch.from_numpy(actions_np).long().to(self.device))
+                actions_buffer.append(actions)  # Keep original tensor on device!
                 log_probs_buffer.append(log_probs.detach())
                 rewards_buffer.append(shaped_rewards)
                 dones_buffer.append(dones_t)
                 values_buffer.append(values)
                 
                 self.total_steps += cfg.n_envs
-                episode_rewards += rewards_t
+                episode_rewards += rewards
             self.profiler.tick("Env Step")
             
-            # Track episodes - batch sync to reduce GPU stalls
+            # Track episode stats (defer logging to avoid Sync)
             if self._torch_env:
-                # Check if any episodes ended (single sync)
-                done_indices = torch.where(dones)[0]
-                if len(done_indices) > 0:
-                    # Batch extract all needed values in one sync
-                    done_rewards = episode_rewards[done_indices].cpu().numpy()
-                    done_food = self.vec_env.last_episode_food[done_indices].cpu().numpy()
-                    done_poison = self.vec_env.last_episode_poison[done_indices].cpu().numpy()
-                    
-                    for j, i in enumerate(done_indices.cpu().numpy()):
-                        self.episode_count += 1
-                        r, f, p = done_rewards[j], int(done_food[j]), int(done_poison[j])
-                        
-                        update_episodes_count += 1
-                        update_reward_sum += r
-                        update_food_sum += f
-                        update_poison_sum += p
-                        
-                        if r > self.best_reward:
-                            self.best_reward = r
-                        
-                        if self.logger:
-                            grid_id = self.vec_env.grid_indices[i]
-                            if isinstance(grid_id, torch.Tensor):
-                                grid_id = grid_id.item()
-                            food_density = self.vec_env.grid_food_counts[grid_id]
-                            if isinstance(food_density, torch.Tensor):
-                                food_density = food_density.item()
-                            avg_food = (self.min_food + self.max_food) / 2
-                            self.logger.log_episode(
-                                episode=self.episode_count,
-                                reward=r,
-                                length=500,
-                                food_eaten=f,
-                                poison_eaten=p,
-                                food_density=food_density,
-                                curriculum_progress=(avg_food - self.min_food) / (self.max_food - self.min_food + 1e-8),
-                                action_prob_std=0.0,  # Skip expensive softmax conversion
-                            )
-                        
-                        episode_rewards[i] = 0.0
+                # Accumulate rewards
+                # episode_rewards += rewards (already done above)
+                
+                # Snapshot current state for logging
+                # We store full tensors to avoid boolean indexing syncs
+                finished_dones_buffer.append(dones)
+                finished_rewards_buffer.append(episode_rewards.clone())
+                
+                # Reset rewards for done agents (Sync-free)
+                # episode_rewards = episode_rewards * (1 - dones)
+                episode_rewards *= (~dones)
+                
             else:
-                # CPU path - dones_t is a tensor now
+                # CPU path - legacy logic
                 done_indices = torch.where(dones_t)[0]
                 if len(done_indices) > 0:
                     done_rewards = episode_rewards[done_indices].cpu().numpy()
@@ -551,7 +554,7 @@ class PPOTrainer:
                     
                     for j, i in enumerate(done_indices.cpu().numpy()):
                         self.episode_count += 1
-                        r, f, p = done_rewards[j], int(done_food[j]), int(done_poison[j])
+                        r, f, p = float(done_rewards[j]), int(done_food[j]), int(done_poison[j])
                         
                         update_episodes_count += 1
                         update_reward_sum += r
@@ -577,6 +580,7 @@ class PPOTrainer:
                             )
                         
                         episode_rewards[i] = 0.0
+
             
             states = next_states
             
@@ -591,7 +595,7 @@ class PPOTrainer:
                     else:
                         states_t = torch.from_numpy(states).float().to(self.device)
                     features = self.policy.get_features(states_t)
-                    next_value = self.value_head(features).squeeze()
+                    next_value = self.value_head(features).squeeze(-1)
                 
                 # Compute GAE - unified function handles both numpy and torch
                 advantages, returns = compute_gae(
@@ -600,23 +604,85 @@ class PPOTrainer:
                 )
                 self.profiler.tick("GAE Calc")
                 
-                # Flatten and prepare buffers for PPO (all tensors stay on GPU)
+                # PROCESS LOGGING (Batch Sync)
                 if self._torch_env:
-                    # GPU path: buffers are tensors
-                    all_states = torch.cat(states_buffer, dim=0)
-                    all_actions = torch.cat(actions_buffer, dim=0)
-                    all_log_probs = torch.cat(log_probs_buffer, dim=0)
-                    all_old_values = torch.stack(values_buffer).flatten()
-                else:
-                    # CPU path: buffers are numpy, convert to tensors
-                    all_states = torch.from_numpy(np.concatenate(states_buffer, axis=0)).float().to(self.device)
-                    all_actions = torch.from_numpy(np.concatenate(actions_buffer, axis=0)).long().to(self.device)
-                    all_log_probs = torch.cat(log_probs_buffer, dim=0)
-                    all_old_values = torch.from_numpy(np.stack(values_buffer).flatten()).float().to(self.device)
+                    # Stack buffers (steps, envs)
+                    all_step_dones = torch.stack(finished_dones_buffer)
+                    all_step_rewards = torch.stack(finished_rewards_buffer)
+                    
+                    # Find ANY completed episodes
+                    # This is the ONLY sync per update
+                    done_coords = all_step_dones.nonzero(as_tuple=False) # (N_events, 2) -> [step, env]
+                    
+                    if done_coords.shape[0] > 0:
+                        # Extract data
+                        steps_idx = done_coords[:, 0]
+                        envs_idx = done_coords[:, 1]
+                        
+                        # Get rewards for the identified events
+                        event_rewards = all_step_rewards[steps_idx, envs_idx]
+                        
+                        # Get food/poison stats (using vectorized lookup)
+                        # Note: last_episode_food might have been overwritten if env finished twice.
+                        # We accept this inaccuracy for performance.
+                        event_food = self.vec_env.last_episode_food[envs_idx]
+                        event_poison = self.vec_env.last_episode_poison[envs_idx]
+                        
+                        # Move to CPU for loop
+                        cpu_rewards = event_rewards.cpu().numpy()
+                        cpu_food = event_food.cpu().numpy()
+                        cpu_poison = event_poison.cpu().numpy()
+                        cpu_env_ids = envs_idx.cpu().numpy()
+                        
+                        # Log
+                        for j, env_id in enumerate(cpu_env_ids):
+                            self.episode_count += 1
+                            r = float(cpu_rewards[j])
+                            f = int(cpu_food[j])
+                            p = int(cpu_poison[j])
+                            
+                            update_episodes_count += 1
+                            update_reward_sum += r
+                            update_food_sum += f
+                            update_poison_sum += p
+                            
+                            if r > self.best_reward:
+                                self.best_reward = r
+                            
+                            if self.logger:
+                                grid_id = self.vec_env.grid_indices[env_id]
+                                if isinstance(grid_id, torch.Tensor):
+                                    grid_id = grid_id.item()
+                                food_density = self.vec_env.grid_food_counts[grid_id]
+                                if isinstance(food_density, torch.Tensor):
+                                    food_density = food_density.item()
+                                avg_food = (self.min_food + self.max_food) / 2
+                                self.logger.log_episode(
+                                    episode=self.episode_count,
+                                    reward=r,
+                                    length=500,
+                                    food_eaten=f,
+                                    poison_eaten=p,
+                                    food_density=food_density,
+                                    curriculum_progress=(avg_food - self.min_food) / (self.max_food - self.min_food + 1e-8),
+                                    action_prob_std=0.0,
+                                )
+                
+                # Flatten and prepare buffers for PPO (all tensors stay on GPU)
+                # Note: Buffers always contain tensors now (converted during collection)
+                all_states = torch.cat(states_buffer, dim=0)
+                all_actions = torch.cat(actions_buffer, dim=0)
+                all_log_probs = torch.cat(log_probs_buffer, dim=0)
+                all_old_values = torch.cat(values_buffer, dim=0)
                 
                 # Returns and advantages from compute_gae (always tensors now)
                 all_returns = returns.flatten()
                 all_advantages = advantages.flatten()
+                
+                if v:
+                    _vprint(f"   [DEBUG] Rewards: mean={torch.cat(rewards_buffer).mean():.4f}, std={torch.cat(rewards_buffer).std():.4f}", v)
+                    _vprint(f"   [DEBUG] Advantages: mean={all_advantages.mean():.4f}, std={all_advantages.std():.4f}", v)
+                    _vprint(f"   [DEBUG] Returns: mean={all_returns.mean():.4f}, std={all_returns.std():.4f}", v)
                 
                 # Normalize advantages
                 all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
@@ -651,6 +717,10 @@ class PPOTrainer:
                 rewards_buffer = []
                 dones_buffer = []
                 values_buffer = []
+
+                # Clear async logging buffers
+                finished_dones_buffer = []
+                finished_rewards_buffer = []
                 
                 # Compute action_probs once for logging (only sync here, not every step)
                 action_probs = F.softmax(last_logits, dim=1)[0].cpu().numpy().tolist()
@@ -717,7 +787,7 @@ class PPOTrainer:
                 window_time = sum(t for s, t in sps_window)
                 sps = window_steps / window_time if window_time > 0 else 0
                 
-                print(f"   [{cfg.mode}] Step {self.total_steps:,}: {sps:,.0f} sps | Best R={self.best_reward:.0f} | Ent={entropy:.3f}")
+                print(f"   [{cfg.mode}] Step {self.total_steps:,}: {sps:,.0f} sps | Best R={self.best_reward:.0f} | Ent={entropy:.3f} | ValL={value_loss:.4f} | ExpV={explained_var:.4f}")
                 print(f"   [Profile] {self.profiler.summary()}")
                 self.profiler.reset()
                 
