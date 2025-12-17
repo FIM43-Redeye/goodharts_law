@@ -88,6 +88,40 @@ class TrainingLogger:
     Designed for easy AI review of training progress.
     """
     
+    @staticmethod
+    def archive_existing_logs(output_dir: str = "logs"):
+        """
+        Move existing log files to logs/previous/ to keep current run clean.
+        
+        Called automatically on first logger creation, or can be called
+        manually before training starts.
+        """
+        logs_dir = Path(output_dir)
+        if not logs_dir.exists():
+            return
+        
+        # Find all log files (csv, json)
+        log_files = list(logs_dir.glob("*_episodes.csv")) + \
+                    list(logs_dir.glob("*_updates.csv")) + \
+                    list(logs_dir.glob("*_summary.json"))
+        
+        if not log_files:
+            return
+        
+        # Create previous directory
+        previous_dir = logs_dir / "previous"
+        previous_dir.mkdir(exist_ok=True)
+        
+        # Move files
+        moved = 0
+        for f in log_files:
+            dest = previous_dir / f.name
+            f.rename(dest)
+            moved += 1
+        
+        if moved > 0:
+            print(f"[Logs] Archived {moved} previous log files to {previous_dir}/")
+    
     def __init__(self, mode: str, output_dir: str = "logs", log_episodes: bool = True):
         """
         Initialize logger for a training run.

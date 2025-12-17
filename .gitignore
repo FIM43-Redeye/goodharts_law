@@ -9,6 +9,7 @@ models/
 visualizations/
 logs/
 evaluations/
+analysis/
 
 # C extensions
 *.so
@@ -150,3 +151,4 @@ cython_debug/
 personal/
 .agent/
 config.toml
+misc/

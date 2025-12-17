@@ -114,6 +114,10 @@ def main():
         except OSError:
             pass
 
+    # Archive existing logs to keep current run clean
+    from goodharts.training.train_log import TrainingLogger
+    TrainingLogger.archive_existing_logs()
+
     config = get_config()
     train_cfg = get_training_config()
     all_modes = get_all_mode_names(config)
@@ -214,14 +218,17 @@ def main():
  
  
 def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool):
-    """Run training with live dashboard."""
-    from goodharts.training.train_dashboard import create_dashboard
+    """Run training with live dashboard in separate process."""
+    from goodharts.training.train_dashboard import create_dashboard_process
     from goodharts.behaviors.action_space import num_actions
     
     train_cfg = get_training_config()
     
-    print(f"\nTraining with dashboard")
-    dashboard = create_dashboard(modes_to_train, n_actions=num_actions(1))
+    print(f"\nTraining with dashboard (process-isolated)")
+    
+    # Create dashboard in separate process
+    dashboard = create_dashboard_process(modes_to_train, n_actions=num_actions(1))
+    dashboard.start()
     
     # For parallel training, do warmup first
     compile_models = overrides.get('compile_models', train_cfg.get('compile_models', True))
@@ -229,10 +236,11 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool)
     n_minibatches = overrides.get('n_minibatches', train_cfg.get('n_minibatches', 4))
     brain_type = overrides.get('brain_type', train_cfg.get('brain_type', 'base_cnn'))
     
-    if sequential:
-        def sequential_training():
+    try:
+        if sequential:
+            # Sequential: run training in main thread (better GPU perf)
             for mode in modes_to_train:
-                # Check if stop was requested before starting next run
+                # Check if stop was requested or dashboard closed
                 if os.path.exists('.training_stop_signal'):
                     print(f"[Sequential] Stop signal detected, skipping remaining modes")
                     try:
@@ -240,6 +248,10 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool)
                     except OSError:
                         pass
                     break
+                if not dashboard.is_alive():
+                    print("[Sequential] Dashboard closed, stopping training")
+                    break
+                    
                 train_ppo(
                     mode=mode,
                     dashboard=dashboard,
@@ -247,45 +259,39 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool)
                     log_to_file=True,
                     **overrides
                 )
-        
-        t = threading.Thread(target=sequential_training, daemon=True)
-        t.start()
-        
-        try:
-            dashboard.run()
-        except KeyboardInterrupt:
-            print("\nTraining interrupted")
-        
-        t.join(timeout=1.0)
-    else:
-        # Parallel: warmup first if compiling
-        if compile_models:
-            _warmup_compile(brain_type, n_envs, n_minibatches)
-        
-        threads = []
-        for mode in modes_to_train:
-            t = threading.Thread(
-                target=train_ppo,
-                kwargs={
-                    'mode': mode,
-                    'dashboard': dashboard,
-                    'output_path': f'models/ppo_{mode}.pth',
-                    'log_to_file': True,
-                    'skip_warmup': True,  # Already warmed up
-                    **overrides
-                },
-                daemon=True
-            )
-            threads.append(t)
-            t.start()
-        
-        try:
-            dashboard.run()
-        except KeyboardInterrupt:
-            print("\nTraining interrupted")
-        
-        for t in threads:
-            t.join(timeout=1.0)
+        else:
+            # Parallel: warmup first if compiling
+            if compile_models:
+                _warmup_compile(brain_type, n_envs, n_minibatches)
+            
+            threads = []
+            for mode in modes_to_train:
+                t = threading.Thread(
+                    target=train_ppo,
+                    kwargs={
+                        'mode': mode,
+                        'dashboard': dashboard,
+                        'output_path': f'models/ppo_{mode}.pth',
+                        'log_to_file': True,
+                        'skip_warmup': True,  # Already warmed up
+                        **overrides
+                    },
+                    daemon=True
+                )
+                threads.append(t)
+                t.start()
+            
+            # Wait for all threads to complete
+            for t in threads:
+                t.join()
+                
+    except KeyboardInterrupt:
+        print("\nTraining interrupted")
+    
+    # Don't auto-close dashboard - let user take screenshots
+    # Dashboard will close when user closes the window
+    if dashboard.is_alive():
+        print("\n[Dashboard] Training complete. Close the dashboard window when done.")
 
 
 def _run_without_dashboard(modes_to_train: list, overrides: dict, sequential: bool):

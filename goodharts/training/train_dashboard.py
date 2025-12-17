@@ -424,7 +424,7 @@ class TrainingDashboard:
         self.ani = FuncAnimation(
             self.fig,
             self._update_frame,
-            interval=500,  # 2 FPS instead of 5 - reduces GIL contention with training thread
+            interval=200,  # Check every 200ms, but only redraw if dirty flag is set
             blit=False,
             cache_frame_data=False
         )
@@ -440,6 +440,142 @@ class TrainingDashboard:
 
 def create_dashboard(modes: list[str], n_actions: int = 8) -> TrainingDashboard:
     return TrainingDashboard(modes, n_actions)
+
+
+# =============================================================================
+# MULTIPROCESSING DASHBOARD - Runs in separate process for zero overhead
+# =============================================================================
+
+import multiprocessing as mp
+from multiprocessing import Process, Queue as MPQueue
+
+
+def _dashboard_process_worker(modes: list[str], n_actions: int, update_queue: MPQueue, stop_event):
+    """
+    Worker function that runs in separate process.
+    
+    Completely isolated from training process - has its own GIL and GPU context.
+    """
+    # Create dashboard in this process
+    dashboard = TrainingDashboard(modes, n_actions)
+    
+    # Override the queue to use multiprocessing queue
+    # We'll poll the mp queue and put items into the dashboard's internal queue
+    
+    def poll_queue():
+        """Poll mp queue and transfer to dashboard queue."""
+        while not stop_event.is_set():
+            try:
+                item = update_queue.get(timeout=0.05)
+                if item is None:  # Poison pill
+                    dashboard.running = False
+                    break
+                mode, update_type, data = item
+                dashboard.update(mode, update_type, data)
+            except:
+                pass  # Queue empty or timeout
+    
+    # Start polling thread within dashboard process
+    import threading
+    poll_thread = threading.Thread(target=poll_queue, daemon=True)
+    poll_thread.start()
+    
+    # Run dashboard (blocks until window closed)
+    try:
+        dashboard.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+
+
+class DashboardProcess:
+    """
+    Dashboard that runs in a completely separate process.
+    
+    This eliminates GIL contention and GPU/display sync overhead by keeping
+    matplotlib in its own isolated process. Training communicates via IPC queue.
+    
+    Usage:
+        dashboard = DashboardProcess(modes=['ground_truth', 'proxy'])
+        dashboard.start()
+        
+        # In training loop:
+        dashboard.send_update('ground_truth', 'update', {'ppo': (...), ...})
+        
+        # When done:
+        dashboard.stop()
+    """
+    
+    def __init__(self, modes: list[str], n_actions: int = 8):
+        self.modes = modes
+        self.n_actions = n_actions
+        
+        # Use 'spawn' context to ensure clean process (no forked state)
+        # This is critical for CUDA/ROCm to work correctly in child process
+        ctx = mp.get_context('spawn')
+        
+        self._queue: MPQueue = ctx.Queue(maxsize=1000)
+        self._stop_event = ctx.Event()
+        self._process: Process = None
+    
+    def start(self):
+        """Start the dashboard process."""
+        ctx = mp.get_context('spawn')
+        self._process = ctx.Process(
+            target=_dashboard_process_worker,
+            args=(self.modes, self.n_actions, self._queue, self._stop_event),
+            daemon=True
+        )
+        self._process.start()
+        print(f"[Dashboard] Started in separate process (PID {self._process.pid})")
+    
+    def send_update(self, mode: str, update_type: str, data: dict):
+        """
+        Send an update to the dashboard process.
+        
+        Non-blocking. If queue is full, update is dropped (dashboard is behind).
+        
+        Args:
+            mode: Training mode (e.g., 'ground_truth')
+            update_type: 'update' or 'finished'
+            data: Payload dict (must be picklable - no torch tensors!)
+        """
+        try:
+            self._queue.put_nowait((mode, update_type, data))
+        except:
+            pass  # Queue full, drop update
+    
+    # Alias for compatibility with existing code
+    def update(self, mode: str, update_type: str, data: dict):
+        """Alias for send_update() - compatible with TrainingDashboard interface."""
+        self.send_update(mode, update_type, data)
+    
+    def is_alive(self) -> bool:
+        """Check if dashboard process is still running."""
+        return self._process is not None and self._process.is_alive()
+    
+    def stop(self, timeout: float = 2.0):
+        """Stop the dashboard process gracefully."""
+        self._stop_event.set()
+        self._queue.put(None)  # Poison pill
+        
+        if self._process is not None:
+            self._process.join(timeout=timeout)
+            if self._process.is_alive():
+                print("[Dashboard] Force terminating...")
+                self._process.terminate()
+                self._process.join(timeout=1.0)
+    
+    def wait(self):
+        """Wait for dashboard to close (user closed window)."""
+        if self._process is not None:
+            self._process.join()
+
+
+def create_dashboard_process(modes: list[str], n_actions: int = 8) -> DashboardProcess:
+    """Factory function to create a process-isolated dashboard."""
+    return DashboardProcess(modes, n_actions)
 
 
 # =============================================================================

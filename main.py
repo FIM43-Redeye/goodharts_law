@@ -201,10 +201,16 @@ def main():
         visualizer = BrainVisualizer(model)
         print(f"[Layers] Discovered: {visualizer.get_displayable_layers()}")
         
-        # Do one forward pass to initialize activations
+        # Do one forward pass to initialization activations
         import torch
         device = next(model.parameters()).device
-        obs_tensor = torch.from_numpy(obs).float().unsqueeze(0).to(device)
+        
+        # Obs is already a tensor (C, H, W)
+        if isinstance(obs, torch.Tensor):
+            obs_tensor = obs.float().unsqueeze(0).to(device)
+        else:
+            obs_tensor = torch.from_numpy(obs).float().unsqueeze(0).to(device)
+             
         with torch.no_grad():
             model(obs_tensor)
         
