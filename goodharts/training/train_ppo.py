@@ -68,34 +68,19 @@ def _warmup_compile(brain_type: str, n_envs: int, n_minibatches: int):
 
 def train_ppo(
     mode: str = 'ground_truth',
-    brain_type: str = 'base_cnn',
-    n_envs: int = 64,
-    total_timesteps: int = 100_000,
-    entropy_coef: float = 0.02,
-    output_path: str = 'models/ppo_agent.pth',
     dashboard = None,
-    log_to_file: bool = True,
-    use_amp: bool = False,
-    compile_models: bool = True,
-    **kwargs
+    **overrides
 ) -> dict:
     """
     Train a PPO agent.
     
-    This is a convenience wrapper around PPOTrainer for backwards compatibility
-    and multi-threaded training coordination.
+    Uses config.toml for defaults; explicit kwargs override them.
+    This is a convenience wrapper around PPOTrainer.
     
     Args:
         mode: Training mode (ground_truth, proxy, etc.)
-        brain_type: Neural network architecture
-        n_envs: Number of parallel environments
-        total_timesteps: Total environment steps
-        entropy_coef: Entropy bonus coefficient
-        output_path: Where to save the trained model
         dashboard: Optional training dashboard
-        log_to_file: Whether to log training metrics
-        use_amp: Enable automatic mixed precision
-        compile_models: Whether to use torch.compile (disable for parallel training)
+        **overrides: Any PPOConfig fields to override
         
     Returns:
         Summary dict with training results
@@ -106,23 +91,8 @@ def train_ppo(
         _TRAINING_COUNTER += 1
     
     try:
-        config = PPOConfig(
-            mode=mode,
-            brain_type=brain_type,
-            n_envs=n_envs,
-            total_timesteps=total_timesteps,
-            entropy_coef=entropy_coef,
-            output_path=output_path,
-            log_to_file=log_to_file,
-            use_amp=use_amp,
-            compile_models=compile_models,
-            n_minibatches=kwargs.get('n_minibatches', 4),
-            tensorboard=kwargs.get('tensorboard', False),
-            skip_warmup=kwargs.get('skip_warmup', False),
-            use_torch_env=kwargs.get('use_torch_env', False),
-            hyper_verbose=kwargs.get('hyper_verbose', False),
-            clean_cache=kwargs.get('clean_cache', False),
-        )
+        # Use factory method - config.toml provides defaults, overrides take precedence
+        config = PPOConfig.from_config(mode=mode, **overrides)
         
         trainer = PPOTrainer(config, dashboard=dashboard)
         return trainer.train()
@@ -153,121 +123,119 @@ def main():
     all_modes = get_all_mode_names(config)
     brain_names = get_brain_names()
     
-    parser = argparse.ArgumentParser(description='PPO training for Goodhart agents')
+    parser = argparse.ArgumentParser(
+        description='PPO training for Goodhart agents. Config file provides defaults; CLI args override.',
+        epilog='Most settings can be changed in config.toml instead of using CLI args.'
+    )
     parser.add_argument('--mode', default='ground_truth', choices=all_modes + ['all'],
                         help='Training mode (or "all" for parallel training)')
-    parser.add_argument('--brain', default='base_cnn', choices=brain_names,
-                        help='Neural network architecture')
+    parser.add_argument('--brain', default=None, choices=brain_names,
+                        help='Override neural network architecture')
     parser.add_argument('--timesteps', type=int, default=None,
-                        help='Total environment steps (default: 100,000)')
+                        help='Override total environment steps')
     parser.add_argument('--updates', type=int, default=None,
                         help='Number of PPO updates (alternative to --timesteps)')
     parser.add_argument('--entropy', type=float, default=None,
-                        help='Entropy coefficient (default: from config)')
+                        help='Override entropy coefficient')
     parser.add_argument('--dashboard', '-d', action='store_true',
                         help='Show live training dashboard')
     parser.add_argument('--sequential', '-s', action='store_true',
                         help='Train modes sequentially (saves VRAM)')
-    parser.add_argument('--n-envs', type=int, default=64,
-                        help='Number of parallel environments')
+    parser.add_argument('--n-envs', type=int, default=None,
+                        help='Override number of parallel environments')
     parser.add_argument('--use-amp', action='store_true', default=None,
-                        help='Enable automatic mixed precision (FP16)')
+                        help='Force enable automatic mixed precision')
     parser.add_argument('--no-amp', action='store_true',
-                        help='Disable automatic mixed precision')
+                        help='Force disable automatic mixed precision')
     parser.add_argument('--minibatches', type=int, default=None,
-                        help='Number of minibatches per epoch (default: from config)')
+                        help='Override minibatches per epoch')
     parser.add_argument('--no-warmup', action='store_true',
-                        help='Skip warmup (disables torch.compile and cuDNN benchmark for faster startup but slower training)')
+                        help='Skip warmup (faster startup but slower training)')
     parser.add_argument('--tensorboard', '-tb', action='store_true',
-                        help='Enable TensorBoard logging (works on Colab)')
-    parser.add_argument('--torch-env', action='store_true',
-                        help='Use GPU-native TorchVecEnv (faster on powerful GPUs)')
+                        help='Enable TensorBoard logging')
     parser.add_argument('--hyper-verbose', action='store_true',
-                        help='Debug mode: print at every major step (for TPU debugging)')
+                        help='Debug mode: print at every major step')
     parser.add_argument('--clean-cache', action='store_true',
-                        help='Delete existing compilation cache before starting')
+                        help='Delete compilation cache before starting')
     args = parser.parse_args()
     
-    # Determine steps_per_env for update calculation
+    # Build overrides dict from CLI args (only non-None values)
+    overrides = {}
+    
+    if args.brain:
+        overrides['brain_type'] = args.brain
+    if args.n_envs:
+        overrides['n_envs'] = args.n_envs
+    if args.entropy:
+        overrides['entropy_coef'] = args.entropy
+    if args.minibatches:
+        overrides['n_minibatches'] = args.minibatches
+    if args.tensorboard:
+        overrides['tensorboard'] = True
+    if args.hyper_verbose:
+        overrides['hyper_verbose'] = True
+    if args.clean_cache:
+        overrides['clean_cache'] = True
+    
+    # Handle timesteps (--updates is a convenience conversion)
+    n_envs = args.n_envs or train_cfg.get('n_envs', 64)
     steps_per_env = train_cfg.get('steps_per_env', 128)
-    
-    # Determine AMP setting: CLI overrides config
-    if args.no_amp:
-        use_amp = False
-    elif args.use_amp:
-        use_amp = True
-    else:
-        amp_cfg = train_cfg.get('use_amp', 'auto')
-        if amp_cfg == 'auto':
-            from goodharts.utils.device import get_amp_support
-            use_amp = get_amp_support(verbose=True)
-        else:
-            use_amp = bool(amp_cfg)
-    
-    # Determine timesteps
     if args.updates is not None:
-        total_timesteps = args.updates * args.n_envs * steps_per_env
-        print(f"   {args.updates} updates x {args.n_envs} envs x {steps_per_env} steps = {total_timesteps:,} timesteps")
+        overrides['total_timesteps'] = args.updates * n_envs * steps_per_env
+        print(f"   {args.updates} updates x {n_envs} envs x {steps_per_env} steps = {overrides['total_timesteps']:,} timesteps")
     elif args.timesteps is not None:
-        total_timesteps = args.timesteps
-    else:
-        total_timesteps = 100_000
+        overrides['total_timesteps'] = args.timesteps
     
-    modes_to_train = all_modes if args.mode == 'all' else [args.mode]
-    entropy_coef = args.entropy if args.entropy is not None else train_cfg.get('entropy_coef', 0.02)
-    n_minibatches = args.minibatches if args.minibatches is not None else train_cfg.get('n_minibatches', 4)
+    # Handle AMP: --no-amp > --use-amp > config
+    if args.no_amp:
+        overrides['use_amp'] = False
+    elif args.use_amp:
+        overrides['use_amp'] = True
+    # else: use config default
     
-    # Determine warmup/compile settings
-    # --no-warmup disables torch.compile AND cuDNN benchmark for fastest startup (but slower training)
+    # Handle --no-warmup
     if args.no_warmup:
-        compile_models = False
-        # Set env var to prevent device.py from re-enabling cuDNN benchmark
+        overrides['compile_models'] = False
+        overrides['skip_warmup'] = True
         os.environ['GOODHARTS_CUDNN_BENCHMARK'] = '0'
         import torch
         torch.backends.cudnn.benchmark = False
         print("   Warmup disabled: torch.compile and cuDNN benchmark OFF")
-    else:
-        compile_models = True
     
-    print(f"   Entropy coefficient: {entropy_coef}")
+    modes_to_train = all_modes if args.mode == 'all' else [args.mode]
     
     # Training execution
     if args.dashboard:
-        _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches, compile_models)
+        _run_with_dashboard(modes_to_train, overrides, args.sequential)
     else:
-        _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches, compile_models)
+        _run_without_dashboard(modes_to_train, overrides, args.sequential)
  
  
-def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches, compile_models):
+def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool):
     """Run training with live dashboard."""
     from goodharts.training.train_dashboard import create_dashboard
     from goodharts.behaviors.action_space import num_actions
     
+    train_cfg = get_training_config()
+    
     print(f"\nTraining with dashboard")
     dashboard = create_dashboard(modes_to_train, n_actions=num_actions(1))
     
-    if args.sequential:
-        # Sequential: train one at a time in background
+    # For parallel training, do warmup first
+    compile_models = overrides.get('compile_models', train_cfg.get('compile_models', True))
+    n_envs = overrides.get('n_envs', train_cfg.get('n_envs', 64))
+    n_minibatches = overrides.get('n_minibatches', train_cfg.get('n_minibatches', 4))
+    brain_type = overrides.get('brain_type', train_cfg.get('brain_type', 'base_cnn'))
+    
+    if sequential:
         def sequential_training():
             for mode in modes_to_train:
-                output_path = f'models/ppo_{mode}.pth'
                 train_ppo(
                     mode=mode,
-                    brain_type=args.brain,
-                    n_envs=args.n_envs,
-                    total_timesteps=total_timesteps,
-                    entropy_coef=entropy_coef,
-                    output_path=output_path,
                     dashboard=dashboard,
+                    output_path=f'models/ppo_{mode}.pth',
                     log_to_file=True,
-                    use_amp=use_amp,
-                    compile_models=compile_models,
-                    n_minibatches=n_minibatches,
-                    tensorboard=args.tensorboard,
-                    use_torch_env=args.torch_env,
-                    hyper_verbose=args.hyper_verbose,
-                    skip_warmup=not compile_models,  # Skip warmup when --no-warmup
-                    clean_cache=args.clean_cache,
+                    **overrides
                 )
         
         t = threading.Thread(target=sequential_training, daemon=True)
@@ -280,33 +248,21 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
         
         t.join(timeout=1.0)
     else:
-        # Parallel: all modes at once
-        # First, do single-threaded warmup to populate kernel cache
+        # Parallel: warmup first if compiling
         if compile_models:
-            _warmup_compile(args.brain, args.n_envs, n_minibatches)
+            _warmup_compile(brain_type, n_envs, n_minibatches)
         
         threads = []
         for mode in modes_to_train:
-            output_path = f'models/ppo_{mode}.pth'
             t = threading.Thread(
                 target=train_ppo,
                 kwargs={
                     'mode': mode,
-                    'brain_type': args.brain,
-                    'n_envs': args.n_envs,
-                    'total_timesteps': total_timesteps,
-                    'entropy_coef': entropy_coef,
-                    'output_path': output_path,
                     'dashboard': dashboard,
+                    'output_path': f'models/ppo_{mode}.pth',
                     'log_to_file': True,
-                    'use_amp': use_amp,
-                    'compile_models': compile_models,
-                    'n_minibatches': n_minibatches,
-                    'tensorboard': args.tensorboard,
-                    'skip_warmup': True,
-                    'clean_cache': args.clean_cache,
-                    'use_torch_env': args.torch_env,
-                    'hyper_verbose': args.hyper_verbose,
+                    'skip_warmup': True,  # Already warmed up
+                    **overrides
                 },
                 daemon=True
             )
@@ -322,38 +278,32 @@ def _run_with_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use
             t.join(timeout=1.0)
 
 
-
-def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, use_amp, n_minibatches, compile_models):
+def _run_without_dashboard(modes_to_train: list, overrides: dict, sequential: bool):
     """Run training without dashboard."""
-    if len(modes_to_train) > 1 and not args.sequential:
+    train_cfg = get_training_config()
+    
+    compile_models = overrides.get('compile_models', train_cfg.get('compile_models', True))
+    n_envs = overrides.get('n_envs', train_cfg.get('n_envs', 64))
+    n_minibatches = overrides.get('n_minibatches', train_cfg.get('n_minibatches', 4))
+    brain_type = overrides.get('brain_type', train_cfg.get('brain_type', 'base_cnn'))
+    
+    if len(modes_to_train) > 1 and not sequential:
         # Parallel training
         print(f"\nParallel training: {len(modes_to_train)} modes")
         
-        # First, do single-threaded warmup to populate kernel cache
         if compile_models:
-            _warmup_compile(args.brain, args.n_envs, n_minibatches)
+            _warmup_compile(brain_type, n_envs, n_minibatches)
         
         threads = []
         for mode in modes_to_train:
-            output_path = f'models/ppo_{mode}.pth'
             t = threading.Thread(
                 target=train_ppo,
                 kwargs={
                     'mode': mode,
-                    'brain_type': args.brain,
-                    'n_envs': args.n_envs,
-                    'total_timesteps': total_timesteps,
-                    'entropy_coef': entropy_coef,
-                    'output_path': output_path,
+                    'output_path': f'models/ppo_{mode}.pth',
                     'log_to_file': True,
-                    'use_amp': use_amp,
-                    'compile_models': compile_models,
-                    'n_minibatches': n_minibatches,
-                    'tensorboard': args.tensorboard,
                     'skip_warmup': True,
-                    'clean_cache': args.clean_cache,
-                    'use_torch_env': args.torch_env,
-                    'hyper_verbose': args.hyper_verbose,
+                    **overrides
                 }
             )
             threads.append(t)
@@ -366,25 +316,14 @@ def _run_without_dashboard(modes_to_train, args, total_timesteps, entropy_coef, 
         if len(modes_to_train) > 1:
             print(f"\nSequential training: {len(modes_to_train)} modes")
         for mode in modes_to_train:
-            output_path = f'models/ppo_{mode}.pth'
             train_ppo(
                 mode=mode,
-                brain_type=args.brain,
-                n_envs=args.n_envs,
-                total_timesteps=total_timesteps,
-                entropy_coef=entropy_coef,
-                output_path=output_path,
+                output_path=f'models/ppo_{mode}.pth',
                 log_to_file=len(modes_to_train) > 1,
-                use_amp=use_amp,
-                compile_models=compile_models,
-                n_minibatches=n_minibatches,
-                tensorboard=args.tensorboard,
-                use_torch_env=args.torch_env,
-                hyper_verbose=args.hyper_verbose,
-                skip_warmup=not compile_models,  # Skip warmup when --no-warmup
-                clean_cache=args.clean_cache,
+                **overrides
             )
 
 
 if __name__ == '__main__':
     main()
+

@@ -1,5 +1,5 @@
 import pytest
-import numpy as np
+import torch
 from goodharts.simulation import Simulation
 from goodharts.configs.default_config import get_config
 
@@ -60,4 +60,5 @@ def test_agent_death_cleanup(config):
 def test_heatmap_update(config):
     sim = Simulation(config)
     sim.step()
-    assert np.sum(sim.stats['heatmap']['all']) > 0
+    # Heatmap is now a Torch tensor
+    assert sim.stats['heatmap']['all'].sum().item() > 0

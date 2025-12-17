@@ -171,10 +171,10 @@ def main():
     config = setup_config(args)
     sim = Simulation(config)
     
-    print(f"\n🌍 World: {config['GRID_WIDTH']}x{config['GRID_HEIGHT']}")
-    print(f"🍎 Food: {config['GRID_FOOD_INIT']} | ☠️  Poison: {config['GRID_POISON_INIT']}")
-    print(f"👁️  View range: {config['AGENT_VIEW_RANGE']}")
-    print(f"\n▶️  Starting simulation... (close window to exit)\n")
+    print(f"\n[World] {config['GRID_WIDTH']}x{config['GRID_HEIGHT']}")
+    print(f"[Food] {config['GRID_FOOD_INIT']} | [Poison] {config['GRID_POISON_INIT']}")
+    print(f"[View] range: {config['AGENT_VIEW_RANGE']}")
+    print(f"\n[Start] Starting simulation... (close window to exit)\n")
     
     if args.brain_view:
         # Brain view mode - visualize neural network internals
@@ -183,7 +183,7 @@ def main():
         # Find the first learned agent (has get_brain method)
         learned_agents = [a for a in sim.agents if hasattr(a.behavior, 'get_brain')]
         if not learned_agents:
-            print("❌ No learned agents found! Use --learned flag.")
+            print("[ERROR] No learned agents found! Use --learned flag.")
             return
         
         agent = learned_agents[0]
@@ -194,12 +194,12 @@ def main():
         
         model = agent.behavior.get_brain()
         if model is None:
-            print("❌ Brain failed to initialize!")
+            print("[ERROR] Brain failed to initialize!")
             return
         
         # Create visualizer
         visualizer = BrainVisualizer(model)
-        print(f"🔍 Discovered layers: {visualizer.get_displayable_layers()}")
+        print(f"[Layers] Discovered: {visualizer.get_displayable_layers()}")
         
         # Do one forward pass to initialize activations
         import torch

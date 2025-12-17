@@ -9,8 +9,16 @@ from matplotlib import colors
 from matplotlib.patches import Patch
 from matplotlib.widgets import RadioButtons
 import numpy as np
+import torch
 
 from goodharts.configs.default_config import CellType
+
+
+def _to_numpy(data):
+    """Convert data to numpy array, handling both tensors and arrays."""
+    if isinstance(data, torch.Tensor):
+        return data.cpu().numpy()
+    return data
 
 
 def build_colormap() -> colors.ListedColormap:
@@ -151,8 +159,9 @@ def create_standard_layout(sim):
     ax_energy.legend(loc='upper right', fontsize=8)
     
     # 3. Heatmap
-    # Initialize with 'all'
-    img_heatmap = ax_heatmap.imshow(sim.stats['heatmap']['all'], cmap='hot', interpolation='nearest')
+    # Initialize with 'all' - convert Torch tensor to NumPy for matplotlib
+    heatmap_data = _to_numpy(sim.stats['heatmap']['all'])
+    img_heatmap = ax_heatmap.imshow(heatmap_data, cmap='hot', interpolation='nearest')
     ax_heatmap.set_title("Activity Heatmap (All)")
     ax_heatmap.axis('off')
     plt.colorbar(img_heatmap, ax=ax_heatmap, fraction=0.046)
@@ -445,9 +454,10 @@ def update_frame(frame, sim, viz, args):
     # Check Radio Button selection
     selected_source = viz['radio'].value_selected
     heatmap_data = sim.stats['heatmap'].get(selected_source, sim.stats['heatmap']['all'])
+    heatmap_np = _to_numpy(heatmap_data)
     
-    viz['img_heatmap'].set_data(heatmap_data)
-    hmap_max = np.max(heatmap_data)
+    viz['img_heatmap'].set_data(heatmap_np)
+    hmap_max = np.max(heatmap_np)
     if hmap_max > 0:
         viz['img_heatmap'].set_clim(vmax=hmap_max)
     

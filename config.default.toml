@@ -98,14 +98,19 @@ min_food = 50               # Minimum food count during training
 max_food = 200              # Maximum food count during training  
 min_poison = 20             # Minimum poison count during training
 max_poison = 100            # Maximum poison count during training
-steps_per_episode = 500     # Max steps per episode
+steps_per_episode = 512     # Max steps per episode
 
 # PPO hyperparameters
-learning_rate = 0.0003       # 3e-4 (Please god let this work)
+learning_rate = 0.0003       # 3e-4
 gamma = 0.99                # Discount factor
+gae_lambda = 0.95           # GAE lambda (bias-variance tradeoff)
 eps_clip = 0.2              # PPO clipping parameter
 k_epochs = 4                # PPO epochs per update
-steps_per_env = 128       # Horizon length for PPO (critical for GAE)
+steps_per_env = 128         # Horizon length for PPO (critical for GAE)
+n_envs = 64                 # Number of parallel environments
+n_minibatches = 4           # Minibatches per epoch (fewer = faster but more VRAM)
+value_coef = 0.5            # Value loss coefficient
+brain_type = "base_cnn"     # Neural network architecture
 
 # Reward shaping - provides gradient toward food/away from poison
 reward_scale = 0.1          # Standardize rewards (was 1.0)

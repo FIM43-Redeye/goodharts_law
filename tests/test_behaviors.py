@@ -1,6 +1,6 @@
 """Tests for behavior implementations."""
 import pytest
-import numpy as np
+import torch
 from goodharts.configs.default_config import get_config
 
 
@@ -40,7 +40,7 @@ class TestOmniscientSeeker:
         # We must ensure the view has enough channels
         
         max_channel = max(ct.channel_index for ct in CellType.all_types())
-        view = np.zeros((max_channel + 1, size, size), dtype=np.float32)
+        view = torch.zeros((max_channel + 1, size, size), dtype=torch.float32)
         
         # Place food relative to center (r, r)
         # Agent at (3, 5), Food at (5, 5) -> dx=2, dy=0
@@ -63,7 +63,7 @@ class TestOmniscientSeeker:
         r = 5
         size = 2*r + 1
         max_channel = max(ct.channel_index for ct in CellType.all_types())
-        view = np.zeros((max_channel + 1, size, size), dtype=np.float32)
+        view = torch.zeros((max_channel + 1, size, size), dtype=torch.float32)
         
         # Place poison directly to the right (r, r+1)
         view[CellType.POISON.channel_index, r, r+1] = 1.0
@@ -94,7 +94,7 @@ class TestProxySeeker:
         
         r = 5
         size = 2*r + 1
-        view = np.zeros((1, size, size), dtype=np.float32)
+        view = torch.zeros((1, size, size), dtype=torch.float32)
         
         # High interestingness to the right
         view[0, r, r+2] = 1.0

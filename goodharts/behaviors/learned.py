@@ -5,10 +5,9 @@ Supports training on either ground-truth or proxy signals,
 enabling empirical demonstration of Goodhart's Law.
 """
 import torch
-import numpy as np
 from goodharts.behaviors import BehaviorStrategy
 from goodharts.behaviors.brains.base_cnn import BaseCNN
-from goodharts.behaviors.action_space import build_action_space, action_to_index, index_to_action, num_actions
+from goodharts.behaviors.action_space import build_action_space
 from goodharts.utils.device import get_device
 
 
@@ -129,14 +128,14 @@ class LearnedBehavior(BehaviorStrategy):
         self.brain.to(self.device)
         self.brain.eval()
 
-    def get_action_logits(self, view: np.ndarray) -> torch.Tensor:
+    def get_action_logits(self, view: torch.Tensor) -> torch.Tensor:
         """
         Get raw logits from the neural network.
         
         Useful for training and saliency visualization.
         
         Args:
-            view: 3D numpy array (channels, H, W) or 2D (H, W) for backward compat
+            view: Tensor (channels, H, W) on device
             
         Returns:
             Tensor of shape (1, num_actions) with raw scores
@@ -144,7 +143,15 @@ class LearnedBehavior(BehaviorStrategy):
         if self.brain is None:
             self._init_brain(view.shape)
         
-        tensor_view = torch.from_numpy(view).float().to(self.device)
+        # Ensure view is tensor
+        if not isinstance(view, torch.Tensor):
+            # Fallback (should prevent this but just in case)
+            tensor_view = torch.from_numpy(view).float().to(self.device)
+        else:
+            tensor_view = view.float()
+            
+        if tensor_view.device != self.device:
+            tensor_view = tensor_view.to(self.device)
         
         # Handle both 2D (H, W) and 3D (C, H, W) inputs
         if tensor_view.dim() == 2:
@@ -156,7 +163,7 @@ class LearnedBehavior(BehaviorStrategy):
         
         return self.brain(input_tensor)
 
-    def decide_action(self, agent, view: np.ndarray) -> tuple[int, int]:
+    def decide_action(self, agent, view: torch.Tensor) -> tuple[int, int]:
         """
         Decides the next action using the neural network.
         
@@ -165,14 +172,17 @@ class LearnedBehavior(BehaviorStrategy):
         
         Args:
             agent: The organism instance (unused but required by interface)
-            view: The local view of the environment
+            view: The local view of the environment (Tensor)
         
         Returns:
             (dx, dy) movement vector
         """
         # Epsilon-greedy exploration (for training)
-        if self.epsilon > 0 and np.random.random() < self.epsilon:
-            idx = np.random.randint(0, self.num_actions)
+        # Use torch.rand for consistency
+        if self.epsilon > 0 and torch.rand(1).item() < self.epsilon:
+            # Random action
+            from goodharts.behaviors.action_space import num_actions
+            idx = torch.randint(0, num_actions(self.max_move_distance), (1,)).item()
             return self._actions[idx]
         
         # Neural network inference
