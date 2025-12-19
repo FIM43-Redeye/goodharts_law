@@ -2,12 +2,31 @@
 
 > "When a measure becomes a target, it ceases to be a good measure." — Charles Goodhart
 
-A multi-agent simulation demonstrating AI alignment failures through **metric optimization vs. true objectives**. Agents navigate a 2D grid world where they can see either the *ground truth* (what's actually food vs. poison) or only a *proxy metric* (an "interestingness" signal). Proxy-optimizing agents inevitably eat poison—a visceral demonstration of Goodhart's Law in action.
+An empirical demonstration of Goodhart's Law in reinforcement learning. Agents navigate a 2D grid world collecting food and avoiding poison. **Ground-truth agents** see real cell types and thrive. **Proxy agents** see only an "interestingness" signal—and eat 4× more poison.
+
+This project provides a concrete, reproducible example of how optimizing for proxy metrics leads to alignment failures, even when the proxy seems reasonable.
+
+---
+
+## Results
+
+Trained agents evaluated over 1,000 episodes each (512 steps/episode):
+
+| Mode | Observation | Reward Signal | Food | Poison | Poison Ratio |
+|------|-------------|---------------|------|--------|--------------|
+| **ground_truth** | Real cell types | Energy | 185.0 | 0.8 | 1.0× (baseline) |
+| **proxy_jammed** | Interestingness only | Interestingness | 162.1 | 3.5 | **4.3×** |
+| **proxy** | Interestingness only | Energy | 42.2 | 3.8 | 4.7× |
+
+**Key finding:** The `proxy_jammed` agent—which optimizes purely for "interestingness"—eats **4.3× more poison** than the ground-truth agent while collecting nearly as much food. It has successfully optimized for the proxy metric, but this optimization is misaligned with the true objective (survival).
+
+The `proxy` agent performs worst overall because it faces an impossible learning problem: it's rewarded based on energy changes it cannot observe, creating a credit assignment nightmare.
 
 ---
 
 ## Table of Contents
 
+- [Results](#results)
 - [Core Concept](#core-concept)
 - [Project Structure](#project-structure)
 - [Quick Start](#quick-start)
@@ -71,7 +90,7 @@ goodharts_law/
 │   │
 │   ├── environments/
 │   │   ├── base.py             # Environment abstract base class
-│   │   └── vec_env.py          # High-performance vectorized environment
+│   │   └── torch_env.py        # GPU-native vectorized environment
 │   │
 │   ├── configs/
 │   │   └── default_config.py   # CellType enum, get_config(), defaults
@@ -234,9 +253,9 @@ python -m goodharts.training.train_ppo --n-envs 128 --timesteps 200000
 ### Training Performance
 
 With the vectorized environment and optimized PPO updates:
-- **~24K steps/second** on GPU (AMD RX 7700S)
-- **~TODO steps/second** on CPU
-- 100,000 timesteps complete in ~15-25 seconds
+- **~14K steps/second** on GPU (AMD RX 7700S)
+- **~1K steps/second** on CPU
+- 100,000 timesteps complete in ~10 seconds (GPU) or ~100 seconds (CPU)
 
 ### Training Output
 
@@ -326,13 +345,13 @@ Linear(512→8) — 8 directional actions
 | 6 | (1, 0) | → Right |
 | 7 | (1, 1) | ↘ Down-Right |
 
-### Vectorized Environment (VecEnv)
+### Vectorized Environment (TorchVecEnv)
 
-The training environment runs N parallel simulations in batched NumPy arrays:
+The training environment is GPU-native—all state lives in PyTorch tensors with no CPU-GPU transfer during training:
 
-- **Batched state**: `grids: (n_envs, H, W)`, `agent_x/y: (n_envs,)`
-- **Vectorized step**: All environments advance simultaneously
-- **Efficient observation extraction**: Pre-allocated buffers, no Python loops
+- **Batched state**: `grids: (n_envs, H, W)`, `agent_x/y: (n_envs,)` — all on GPU
+- **Vectorized step**: All environments advance simultaneously via tensor operations
+- **Zero-copy observations**: Views into grid tensors, no data movement
 - **Shared grid mode**: Multiple agents in single world (for visualization)
 
 ### Behavior Registry
@@ -389,7 +408,7 @@ This accidental demonstration of Goodhart's Law on ourselves is documented in `d
 ### ✅ Phase 2: Learned Behaviors
 - [x] BaseCNN architecture with dynamic channels
 - [x] PPO training with GAE and curriculum
-- [x] Vectorized training (~6000 steps/sec)
+- [x] GPU-native vectorized training (~14K steps/sec)
 - [x] Multi-mode dashboard
 - [x] Structured logging (CSV/JSON)
 - [x] Model verification suite
@@ -398,7 +417,7 @@ This accidental demonstration of Goodhart's Law on ourselves is documented in `d
 - [x] TOML configuration system
 - [x] Auto-discovery behavior registry
 - [x] Centralized device selection
-- [x] Comprehensive test suite (27 tests)
+- [x] Comprehensive test suite (166 tests)
 
 ### 🔮 Phase 3: Emergent Deception
 - [ ] Multi-agent signaling dynamics

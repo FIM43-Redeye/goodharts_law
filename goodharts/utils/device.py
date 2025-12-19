@@ -420,18 +420,33 @@ def apply_system_optimizations(device: torch.device = None, verbose: bool = True
                     # Fallback or specific error handling if needed, but usually safe
                     print(f"   Note: Failed to set float32_matmul_precision: {e}")
             
-            # 2. Enable cuDNN benchmark
-            # This runs a quick benchmark on start to find the best convolution algo
-            # for the specific hardware/input size. Great for fixed input sizes (standard RL).
-            # Note: only enable if not already disabled (e.g., via --no-warmup CLI flag)
+            # 2. cuDNN benchmark mode
+            # Runs algorithm selection to find fastest kernels for this hardware/input size.
+            # NVIDIA cuDNN caches results well; AMD MIOpen doesn't cache across processes.
+            # Config default is OFF for fast startup (~4s vs 60-300s), with ~3% throughput cost.
             if torch.backends.cudnn.is_available():
-                # Check environment variable for explicit disable
-                if os.environ.get('GOODHARTS_CUDNN_BENCHMARK', '').lower() in ('0', 'false', 'off'):
+                # Priority: env var > config > default (False)
+                env_val = os.environ.get('GOODHARTS_CUDNN_BENCHMARK', '').lower()
+                if env_val in ('0', 'false', 'off'):
+                    torch.backends.cudnn.benchmark = False
                     if verbose:
                         print("   Performance: cuDNN benchmark disabled (via env)")
-                elif not torch.backends.cudnn.benchmark:
+                elif env_val in ('1', 'true', 'on'):
                     torch.backends.cudnn.benchmark = True
                     if verbose:
-                        print("   Performance: cuDNN benchmark enabled")
+                        print("   Performance: cuDNN benchmark enabled (via env)")
+                else:
+                    # Read from config
+                    try:
+                        from goodharts.config import get_runtime_config
+                        runtime_cfg = get_runtime_config()
+                        cudnn_benchmark = runtime_cfg.get('cudnn_benchmark', False)
+                    except Exception:
+                        cudnn_benchmark = False  # Safe default
+
+                    torch.backends.cudnn.benchmark = cudnn_benchmark
+                    if verbose:
+                        status = "enabled" if cudnn_benchmark else "disabled"
+                        print(f"   Performance: cuDNN benchmark {status}")
         
         _optimizations_applied = True

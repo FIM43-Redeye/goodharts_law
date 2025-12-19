@@ -83,6 +83,12 @@ freeze_energy = true # If true, agent energy stays constant (for visualization)
 
 # hsa_override_gfx_version = "11.0.0" # Override for ROCm iGPU support (e.g. gfx1103 -> 11.0.0)
 
+# cuDNN benchmark mode - runs algorithm selection to find fastest kernels
+# ON: ~3% faster training, but 60-300s startup (NVIDIA caches well, AMD doesn't)
+# OFF: Fast startup (~4s), slightly slower training
+# Default OFF because MIOpen (AMD) doesn't cache across processes
+cudnn_benchmark = false
+
 
 # =============================================================================
 # TRAINING (for train_ppo.py and other training scripts)

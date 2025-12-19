@@ -71,7 +71,8 @@ class PPOConfig:
     hyper_verbose: bool = False
     clean_cache: bool = False
     profile_enabled: bool = True  # Disable with --no-profile for production
-    
+    benchmark_mode: bool = False  # Skip saving, just measure throughput
+
     # Validation episodes (periodic eval without exploration)
     validation_interval: int = 8     # Every N updates (0 = disabled)
     validation_episodes: int = 16     # Episodes per validation
@@ -247,12 +248,33 @@ class PPOTrainer:
         self.device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
         self.scaler = GradScaler(enabled=cfg.use_amp) if cfg.use_amp else None
 
+        # cuDNN benchmark warmup - MUST happen BEFORE torch.compile
+        # cuDNN benchmark runs algorithm selection on first use (~7s for our model)
+        # If we don't warm up first, this happens inside torch.compile and breaks caching
+        if not cfg.skip_warmup and self.device.type == 'cuda' and torch.backends.cudnn.benchmark:
+            warmup_batch = (cfg.n_envs * cfg.steps_per_env) // cfg.n_minibatches
+            print(f"   [cuDNN] Warming up benchmark mode (batch={warmup_batch})...", flush=True)
+            warmup_start = time.time()
+
+            dummy_obs = torch.zeros(
+                (warmup_batch, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size),
+                device=self.device, requires_grad=False
+            )
+
+            # Eager forward pass to trigger cuDNN algorithm selection
+            with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                _ = self.policy(dummy_obs)
+                _ = self.policy.get_features(dummy_obs)
+            torch.cuda.synchronize()
+
+            print(f"   [cuDNN] Benchmark complete ({time.time()-warmup_start:.1f}s)", flush=True)
+
         # Compile models for extra speed if torch.compile is available (PyTorch 2.0+)
         # Use lock to serialize compilation - Dynamo's global state is not thread-safe
         # Skip on TPU - XLA uses its own JIT compilation
         with _COMPILE_LOCK:
             if cfg.compile_models and hasattr(torch, 'compile') and not is_tpu(self.device):
-                
+
                 # Keep references to originals in case compilation fails
                 orig_policy = self.policy
                 orig_value_head = self.value_head
@@ -261,42 +283,44 @@ class PPOTrainer:
                     # Fixed-shape kernels should cache properly across runs
                     self.policy = torch.compile(self.policy)
                     self.value_head = torch.compile(self.value_head)
-                    
+
                     # Skip explicit warmup if global warmup was already done (parallel training)
                     if not cfg.skip_warmup:
                         # Explicit JIT Warmup - MUST use actual training batch size
                         # Otherwise torch.compile recompiles on first real batch (85s+ forward, 270s+ backward!)
                         warmup_batch = (cfg.n_envs * cfg.steps_per_env) // cfg.n_minibatches
-                        
+
                         print(f"   [JIT] Warming up torch.compile (batch={warmup_batch})...", flush=True)
                         warmup_start = time.time()
-                        
+
                         dummy_obs = torch.zeros(
-                            (warmup_batch, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size), 
+                            (warmup_batch, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size),
                             device=self.device, requires_grad=False
                         )
                         dummy_actions = torch.zeros(warmup_batch, dtype=torch.long, device=self.device)
                         dummy_returns = torch.zeros(warmup_batch, device=self.device)
-                        
+
                         # Forward warmup (with autocast if using AMP)
                         with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                             logits = self.policy(dummy_obs)
                             features = self.policy.get_features(dummy_obs)
                             values = self.value_head(features).squeeze(-1)
-                            
+
                             # Compute dummy loss (triggers backward graph compilation)
                             dist = Categorical(logits=logits, validate_args=False)
                             log_probs = dist.log_prob(dummy_actions)
                             dummy_loss = -log_probs.mean() + F.mse_loss(values, dummy_returns)
-                        
+
                         # Backward warmup (compiles gradient kernels)
                         dummy_loss.backward()
-                        
+                        if self.device.type == 'cuda':
+                            torch.cuda.synchronize()
+
                         # Clear gradients and CUDA cache
                         self.policy.zero_grad()
                         self.value_head.zero_grad()
                         torch.cuda.empty_cache() if self.device.type == 'cuda' else None
-                        
+
                         warmup_time = time.time() - warmup_start
                         print(f"   [JIT] Compilation complete ({warmup_time:.1f}s)", flush=True)
                     
@@ -355,8 +379,8 @@ class PPOTrainer:
             device=self.device
         )
         
-        # Logger
-        if cfg.log_to_file:
+        # Logger (skip in benchmark mode)
+        if cfg.log_to_file and not cfg.benchmark_mode:
             self.logger = TrainingLogger(mode=cfg.mode, output_dir=cfg.log_dir)
             self.logger.set_hyperparams(
                 mode=cfg.mode,
@@ -452,11 +476,11 @@ class PPOTrainer:
         update_poison_sum = 0
         
         step_in_update = 0
-        start_time = time.perf_counter()
-        
+        self.start_time = time.perf_counter()
+
         # Rolling window for sps calculation (exclude compilation warmup)
         sps_window = []  # (steps, time) pairs for last 4 updates
-        last_update_time = start_time
+        last_update_time = self.start_time
         last_update_steps = 0
         
         while self.total_steps < cfg.total_timesteps:
@@ -831,27 +855,44 @@ class PPOTrainer:
     def _finalize(self) -> dict:
         """Save final model and return summary."""
         cfg = self.config
-        
+
+        # Calculate throughput
+        elapsed = time.perf_counter() - self.start_time
+        throughput = self.total_steps / elapsed if elapsed > 0 else 0
+
         # Shutdown async logger first - flushes all queued logs
         if self.async_logger:
             self.async_logger.shutdown()
-        
-        torch.save(self.policy.state_dict(), cfg.output_path)
-        print(f"\n[PPO] Training complete: {cfg.output_path}")
-        
-        if self.logger:
-            self.logger.finalize(best_efficiency=self.best_reward, final_model_path=cfg.output_path)
-        
+
+        if cfg.benchmark_mode:
+            # Benchmark mode: just report throughput, don't save
+            print(f"\n{'='*60}")
+            print(f"BENCHMARK RESULTS ({cfg.mode})")
+            print(f"{'='*60}")
+            print(f"  Total steps:    {self.total_steps:,}")
+            print(f"  Elapsed time:   {elapsed:.2f}s")
+            print(f"  Throughput:     {throughput:,.0f} steps/sec")
+            print(f"  Best reward:    {self.best_reward:.1f}")
+            print(f"{'='*60}")
+        else:
+            torch.save(self.policy.state_dict(), cfg.output_path)
+            print(f"\n[PPO] Training complete: {cfg.output_path}")
+
+            if self.logger:
+                self.logger.finalize(best_efficiency=self.best_reward, final_model_path=cfg.output_path)
+
         # Close TensorBoard writer to flush all data
         if self.tb_writer:
             self.tb_writer.close()
-        
+
         if self.dashboard:
             self.dashboard.update(cfg.mode, 'finished', None)
-        
+
         return {
             'mode': cfg.mode,
             'total_steps': self.total_steps,
+            'elapsed_seconds': elapsed,
+            'throughput': throughput,
             'best_reward': self.best_reward,
-            'model_path': cfg.output_path,
+            'model_path': None if cfg.benchmark_mode else cfg.output_path,
         }

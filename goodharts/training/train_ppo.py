@@ -159,6 +159,8 @@ def main():
                         help='Debug mode: print at every major step')
     parser.add_argument('--clean-cache', action='store_true',
                         help='Delete compilation cache before starting')
+    parser.add_argument('--benchmark', '-b', action='store_true',
+                        help='Benchmark mode: measure throughput only, discard model')
     args = parser.parse_args()
     
     # Build overrides dict from CLI args (only non-None values)
@@ -178,7 +180,13 @@ def main():
         overrides['hyper_verbose'] = True
     if args.clean_cache:
         overrides['clean_cache'] = True
-    
+    if args.benchmark:
+        overrides['benchmark_mode'] = True
+        overrides['validation_interval'] = 0  # Skip validation in benchmarks
+        # Default to 50k steps if not specified
+        if args.timesteps is None and args.updates is None:
+            overrides['total_timesteps'] = 50_000
+
     # Handle timesteps (--updates is a convenience conversion)
     n_envs = args.n_envs or train_cfg.get('n_envs', 64)
     steps_per_env = train_cfg.get('steps_per_env', 128)
