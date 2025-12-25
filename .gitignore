@@ -149,7 +149,8 @@ cython_debug/
 
 # Personal!
 personal/
-.agent/
 config.toml
-misc/
 CLAUDE.local.md
+
+# Root-level artifacts (models should go in models/)
+/*.pth
