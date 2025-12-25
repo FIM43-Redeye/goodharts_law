@@ -114,49 +114,70 @@ def main():
     train_cfg = get_training_config()
     all_modes = get_all_mode_names(config)
     brain_names = get_brain_names()
-    
+
+    # Get defaults from config for help text
+    default_envs = train_cfg.get('n_envs', 64)
+    default_minibatches = train_cfg.get('n_minibatches', 4)
+    default_brain = train_cfg.get('brain_type', 'base_cnn')
+
     parser = argparse.ArgumentParser(
-        description='PPO training for Goodhart agents. Config file provides defaults; CLI args override.',
-        epilog='Most settings can be changed in config.toml instead of using CLI args.'
+        description='PPO training for Goodhart agents.',
+        epilog='Config precedence: CLI args > config.toml > config.default.toml',
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument('--mode', default='ground_truth', choices=all_modes + ['all'],
-                        help='Training mode (or "all" for parallel training)')
-    parser.add_argument('--brain', default=None, choices=brain_names,
-                        help='Override neural network architecture')
-    parser.add_argument('--timesteps', type=int, default=None,
-                        help='Override total environment steps')
-    parser.add_argument('--updates', type=int, default=None,
-                        help='Number of PPO updates (alternative to --timesteps)')
-    parser.add_argument('--entropy', type=float, default=None,
-                        help='Override entropy coefficient')
-    parser.add_argument('--dashboard', '-d', action='store_true',
-                        help='Show live training dashboard')
-    parser.add_argument('--sequential', '-s', action='store_true',
-                        help='Train modes sequentially (saves VRAM)')
-    parser.add_argument('--n-envs', type=int, default=None,
-                        help='Override number of parallel environments')
-    parser.add_argument('--use-amp', action='store_true', default=None,
-                        help='Force enable automatic mixed precision')
-    parser.add_argument('--no-amp', action='store_true',
-                        help='Force disable automatic mixed precision')
-    parser.add_argument('--minibatches', type=int, default=None,
-                        help='Override minibatches per epoch')
-    parser.add_argument('--no-warmup', action='store_true',
-                        help='Skip warmup (faster startup but slower training)')
-    parser.add_argument('--no-profile', action='store_true',
-                        help='Disable profiling (removes GPU sync overhead, faster for production)')
-    parser.add_argument('--tensorboard', '-tb', action='store_true',
-                        help='Enable TensorBoard logging')
-    parser.add_argument('--hyper-verbose', action='store_true',
-                        help='Debug mode: print at every major step')
-    parser.add_argument('--clean-cache', action='store_true',
-                        help='Delete compilation cache before starting')
-    parser.add_argument('--benchmark', '-b', action='store_true',
-                        help='Benchmark mode: measure throughput only, discard model')
-    parser.add_argument('--seed', type=int, default=None,
-                        help='Random seed for reproducibility (default: random)')
-    parser.add_argument('--deterministic', action='store_true',
-                        help='Enable full determinism (slower, for debugging)')
+
+    # Training options
+    training = parser.add_argument_group('Training')
+    training.add_argument('-m', '--mode', default='ground_truth', choices=all_modes + ['all'],
+                          metavar='MODE',
+                          help=f'Training mode: {", ".join(all_modes)}, or "all" [default: ground_truth]')
+    training.add_argument('-t', '--timesteps', type=int, default=None, metavar='N',
+                          help='Total environment steps')
+    training.add_argument('-u', '--updates', type=int, default=None, metavar='N',
+                          help='PPO updates (alternative to --timesteps)')
+    training.add_argument('-s', '--sequential', action='store_true',
+                          help='Train modes sequentially (saves VRAM)')
+
+    # Performance tuning
+    perf = parser.add_argument_group('Performance')
+    perf.add_argument('-e', '--n-envs', type=int, default=None, metavar='N',
+                      help=f'Parallel environments [default: {default_envs}]')
+    perf.add_argument('--minibatches', type=int, default=None, metavar='N',
+                      help=f'Minibatches per epoch [default: {default_minibatches}]')
+    perf.add_argument('--no-amp', action='store_true',
+                      help='Disable mixed precision (AMP)')
+    perf.add_argument('--no-warmup', action='store_true',
+                      help='Skip JIT warmup (faster startup, slower training)')
+    perf.add_argument('--no-profile', action='store_true',
+                      help='Disable profiling (faster for production)')
+
+    # Monitoring
+    monitor = parser.add_argument_group('Monitoring')
+    monitor.add_argument('-d', '--dashboard', action='store_true',
+                         help='Show live training dashboard')
+    monitor.add_argument('-tb', '--tensorboard', action='store_true',
+                         help='Enable TensorBoard logging')
+    monitor.add_argument('-v', '--verbose', action='store_true', dest='hyper_verbose',
+                         help='Debug mode: print at every major step')
+
+    # Experiment settings
+    experiment = parser.add_argument_group('Experiment')
+    experiment.add_argument('--brain', default=None, choices=brain_names, metavar='ARCH',
+                            help=f'Neural network architecture [default: {default_brain}]')
+    experiment.add_argument('--entropy', type=float, default=None, metavar='COEF',
+                            help='Entropy coefficient for exploration')
+    experiment.add_argument('--seed', type=int, default=None, metavar='N',
+                            help='Random seed for reproducibility')
+    experiment.add_argument('--deterministic', action='store_true',
+                            help='Full determinism (slower, for debugging)')
+
+    # Utility
+    utility = parser.add_argument_group('Utility')
+    utility.add_argument('-b', '--benchmark', action='store_true',
+                         help='Benchmark mode: measure throughput, discard model')
+    utility.add_argument('--clean-cache', action='store_true',
+                         help='Delete compilation cache before starting')
+
     args = parser.parse_args()
     
     # Build overrides dict from CLI args (only non-None values)
@@ -192,12 +213,9 @@ def main():
     elif args.timesteps is not None:
         overrides['total_timesteps'] = args.timesteps
     
-    # Handle AMP: --no-amp > --use-amp > config
+    # Handle AMP
     if args.no_amp:
         overrides['use_amp'] = False
-    elif args.use_amp:
-        overrides['use_amp'] = True
-    # else: use config default
     
     # Handle --no-warmup
     if args.no_warmup:
