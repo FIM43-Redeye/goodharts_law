@@ -133,7 +133,7 @@ def main():
                         help="Specific models to evaluate (default: all)")
     parser.add_argument("--models-dir", type=Path, default=Path("models"),
                         help="Directory containing trained models")
-    parser.add_argument("--output-dir", type=Path, default=Path("evaluations"),
+    parser.add_argument("--output-dir", type=Path, default=Path("generated/evaluations"),
                         help="Directory for output files")
     args = parser.parse_args()
     

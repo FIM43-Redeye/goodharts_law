@@ -62,7 +62,7 @@ class PPOConfig:
     value_coef: float = 0.5
     output_path: str = 'models/ppo_agent.pth'
     log_to_file: bool = True
-    log_dir: str = 'logs'
+    log_dir: str = 'generated/logs'
     use_amp: bool = False
     compile_models: bool = True
     tensorboard: bool = False

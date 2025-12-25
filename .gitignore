@@ -4,12 +4,11 @@
 *$py.class
 behaviors/__pycache__
 
-# Models and other live-generated things
+# Trained models
 models/
-visualizations/
-logs/
-evaluations/
-analysis/
+
+# Generated outputs (logs, evaluations, visualizations, analysis)
+generated/
 
 # C extensions
 *.so

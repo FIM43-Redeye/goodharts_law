@@ -648,7 +648,7 @@ def load_run_from_logs(log_prefix: str) -> RunState:
     return run
 
 
-def find_latest_logs(log_dir: str = 'logs', mode: str = None) -> list[str]:
+def find_latest_logs(log_dir: str = 'generated/logs', mode: str = None) -> list[str]:
     """
     Find the latest log prefixes in a directory.
     
@@ -781,7 +781,7 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(description='Training Dashboard - View training logs')
     parser.add_argument('logs', nargs='*', help='Log file prefixes to view (without _episodes.csv suffix)')
-    parser.add_argument('--dir', '-d', default='logs', help='Log directory to search (default: logs)')
+    parser.add_argument('--dir', '-d', default='generated/logs', help='Log directory to search (default: generated/logs)')
     parser.add_argument('--mode', '-m', help='Filter by mode (e.g., ground_truth)')
     parser.add_argument('--smooth', '-s', type=float, default=0.9, help='Smoothing factor 0.0-1.0 (default: 0.9)')
     parser.add_argument('--latest', '-l', action='store_true', help='View latest run(s) automatically')

@@ -375,7 +375,7 @@ def find_default_model() -> str:
 def analyze_model_attention(
     model_path: str | None = None,
     config: dict | None = None,
-    output_dir: str = 'visualizations',
+    output_dir: str = 'generated/visualizations',
     num_samples: int = 5,
     show: bool = True,
 ):
@@ -555,7 +555,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate saliency visualizations for trained models")
     parser.add_argument('--model', type=str, default=None,
                         help='Path to trained model (default: auto-detect from models/)')
-    parser.add_argument('--output', type=str, default='visualizations',
+    parser.add_argument('--output', type=str, default='generated/visualizations',
                         help='Output directory for images')
     parser.add_argument('--samples', type=int, default=5,
                         help='Number of sample views to visualize')
