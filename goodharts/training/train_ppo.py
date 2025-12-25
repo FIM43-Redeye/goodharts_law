@@ -31,41 +31,6 @@ _TRAINING_LOCK = threading.Lock()
 _TRAINING_COUNTER = 0
 
 
-def _warmup_compile(brain_type: str, n_envs: int, n_minibatches: int):
-    """
-    Pre-compile kernels by running a single-threaded warmup.
-    This populates the cache so parallel threads can reuse compiled kernels.
-    """
-    print("\n[Warmup] Pre-compiling kernels for parallel training...")
-    
-    # Create a minimal config just for warmup
-    config = PPOConfig(
-        mode='ground_truth',  # Any mode works, they all use the same model
-        brain_type=brain_type,
-        n_envs=n_envs,
-        total_timesteps=0,  # No actual training
-        compile_models=True,
-        n_minibatches=n_minibatches,
-        log_to_file=False,
-    )
-    
-    # Create trainer and just run setup (which includes JIT warmup)
-    trainer = PPOTrainer(config)
-    trainer._setup()
-    
-    # Cleanup
-    del trainer
-    import gc
-    gc.collect()
-    
-    # Force CUDA cache cleanup
-    import torch
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    print("[Warmup] Pre-compilation complete. Starting parallel training...\n")
-
-
 def train_ppo(
     mode: str = 'ground_truth',
     dashboard = None,
@@ -249,21 +214,13 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool)
     """Run training with live dashboard in separate process."""
     from goodharts.training.train_dashboard import create_dashboard_process
     from goodharts.behaviors.action_space import num_actions
-    
-    train_cfg = get_training_config()
-    
+
     print(f"\nTraining with dashboard (process-isolated)")
-    
+
     # Create dashboard in separate process
     dashboard = create_dashboard_process(modes_to_train, n_actions=num_actions(1))
     dashboard.start()
-    
-    # For parallel training, do warmup first
-    compile_models = overrides.get('compile_models', train_cfg.get('compile_models', True))
-    n_envs = overrides.get('n_envs', train_cfg.get('n_envs', 64))
-    n_minibatches = overrides.get('n_minibatches', train_cfg.get('n_minibatches', 4))
-    brain_type = overrides.get('brain_type', train_cfg.get('brain_type', 'base_cnn'))
-    
+
     try:
         if sequential:
             # Sequential: run training in main thread (better GPU perf)
@@ -284,10 +241,7 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool)
                     **overrides
                 )
         else:
-            # Parallel: warmup first if compiling
-            if compile_models:
-                _warmup_compile(brain_type, n_envs, n_minibatches)
-            
+            # Parallel training (first trainer warms up, others skip via global flag)
             threads = []
             for mode in modes_to_train:
                 t = threading.Thread(
@@ -297,14 +251,13 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool)
                         'dashboard': dashboard,
                         'output_path': f'models/ppo_{mode}.pth',
                         'log_to_file': True,
-                        'skip_warmup': True,  # Already warmed up
                         **overrides
                     },
                     daemon=True
                 )
                 threads.append(t)
                 t.start()
-            
+
             # Wait for all threads to complete
             for t in threads:
                 t.join()
@@ -320,20 +273,10 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool)
 
 def _run_without_dashboard(modes_to_train: list, overrides: dict, sequential: bool):
     """Run training without dashboard."""
-    train_cfg = get_training_config()
-    
-    compile_models = overrides.get('compile_models', train_cfg.get('compile_models', True))
-    n_envs = overrides.get('n_envs', train_cfg.get('n_envs', 64))
-    n_minibatches = overrides.get('n_minibatches', train_cfg.get('n_minibatches', 4))
-    brain_type = overrides.get('brain_type', train_cfg.get('brain_type', 'base_cnn'))
-    
     if len(modes_to_train) > 1 and not sequential:
-        # Parallel training
+        # Parallel training (first trainer warms up, others skip via global flag)
         print(f"\nParallel training: {len(modes_to_train)} modes")
-        
-        if compile_models:
-            _warmup_compile(brain_type, n_envs, n_minibatches)
-        
+
         threads = []
         for mode in modes_to_train:
             t = threading.Thread(
@@ -342,13 +285,12 @@ def _run_without_dashboard(modes_to_train: list, overrides: dict, sequential: bo
                     'mode': mode,
                     'output_path': f'models/ppo_{mode}.pth',
                     'log_to_file': True,
-                    'skip_warmup': True,
                     **overrides
                 }
             )
             threads.append(t)
             t.start()
-        
+
         for t in threads:
             t.join()
     else:
