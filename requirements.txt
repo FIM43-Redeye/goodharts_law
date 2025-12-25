@@ -1,8 +1,0 @@
-numpy~=2.3.5
-matplotlib~=3.10.8
-tqdm~=4.67.1
-torch
-torchvision
-pytest
-pytest-cov
-ipykernel
