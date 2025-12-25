@@ -39,6 +39,11 @@ from .async_logger import AsyncLogger, LogPayload
 # This only affects startup; compiled models run in parallel fine.
 _COMPILE_LOCK = threading.Lock()
 
+# Global warmup state - shared across sequential/parallel training runs
+# Once warmup is done for one mode, subsequent modes skip it
+_WARMUP_LOCK = threading.Lock()
+_WARMUP_DONE = False
+
 
 @dataclass
 class PPOConfig:
@@ -244,6 +249,102 @@ class PPOTrainer:
 
         return time.time() - start_time
 
+    def _run_warmup_update(self, states: torch.Tensor, episode_rewards: torch.Tensor) -> torch.Tensor:
+        """
+        Run one full training update as warmup (discarded).
+
+        This triggers all lazy initialization in a realistic context:
+        - Real environment steps (not synthetic data)
+        - Full forward/backward through compiled models
+        - All MIOpen/cuDNN algorithm selection
+
+        The results are discarded; this just warms up the runtime.
+
+        Args:
+            states: Current environment states
+            episode_rewards: Episode reward accumulator
+
+        Returns:
+            New states after the warmup steps
+        """
+        cfg = self.config
+
+        # Collect one update worth of experience
+        states_buffer = []
+        actions_buffer = []
+        log_probs_buffer = []
+        rewards_buffer = []
+        dones_buffer = []
+        values_buffer = []
+
+        for _ in range(cfg.steps_per_env):
+            with torch.no_grad():
+                states_t = states.float()
+                with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                    logits, features = self.policy.forward_with_features(states_t)
+                    values = self.value_head(features).squeeze(-1)
+                    dist = Categorical(logits=logits, validate_args=False)
+                    actions = dist.sample()
+                    log_probs = dist.log_prob(actions)
+
+            current_states = states.clone()
+            next_states, rewards, dones = self.vec_env.step(actions)
+            shaped_rewards = self.reward_computer.compute(rewards, current_states, next_states, dones)
+
+            states_buffer.append(current_states)
+            actions_buffer.append(actions)
+            log_probs_buffer.append(log_probs.detach())
+            rewards_buffer.append(shaped_rewards)
+            dones_buffer.append(dones.clone())
+            values_buffer.append(values)
+
+            episode_rewards += rewards
+            episode_rewards *= (~dones)
+            states = next_states
+
+        # Bootstrap value
+        with torch.no_grad():
+            states_t = states.float()
+            _, features = self.policy.forward_with_features(states_t)
+            next_value = self.value_head(features).squeeze(-1)
+
+        # Compute GAE
+        advantages, returns = compute_gae(
+            rewards_buffer, values_buffer, dones_buffer,
+            next_value, cfg.gamma, cfg.gae_lambda, device=self.device
+        )
+
+        # PPO update (this triggers backward pass lazy init)
+        # Use cat to flatten (steps, envs) -> (steps * envs)
+        all_states = torch.cat(states_buffer, dim=0)
+        all_actions = torch.cat(actions_buffer, dim=0)
+        all_log_probs = torch.cat(log_probs_buffer, dim=0)
+        all_values = torch.cat(values_buffer, dim=0)
+        all_returns = returns.flatten()
+        all_advantages = advantages.flatten()
+
+        # Normalize advantages
+        all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
+
+        ppo_update(
+            self.policy, self.value_head, self.optimizer,
+            all_states, all_actions, all_log_probs,
+            all_returns, all_advantages, all_values,
+            self.device,
+            eps_clip=cfg.eps_clip,
+            k_epochs=cfg.k_epochs,
+            entropy_coef=cfg.entropy_coef,
+            value_coef=cfg.value_coef,
+            n_minibatches=cfg.n_minibatches,
+            scaler=self.scaler,
+        )
+
+        # Sync to ensure all kernels complete
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()
+
+        return states
+
     def train(self) -> dict:
         """
         Run the full training loop.
@@ -319,56 +420,21 @@ class PPOTrainer:
         self.device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
         self.scaler = GradScaler(enabled=cfg.use_amp) if cfg.use_amp else None
 
-        # cuDNN benchmark warmup - MUST happen BEFORE torch.compile
-        # cuDNN benchmark runs algorithm selection on first use (~7s for our model)
-        # If we don't warm up first, this happens inside torch.compile and breaks caching
-        if not cfg.skip_warmup and self.device.type == 'cuda' and torch.backends.cudnn.benchmark:
-            warmup_batch = (cfg.n_envs * cfg.steps_per_env) // cfg.n_minibatches
-            print(f"   [cuDNN] Warming up benchmark mode (batch={warmup_batch})...", flush=True)
-            elapsed = self._warmup_forward_backward(warmup_batch, include_backward=False, label="cuDNN")
-            print(f"   [cuDNN] Benchmark complete ({elapsed:.1f}s)", flush=True)
-
         # Compile models for extra speed if torch.compile is available (PyTorch 2.0+)
         # Use lock to serialize compilation - Dynamo's global state is not thread-safe
         # Skip on TPU - XLA uses its own JIT compilation
+        # Note: Actual warmup happens in _training_loop via _run_warmup_update()
         with _COMPILE_LOCK:
             if cfg.compile_models and hasattr(torch, 'compile') and not is_tpu(self.device):
-
-                # Keep references to originals in case compilation fails
-                orig_policy = self.policy
-                orig_value_head = self.value_head
                 try:
-                    # Note: NOT using dynamic=True because we warmup with exact batch size
-                    # Fixed-shape kernels should cache properly across runs
                     self.policy = torch.compile(self.policy)
                     self.value_head = torch.compile(self.value_head)
-
-                    # Skip explicit warmup if global warmup was already done (parallel training)
-                    if not cfg.skip_warmup:
-                        # Explicit JIT Warmup - MUST use actual training batch size
-                        # Otherwise torch.compile recompiles on first real batch (85s+ forward, 270s+ backward!)
-                        warmup_batch = (cfg.n_envs * cfg.steps_per_env) // cfg.n_minibatches
-                        print(f"   [JIT] Warming up torch.compile (batch={warmup_batch})...", flush=True)
-                        elapsed = self._warmup_forward_backward(warmup_batch, include_backward=True, label="JIT")
-                        print(f"   [JIT] Compilation complete ({elapsed:.1f}s)", flush=True)
-                    
+                    print(f"   [JIT] torch.compile enabled (warmup deferred)")
                 except RuntimeError as e:
-                    # Fallback if compilation fails (common in complex multi-threaded setups)
                     if "FX" in str(e) or "dynamo" in str(e).lower():
-                        print(f"   [JIT] Warning: torch.compile failed ({e}). Reverting to eager mode.", flush=True)
-                        self.policy = orig_policy
-                        self.value_head = orig_value_head
+                        print(f"   [JIT] Warning: torch.compile failed ({e}). Using eager mode.")
                     else:
-                        # Re-raise unexpected errors
                         raise e
-        
-        # Eager warmup (even without torch.compile) for cuDNN algorithm selection
-        # This warms up cuDNN benchmark mode and autograd graph construction
-        if not cfg.skip_warmup:
-            warmup_batch = (cfg.n_envs * cfg.steps_per_env) // cfg.n_minibatches
-            print(f"   [Warmup] Running eager warmup (cuDNN + autograd)...", flush=True)
-            elapsed = self._warmup_forward_backward(warmup_batch, include_backward=True, label="Eager")
-            print(f"   [Warmup] Complete ({elapsed:.1f}s)", flush=True)
         
         # Optimizer
         self.optimizer = optim.Adam(
@@ -466,28 +532,72 @@ class PPOTrainer:
         _vprint("Resetting environment for initial state...", v)
         states = self.vec_env.reset()
         _vprint("Environment reset done", v)
-        
+
         # Initialize reward computer
         _vprint("Initializing reward computer...", v)
         self.reward_computer.initialize(states)  # stays on GPU
         episode_rewards = torch.zeros(cfg.n_envs, device=self.device)
         _vprint("Training loop ready to start", v)
-        
+
+        # === WARMUP UPDATE (lazy init) ===
+        # Run one full update cycle to trigger all lazy initialization:
+        # - cuDNN/MIOpen algorithm selection
+        # - Autograd graph construction
+        # - Any remaining JIT compilation
+        # This is discarded; real training starts fresh after.
+        # For sequential/parallel training, warmup only runs once.
+        global _WARMUP_DONE
+        should_warmup = not cfg.skip_warmup
+
+        with _WARMUP_LOCK:
+            if _WARMUP_DONE:
+                should_warmup = False
+                print(f"   [Warmup] Skipped (already done)", flush=True)
+
+        if should_warmup:
+            print(f"   [Warmup] Running warmup update (lazy init)...", flush=True)
+            warmup_start = time.perf_counter()
+
+            # Save model state before warmup (will be restored after)
+            policy_state = {k: v.clone() for k, v in self.policy.state_dict().items()}
+            value_head_state = {k: v.clone() for k, v in self.value_head.state_dict().items()}
+            optimizer_state = self.optimizer.state_dict()
+
+            # Run warmup (modifies model, but we'll restore)
+            states = self._run_warmup_update(states, episode_rewards)
+
+            # Restore model state (discard warmup training)
+            self.policy.load_state_dict(policy_state)
+            self.value_head.load_state_dict(value_head_state)
+            self.optimizer.load_state_dict(optimizer_state)
+
+            warmup_elapsed = time.perf_counter() - warmup_start
+            print(f"   [Warmup] Complete ({warmup_elapsed:.1f}s) - weights restored", flush=True)
+
+            # Mark warmup as done globally
+            with _WARMUP_LOCK:
+                _WARMUP_DONE = True
+
+            # Reset environment state for clean start
+            states = self.vec_env.reset()
+            self.reward_computer.initialize(states)
+            episode_rewards.zero_()
+
         # Dashboard aggregation (per-update)
         # We track how many episodes finished during this collection phase
         update_episodes_count = 0
         update_reward_sum = 0.0
         update_food_sum = 0
         update_poison_sum = 0
-        
+
         step_in_update = 0
         self.start_time = time.perf_counter()
 
-        # Rolling window for sps calculation (exclude compilation warmup)
+        # Rolling window for sps calculation (all updates valid post-warmup)
         sps_window = []  # (steps, time) pairs for last 4 updates
         last_update_time = self.start_time
         last_update_steps = 0
-        
+
         while self.total_steps < cfg.total_timesteps:
             self.profiler.start()
             
@@ -691,14 +801,16 @@ class PPOTrainer:
                 finished_dones_buffer = []
                 finished_rewards_buffer = []
                 
-                # Progress - use rolling window for sps (excludes compilation warmup)
+                # Progress - use rolling window for sps (excludes first update warmup)
                 now = time.perf_counter()
                 update_steps = self.total_steps - last_update_steps
                 update_time = now - last_update_time
+
+                # Add to rolling window (all updates valid post-warmup)
                 sps_window.append((update_steps, update_time))
                 if len(sps_window) > 4:
                     sps_window.pop(0)
-                
+
                 # Calculate sps from window
                 window_steps = sum(s for s, t in sps_window)
                 window_time = sum(t for s, t in sps_window)
@@ -869,7 +981,7 @@ class PPOTrainer:
         """Save final model and return summary."""
         cfg = self.config
 
-        # Calculate throughput
+        # Calculate throughput (warmup is now separate, so all steps are valid)
         elapsed = time.perf_counter() - self.start_time
         throughput = self.total_steps / elapsed if elapsed > 0 else 0
 
