@@ -43,5 +43,15 @@ class BehaviorStrategy(ABC):
         pass
 
     @abstractmethod
-    def decide_action(self, agent, view):
+    def decide_action(self, agent, view) -> tuple[int, int]:
+        """
+        Determine the next action for the agent based on its local view.
+
+        Args:
+            agent: The AgentWrapper instance (provides properties like sight_radius)
+            view: Tensor of shape (C, H, W) containing the agent's local observation
+
+        Returns:
+            (dx, dy) tuple representing the movement direction
+        """
         pass

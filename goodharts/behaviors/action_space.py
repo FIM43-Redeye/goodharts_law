@@ -81,7 +81,19 @@ def index_to_action(idx: int, max_move_distance: int = 1) -> tuple[int, int]:
 
 
 def num_actions(max_move_distance: int = 1) -> int:
-    """Get number of actions for given movement range."""
+    """
+    Get number of actions for a given movement range.
+
+    Args:
+        max_move_distance: Maximum cells the agent can move per step
+
+    Returns:
+        Total number of possible actions (excluding no-op)
+
+    Examples:
+        num_actions(1) -> 8  (8-directional movement)
+        num_actions(2) -> 24 (5x5 grid minus center)
+    """
     return len(build_action_space(max_move_distance))
 
 
@@ -91,8 +103,16 @@ ACTION_LABELS_8 = ['↖', '←', '↙', '↑', '↓', '↗', '→', '↘']
 
 
 # Debug helper
-def print_action_space(max_move_distance: int = 1):
-    """Print the action space for debugging."""
+def print_action_space(max_move_distance: int = 1) -> None:
+    """
+    Print the action space for debugging/documentation purposes.
+
+    Outputs each action index with its (dx, dy) values and directional
+    arrow for 8-directional movement.
+
+    Args:
+        max_move_distance: Maximum cells the agent can move per step
+    """
     actions = build_action_space(max_move_distance)
     labels_8 = ['↖', '←', '↙', '↑', '↓', '↗', '→', '↘']
     print(f"Action space for max_move_distance={max_move_distance} ({len(actions)} actions):")

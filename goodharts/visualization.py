@@ -15,8 +15,16 @@ from goodharts.behaviors.utils import get_behavior_name
 from goodharts.configs.default_config import CellType
 
 
-def _to_numpy(data):
-    """Convert data to numpy array, handling both tensors and arrays."""
+def _to_numpy(data) -> np.ndarray:
+    """
+    Convert data to numpy array, handling both tensors and arrays.
+
+    Args:
+        data: A torch.Tensor or numpy array
+
+    Returns:
+        numpy array on CPU
+    """
     if isinstance(data, torch.Tensor):
         return data.cpu().numpy()
     return data
@@ -417,86 +425,77 @@ def update_brain_frame(frame, sim, viz, args):
     return []
 
 
-def update_frame(frame, sim, viz, args):
-    """
-    Update standard visualization for one frame.
-    
-    Args:
-        frame: Frame number (from FuncAnimation)
-        sim: Simulation instance
-        viz: Visualization state dict from create_standard_layout
-        args: Parsed CLI arguments
-        
-    Returns:
-        List of updated artists (for blitting)
-    """
-    sim.step()
-    
-    # Update simulation view with RGB rendering
+def _update_grid_view(sim, viz) -> None:
+    """Update the simulation grid view with agent positions."""
     grid = sim.get_render_grid()
     agent_positions = sim.get_agent_positions()
     rgb_grid = render_with_agents(grid, agent_positions, sim.world.width, sim.world.height)
     viz['img_sim'].set_data(rgb_grid)
-    
-    # Update energy plot
+
+
+def _update_energy_plot(sim, viz) -> None:
+    """Update the energy plot with current agent energies by behavior type."""
     for b_name, line in viz['energy_lines'].items():
-        # Find agents of this type
         agents_of_type = [
             a for a in sim.agents
             if get_behavior_name(a.behavior) == b_name
         ]
-        
         avg_energy = np.mean([a.energy for a in agents_of_type]) if agents_of_type else 0
         viz['energy_histories'][b_name].append(avg_energy)
         line.set_data(range(len(viz['energy_histories'][b_name])), viz['energy_histories'][b_name])
-    
+
     # Dynamic scaling
     viz['ax_energy'].set_xlim(0, max(100, sim.step_count + 10))
     all_energies = [val for hist in viz['energy_histories'].values() for val in hist]
     max_energy = max(all_energies + [1])
     viz['ax_energy'].set_ylim(0, max(100, max_energy * 1.1))
-    
-    # Update heatmap
-    # Check Radio Button selection
+
+
+def _update_heatmap(sim, viz) -> None:
+    """Update the activity heatmap based on radio button selection."""
     selected_source = viz['radio'].value_selected
     heatmap_data = sim.stats['heatmap'].get(selected_source, sim.stats['heatmap']['all'])
     heatmap_np = _to_numpy(heatmap_data)
-    
+
     viz['img_heatmap'].set_data(heatmap_np)
     hmap_max = np.max(heatmap_np)
     if hmap_max > 0:
         viz['img_heatmap'].set_clim(vmax=hmap_max)
-    
-    # Update death stats (Stacked Bars)
+
+
+def _update_death_stats(sim, viz) -> None:
+    """Update the death statistics stacked bar chart."""
     deaths = sim.stats['deaths']
     behavior_names = viz['behavior_names']
-    
+
     starved_counts = []
     poisoned_counts = []
-    
+
     for b_name in behavior_names:
-        # Filter deaths for this behavior (stored in death stats by simulation.step)
         relevant_deaths = [d for d in deaths if d.get('behavior', 'Unknown') == b_name]
         s = sum(1 for d in relevant_deaths if d['reason'] == 'Starvation')
         p = sum(1 for d in relevant_deaths if d['reason'] == 'Poison')
         starved_counts.append(s)
         poisoned_counts.append(p)
-        
-    # Update bar heights
+
     for bar, h in zip(viz['bars_starved'], starved_counts):
         bar.set_height(h)
-        
+
     for bar, h_p, h_s in zip(viz['bars_poisoned'], poisoned_counts, starved_counts):
         bar.set_height(h_p)
-        bar.set_y(h_s) # Stack on top of starvation
-    
-    max_deaths = max(sum(starved_counts) + sum(poisoned_counts), 10) # Total roughly
+        bar.set_y(h_s)
+
+    max_deaths = max(sum(starved_counts) + sum(poisoned_counts), 10)
     viz['ax_stats'].set_ylim(0, max_deaths + 2)
-    
-    # Check if everyone died
+
     alive_count = len(sim.agents)
-    viz['ax_stats'].set_title( f"Deaths (Step {sim.step_count}) | Alive: {alive_count}")
-    
+    viz['ax_stats'].set_title(f"Deaths (Step {sim.step_count}) | Alive: {alive_count}")
+
+
+def _check_end_conditions(sim, viz, args) -> None:
+    """Check if simulation should end (all dead or step limit reached)."""
+    alive_count = len(sim.agents)
+
     if alive_count == 0 and not getattr(viz, 'death_announced', False):
         viz['death_announced'] = True
         print(f"\nAll agents dead at step {sim.step_count}. Closing in 5s...")
@@ -506,11 +505,31 @@ def update_frame(frame, sim, viz, args):
             time.sleep(5)
             plt.close(viz['fig'])
         threading.Thread(target=close_window, daemon=True).start()
-    
-    # Check stop condition
+
     if args.steps and sim.step_count >= args.steps:
         print(f"\nSimulation complete after {sim.step_count} steps")
         plt.close(viz['fig'])
-    
-    # Return artists to satisfy blit requirement (though we often turn blit off)
+
+
+def update_frame(frame, sim, viz, args):
+    """
+    Update standard visualization for one frame.
+
+    Args:
+        frame: Frame number (from FuncAnimation)
+        sim: Simulation instance
+        viz: Visualization state dict from create_standard_layout
+        args: Parsed CLI arguments
+
+    Returns:
+        List of updated artists (for blitting)
+    """
+    sim.step()
+
+    _update_grid_view(sim, viz)
+    _update_energy_plot(sim, viz)
+    _update_heatmap(sim, viz)
+    _update_death_stats(sim, viz)
+    _check_end_conditions(sim, viz, args)
+
     return [viz['img_sim'], viz['img_heatmap']]
