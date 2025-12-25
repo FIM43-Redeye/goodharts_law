@@ -71,10 +71,6 @@ def train_ppo(
 
 def main():
     """Main CLI entry point."""
-    # Archive existing logs to keep current run clean
-    from goodharts.training.train_log import TrainingLogger
-    TrainingLogger.archive_existing_logs()
-
     config = get_config()
     train_cfg = get_training_config()
     all_modes = get_all_mode_names(config)
