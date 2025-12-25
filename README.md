@@ -104,9 +104,6 @@ goodharts_law/
 │   │   ├── reward_shaping.py   # Potential-based reward shaping
 │   │   ├── train_dashboard.py  # Live multi-mode training dashboard
 │   │   ├── train_log.py        # Structured CSV/JSON logging
-│   │   ├── train.py            # Behavior cloning (deprecated)
-│   │   ├── collect.py          # Expert demonstration collection
-│   │   ├── dataset.py          # Dataset utilities
 │   │   ├── verification/       # Model fitness testing
 │   │   │   ├── directional.py  # Direction accuracy tests
 │   │   │   └── survival.py     # Survival simulation tests
@@ -115,8 +112,7 @@ goodharts_law/
 │   └── utils/
 │       ├── device.py           # Centralized PyTorch device selection
 │       ├── brain_viz.py        # Neural network visualization
-│       ├── logging_config.py   # Logging setup
-│       └── numba_utils.py      # JIT acceleration utilities
+│       └── logging_config.py   # Logging setup
 │
 ├── tests/                      # pytest test suite
 ├── docs/                       # Additional documentation
@@ -284,10 +280,10 @@ All cell types are defined in `configs/default_config.py` with intrinsic propert
 |------|-------|-------|-----------------|---------------|
 | EMPTY | 0 | Dark blue | 0.0 | — |
 | WALL | 1 | Gray | 0.0 | — |
-| FOOD | 2 | Teal | **1.0** | +15 |
-| POISON | 3 | Coral | **0.9** | -10 |
+| FOOD | 2 | Teal | **1.0** | + (configurable) |
+| POISON | 3 | Coral | **0.9** | - (configurable) |
 | PREY | 4 | Cyan | 0.3 | — |
-| PREDATOR | 5 | Red | 1.0 | +25 |
+| PREDATOR | 5 | Red | 1.0 | + (configurable) |
 
 Adding new cell types is simple—add to `CellType` class, and observation channels auto-expand.
 

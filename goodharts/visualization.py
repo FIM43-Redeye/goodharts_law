@@ -76,7 +76,6 @@ def build_legend_elements(sim) -> list[Patch]:
     ]
     
     # Add unique behavior types from current agents
-    # Add unique behavior types from current agents
     seen_behaviors = set()
     for agent in sim.agents:
         # Use str(behavior) which maps to behavior.name for LearnedBehavior

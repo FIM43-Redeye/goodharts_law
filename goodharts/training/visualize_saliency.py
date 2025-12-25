@@ -389,36 +389,52 @@ def analyze_model_attention(
         num_samples: Number of views to visualize
         show: If True, display plots interactively
     """
-    from goodharts.training.collect import collect_from_expert
-    from goodharts.behaviors import OmniscientSeeker
     from goodharts.configs.default_config import get_config
-    
+    from goodharts.environments import create_vec_env
+    from goodharts.modes import ObservationSpec
+
     # Auto-detect model if not specified
     if model_path is None:
         model_path = find_default_model()
         print(f"Auto-detected model: {model_path}")
-    
+
     if config is None:
         config = get_config()
-    
+
     device = get_device()
-    
+
     # Load model with auto-detected architecture
     model, metadata = load_model_from_path(model_path, device)
-    
-    # Collect sample views (mode depends on input channels)
-    mode = 'ground_truth' if metadata['input_channels'] == 4 else 'proxy_metric'
+
+    # Collect sample views using TorchVecEnv
+    # Mode depends on input channels (4 = ground_truth, 1 = proxy)
+    mode = 'ground_truth' if metadata['input_channels'] == 4 else 'proxy'
     print(f"Collecting {num_samples} sample views (mode: {mode})...")
-    buffer = collect_from_expert(config, OmniscientSeeker, num_steps=100, num_agents=5)
-    
+
+    obs_spec = ObservationSpec.for_mode(mode, config)
+    env = create_vec_env(n_envs=5, obs_spec=obs_spec, config=config, device=device)
+
+    # Collect observations by stepping through environment
+    sample_views = []
+    obs = env.reset()
+    sample_views.append(obs)
+    for _ in range(max(20, num_samples // 5)):
+        # Random actions to get diverse views
+        actions = torch.randint(0, 8, (5,), device=device)
+        obs, _, _, _ = env.step(actions)
+        sample_views.append(obs)
+
+    # Flatten: (num_steps, n_envs, C, H, W) -> (N, C, H, W)
+    all_views = torch.cat(sample_views, dim=0)
+
     # Create output directory
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     model_name = Path(model_path).stem
-    
+
     # Generate visualizations
     print(f"Generating saliency maps...")
-    for i in range(min(num_samples, len(buffer))):
-        view = buffer.buffer[i].state  # Shape: (C, H, W) or (H, W)
+    for i in range(min(num_samples, len(all_views))):
+        view = all_views[i]  # Shape: (C, H, W)
         
         # Handle multi-channel views for saliency - aggregate across channels
         if view.ndim == 3:
