@@ -106,14 +106,6 @@ def train_ppo(
 
 def main():
     """Main CLI entry point."""
-    # Cleanup stale stop signal
-    if os.path.exists('.training_stop_signal'):
-        try:
-            os.remove('.training_stop_signal')
-            print("Removed stale stop signal.")
-        except OSError:
-            pass
-
     # Archive existing logs to keep current run clean
     from goodharts.training.train_log import TrainingLogger
     TrainingLogger.archive_existing_logs()
@@ -161,6 +153,10 @@ def main():
                         help='Delete compilation cache before starting')
     parser.add_argument('--benchmark', '-b', action='store_true',
                         help='Benchmark mode: measure throughput only, discard model')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed for reproducibility (default: random)')
+    parser.add_argument('--deterministic', action='store_true',
+                        help='Enable full determinism (slower, for debugging)')
     args = parser.parse_args()
     
     # Build overrides dict from CLI args (only non-None values)
@@ -215,7 +211,13 @@ def main():
     # Handle --no-profile (critical for high steps_per_env configs)
     if args.no_profile:
         overrides['profile_enabled'] = False
-    
+
+    # Handle seed and deterministic mode
+    if args.seed is not None:
+        overrides['seed'] = args.seed
+    if args.deterministic:
+        overrides['deterministic'] = True
+
     modes_to_train = all_modes if args.mode == 'all' else [args.mode]
     
     # Training execution
@@ -249,12 +251,8 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool)
             # Sequential: run training in main thread (better GPU perf)
             for mode in modes_to_train:
                 # Check if stop was requested or dashboard closed
-                if os.path.exists('.training_stop_signal'):
+                if dashboard.should_stop():
                     print(f"[Sequential] Stop signal detected, skipping remaining modes")
-                    try:
-                        os.remove('.training_stop_signal')
-                    except OSError:
-                        pass
                     break
                 if not dashboard.is_alive():
                     print("[Sequential] Dashboard closed, stopping training")

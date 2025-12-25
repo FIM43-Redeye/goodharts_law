@@ -465,7 +465,7 @@ The project uses type hints throughout. Key conventions:
 
 ## Disclosure
 
-This project was developed almost entirely using Google's experimental Antigravity agentic IDE, with the gracious assistance of Claude 4.5 Opus and Gemini 3 Pro. I acted as architect and systems lead, manually writing some code where relevant, but I credit Opus for the vast majority of the implementation and documentation. This project would not have been possible without Google's free Gemini Pro subscription for students and the experimental high usage limits in Antigravity.
+This project was developed initially using Google's experimental Antigravity agentic IDE, with the gracious assistance of Claude 4.5 Opus and Gemini 3 Pro. Due to emergent lag in Antigravity, I later switched to Claude Code, entirely with 4.5 Opus. I acted as architect and systems lead, manually writing some code where relevant, but I credit Opus for the vast majority of the implementation and documentation. This project would not have been possible without Google's free Gemini Pro subscription for students, the experimental high usage limits in Antigravity, and the extreme efficiency and potential of Claude Code.
 
 I am grateful to Google and Anthropic for making this project possible.
 

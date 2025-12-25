@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import torch
 
 from goodharts.utils.device import get_device
+from goodharts.utils.seed import set_seed
 from goodharts.configs.default_config import get_config
 from goodharts.modes import ObservationSpec
 from goodharts.behaviors.brains import create_brain
@@ -135,9 +136,12 @@ def main():
                         help="Directory containing trained models")
     parser.add_argument("--output-dir", type=Path, default=Path("generated/evaluations"),
                         help="Directory for output files")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducibility (default: random)")
     args = parser.parse_args()
-    
+
     # Setup
+    seed = set_seed(args.seed, verbose=True)
     device = get_device()
     args.output_dir.mkdir(exist_ok=True)
     
@@ -157,7 +161,7 @@ def main():
         models = all_models
     
     print(f"\nEvaluation: {len(models)} models, {args.episodes} episodes each")
-    print(f"Device: {device}, Envs: {args.n_envs}")
+    print(f"Device: {device}, Envs: {args.n_envs}, Seed: {seed}")
     print(f"Models: {', '.join(sorted(models.keys()))}\n")
     
     # Run evaluations sequentially
@@ -196,8 +200,14 @@ def main():
             }
     
     summary_path = args.output_dir / f"{timestamp}_summary.json"
+    output = {
+        "seed": seed,
+        "n_envs": args.n_envs,
+        "episodes_per_model": args.episodes,
+        "results": summary,
+    }
     with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
+        json.dump(output, f, indent=2)
     
     # Print summary
     print(f"\n{'='*60}")

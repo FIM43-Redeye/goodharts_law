@@ -139,10 +139,15 @@ class TorchVecEnv:
         # State tensors (all on GPU)
         # Grid uses float32 for faster F.pad (avoids dtype conversion overhead)
         self.grids = torch.zeros((self.n_grids, self.height, self.width), dtype=torch.float32, device=device)
+        # Use int32 for positions (TPU-friendly; PyTorch accepts int32 for indexing)
         self.agent_x = torch.zeros(n_envs, dtype=torch.int32, device=device)
         self.agent_y = torch.zeros(n_envs, dtype=torch.int32, device=device)
         self.agent_energy = torch.full((n_envs,), self.initial_energy, dtype=torch.float32, device=device)
         self.agent_steps = torch.zeros(n_envs, dtype=torch.int32, device=device)
+
+        # Track what cell type is "under" each agent (for restoration when moving)
+        # Agents are permanently marked on grid - this tracks the original cell value
+        self.agent_underlying_cell = torch.zeros(n_envs, dtype=torch.float32, device=device)
         
         # Pre-allocated view buffer
         self._view_buffer = torch.zeros(
@@ -152,7 +157,15 @@ class TorchVecEnv:
         
         # Done states
         self.dones = torch.zeros(n_envs, dtype=torch.bool, device=device)
-        
+
+        # Pre-allocated temporaries for step() to avoid per-step allocations
+        self._old_y = torch.zeros(n_envs, dtype=torch.int32, device=device)
+        self._old_x = torch.zeros(n_envs, dtype=torch.int32, device=device)
+        self._dones_return = torch.zeros(n_envs, dtype=torch.bool, device=device)
+        self._step_rewards = torch.zeros(n_envs, dtype=torch.float32, device=device)
+        self._empty_value = torch.tensor(self.CellType.EMPTY.value, device=device, dtype=torch.float32)
+        self._neg_inf = torch.tensor(-float('inf'), device=device, dtype=torch.float32)
+
         # Stats tracking
         self.current_episode_food = torch.zeros(n_envs, dtype=torch.int32, device=device)
         self.last_episode_food = torch.zeros(n_envs, dtype=torch.int32, device=device)
@@ -210,23 +223,46 @@ class TorchVecEnv:
         self._place_items(grid_id, self.CellType.POISON.value, poison_count)
     
     def _reset_agent(self, env_id: int):
-        """Reset a single agent's state."""
-        grid_id = self.grid_indices[env_id].item()
-        
-        # Find empty positions - use as_tuple for XLA compatibility
+        """Reset a single agent's state and mark on grid.
+
+        Uses tensor operations throughout to avoid CPU-GPU sync points.
+        """
+        grid_id = self.grid_indices[env_id]  # Keep as tensor, no .item()
+
+        # Clear old position (restore underlying cell) - only if agent is actually there
+        old_y = self.agent_y[env_id]
+        old_x = self.agent_x[env_id]
+        old_cell_value = self.grids[grid_id, old_y, old_x]
+        agent_type = self.agent_types[env_id].float()
+
+        # Conditional restore using torch.where (no Python branching on GPU values)
+        is_agent_marked = (old_cell_value == agent_type)
+        self.grids[grid_id, old_y, old_x] = torch.where(
+            is_agent_marked,
+            self.agent_underlying_cell[env_id],
+            old_cell_value
+        )
+
+        # Noise-based random selection (avoids .item() on randint result)
+        noise = torch.rand(self.height, self.width, device=self.device)
         empty_mask = (self.grids[grid_id] == self.CellType.EMPTY.value)
-        empty_y, empty_x = empty_mask.nonzero(as_tuple=True)
-        n_empty = empty_y.shape[0]
-        
-        if n_empty > 0:
-            idx = torch.randint(n_empty, (1,), dtype=torch.int32, device=self.device).item()
-            self.agent_y[env_id] = empty_y[idx]
-            self.agent_x[env_id] = empty_x[idx]
-        
+        masked_noise = torch.where(empty_mask, noise, self._neg_inf)
+
+        # Argmax finds the random empty cell
+        flat_idx = masked_noise.view(-1).argmax()
+        new_y = (flat_idx // self.width).int()
+        new_x = (flat_idx % self.width).int()
+
+        # Update position and mark on grid
+        self.agent_y[env_id] = new_y
+        self.agent_x[env_id] = new_x
+        self.agent_underlying_cell[env_id] = self.CellType.EMPTY.value
+        self.grids[grid_id, new_y, new_x] = self.agent_types[env_id].float()
+
         self.agent_energy[env_id] = self.initial_energy
         self.agent_steps[env_id] = 0
         self.dones[env_id] = False
-        
+
         # Update stats
         self.last_episode_food[env_id] = self.current_episode_food[env_id]
         self.last_episode_poison[env_id] = self.current_episode_poison[env_id]
@@ -234,69 +270,151 @@ class TorchVecEnv:
         self.current_episode_poison[env_id] = 0
     
     def _reset_agents_batch(self, env_ids: torch.Tensor):
-        """Vectorized batch reset for multiple agents - minimal GPU syncs."""
+        """Batch reset for multiple agents with proper grid marking."""
         if len(env_ids) == 0:
             return
-        
-        n_reset = len(env_ids)
-        
+
         # Update stats (vectorized)
         self.last_episode_food[env_ids] = self.current_episode_food[env_ids]
         self.last_episode_poison[env_ids] = self.current_episode_poison[env_ids]
         self.current_episode_food[env_ids] = 0
         self.current_episode_poison[env_ids] = 0
-        
+
+        # Restore old cells (clear agent markers) - only where agents are actually marked
+        old_y = self.agent_y[env_ids]
+        old_x = self.agent_x[env_ids]
+        grid_ids = self.grid_indices[env_ids]
+        old_cell_values = self.grids[grid_ids, old_y, old_x]
+        agent_types_for_reset = self.agent_types[env_ids].float()
+        # Only restore where the agent is actually marked
+        actually_marked = (old_cell_values == agent_types_for_reset)
+        restore_values = torch.where(
+            actually_marked,
+            self.agent_underlying_cell[env_ids],
+            old_cell_values  # Keep existing if agent wasn't marked here
+        )
+        self.grids[grid_ids, old_y, old_x] = restore_values
+
         # Reset energy, steps, dones (vectorized)
         self.agent_energy[env_ids] = self.initial_energy
         self.agent_steps[env_ids] = 0
         self.dones[env_ids] = False
-        
-        # Random spawn positions - sample uniformly and check for empty
-        # This is approximate but avoids per-agent loops
+
+        if self.shared_grid:
+            # Shared grid: sequential spawning for correctness (avoids collisions)
+            # Use range to avoid .tolist() sync; _spawn_agent_on_empty handles tensor indexing
+            for i in range(len(env_ids)):
+                self._spawn_agent_on_empty(env_ids[i])
+        else:
+            # Independent grids: vectorized spawning (each agent has own grid)
+            self._spawn_agents_vectorized(env_ids)
+
+    def _spawn_agent_on_empty(self, env_id):
+        """Spawn a single agent on an empty cell using noise-based selection.
+
+        Args:
+            env_id: Environment index (int or 0-d tensor)
+
+        Uses argmax on masked noise to avoid CPU-GPU sync. Still called
+        sequentially for shared_grid mode to prevent collisions.
+        """
+        grid_id = self.grid_indices[env_id]  # Keep as tensor, no .item()
+
+        # Noise-based random selection (avoids .item() on randint result)
+        noise = torch.rand(self.height, self.width, device=self.device)
+        empty_mask = (self.grids[grid_id] == self.CellType.EMPTY.value)
+        masked_noise = torch.where(empty_mask, noise, self._neg_inf)
+
+        # Argmax finds the random empty cell
+        flat_idx = masked_noise.view(-1).argmax()
+        new_y = (flat_idx // self.width).int()
+        new_x = (flat_idx % self.width).int()
+
+        # Update position and mark on grid
+        self.agent_y[env_id] = new_y
+        self.agent_x[env_id] = new_x
+        self.agent_underlying_cell[env_id] = self.CellType.EMPTY.value
+        self.grids[grid_id, new_y, new_x] = self.agent_types[env_id].float()
+
+    def _spawn_agents_vectorized(self, env_ids: torch.Tensor):
+        """Fully vectorized spawn using noise-based random selection.
+
+        Uses argmax on masked noise to select random empty cells without
+        any CPU-GPU synchronization. Each agent has its own grid, so
+        spawns are independent and can be fully parallelized.
+        """
+        n_reset = len(env_ids)
+        if n_reset == 0:
+            return
+
         grid_ids = self.grid_indices[env_ids]
-        
-        # Generate random positions (int32 to match agent_y/x dtype)
-        rand_y = torch.randint(0, self.height, (n_reset,), dtype=torch.int32, device=self.device)
-        rand_x = torch.randint(0, self.width, (n_reset,), dtype=torch.int32, device=self.device)
-        
-        # Assign positions (if occupied, agent spawns there anyway - rare edge case)
-        self.agent_y[env_ids] = rand_y
-        self.agent_x[env_ids] = rand_x
+
+        # Generate random noise for all cells across all grids
+        noise = torch.rand(n_reset, self.height, self.width, device=self.device)
+
+        # Get empty masks for all grids at once
+        grids = self.grids[grid_ids]  # (n_reset, height, width)
+        empty_mask = (grids == self.CellType.EMPTY.value)
+
+        # Mask non-empty cells to -inf so they can't be chosen
+        masked_noise = torch.where(empty_mask, noise, self._neg_inf)
+
+        # Find argmax per grid (random empty cell due to uniform noise)
+        flat_noise = masked_noise.view(n_reset, -1)
+        flat_idx = flat_noise.argmax(dim=1)
+
+        # Convert flat index to (y, x) coordinates
+        new_y = (flat_idx // self.width).int()
+        new_x = (flat_idx % self.width).int()
+
+        # Update agent positions (vectorized)
+        self.agent_y[env_ids] = new_y
+        self.agent_x[env_ids] = new_x
+        self.agent_underlying_cell[env_ids] = self.CellType.EMPTY.value
+
+        # Mark agents on grids (vectorized advanced indexing)
+        self.grids[grid_ids, new_y, new_x] = self.agent_types[env_ids].float()
     
     def _place_items(self, grid_id: int, cell_type: int, count: int):
-        """Place items at random empty positions."""
+        """Place items at random empty positions (guaranteed unique positions)."""
         if count <= 0:
             return
-        
+
         empty_mask = (self.grids[grid_id] == self.CellType.EMPTY.value)
         # Use as_tuple for XLA compatibility (returns tuple of 1D tensors)
         empty_y, empty_x = empty_mask.nonzero(as_tuple=True)
         n_empty = empty_y.shape[0]
-        
+
         if n_empty == 0:
             return
-        
-        # Randomly select positions - use int32 for XLA/TPU compatibility
+
         n_to_place = min(count, n_empty)
-        # Generate random indices (with replacement to avoid int64 randperm)
-        # For small counts vs large pool, duplicates are rare and handled by overwriting
-        indices = torch.randint(n_empty, (n_to_place,), dtype=torch.int32, device=self.device)
-        
-        # Index and place items
-        chosen_y = empty_y[indices.long()]  # Index with long for PyTorch compat
-        chosen_x = empty_x[indices.long()]
+
+        # Use randperm for sampling WITHOUT replacement (guarantees unique positions)
+        # randperm returns int64 which is fine for indexing
+        perm = torch.randperm(n_empty, device=self.device)[:n_to_place]
+        chosen_y = empty_y[perm]
+        chosen_x = empty_x[perm]
+
         self.grids[grid_id, chosen_y, chosen_x] = cell_type
     
     def step(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Execute batched actions."""
+        """Execute batched actions with proper grid updates."""
         # Ensure actions are on device
         if actions.device != self.device:
             actions = actions.to(self.device)
-        
+
+        # Store old positions (reuse pre-allocated buffers)
+        self._old_y.copy_(self.agent_y)
+        self._old_x.copy_(self.agent_x)
+
+        # Restore old cells (clear agent markers before moving)
+        self.grids[self.grid_indices, self._old_y, self._old_x] = self.agent_underlying_cell
+
         # Get movement deltas
         dx = self.action_deltas[actions, 0]
         dy = self.action_deltas[actions, 1]
-        
+
         # Move agents
         if self.loop:
             self.agent_x = (self.agent_x + dx) % self.width
@@ -304,100 +422,72 @@ class TorchVecEnv:
         else:
             self.agent_x = torch.clamp(self.agent_x + dx, 0, self.width - 1)
             self.agent_y = torch.clamp(self.agent_y + dy, 0, self.height - 1)
-        
+
         # Energy cost
         self.agent_energy -= self.energy_move_cost
-        
-        # Eating
+
+        # Eating (updates underlying_cell and clears eaten items)
         rewards = self._eat_batch()
-        
+
+        # Mark agents at new positions
+        self.grids[self.grid_indices, self.agent_y, self.agent_x] = self.agent_types.float()
+
         # Step count and done check
         self.agent_steps += 1
         self.dones = (self.agent_energy <= 0) | (self.agent_steps >= self.max_steps)
-        
-        # Death penalty
+
         # Death penalty (ONLY for starvation, not timeout)
         rewards = torch.where(self.agent_energy <= 0, rewards - 10.0, rewards)
-        
+
         # Movement cost (living penalty) - crucial for sparse reward learning!
         rewards -= self.energy_move_cost
-        
-        # Save dones before reset
-        dones_to_return = self.dones.clone()
-        
+
+        # Save dones before reset (reuse pre-allocated buffer)
+        self._dones_return.copy_(self.dones)
+
         # Auto-reset done agents (vectorized - no Python loop)
         if self.dones.any():
             done_indices = self.dones.nonzero(as_tuple=True)[0]
             self._reset_agents_batch(done_indices)
-        
-        return self._get_observations(), rewards, dones_to_return
+
+        return self._get_observations(), rewards, self._dones_return
     
     def _eat_batch(self) -> torch.Tensor:
-        """Fully vectorized eating logic - minimized syncs (no .any() checks)."""
-        rewards = torch.zeros(self.n_envs, dtype=torch.float32, device=self.device)
-        
+        """Vectorized eating logic with underlying cell tracking."""
+        # Reuse pre-allocated rewards buffer
+        self._step_rewards.zero_()
+
         # Get cell values at agent positions (vectorized)
-        agent_y_long = self.agent_y.long()
-        agent_x_long = self.agent_x.long()
-        cell_values = self.grids[self.grid_indices, agent_y_long, agent_x_long]
-        
-        # Food - unconditional execution with masking (avoids .any() sync)
+        cell_values = self.grids[self.grid_indices, self.agent_y, self.agent_x]
+
+        # Food eating
         food_mask = (cell_values == self.CellType.FOOD.value)
-        
-        # Apply food effects masked
-        rewards = torch.where(food_mask, rewards + self.food_reward, rewards)
-        
-        # Only update energy/count where food was eaten
-        # We can use index_addish logic or just masked update since we have per-agent state
+        self._step_rewards = torch.where(food_mask, self._step_rewards + self.food_reward, self._step_rewards)
         self.agent_energy = torch.where(food_mask, self.agent_energy + self.food_reward, self.agent_energy)
         self.current_episode_food = torch.where(food_mask, self.current_episode_food + 1, self.current_episode_food)
-        
-        # Clear eaten food (mask write)
-        # We need grid_indices for scatter
-        # scatter_ or index_put_ works with masks?
-        # grids[ind, y, x] = val works with boolean mask indexing, but that causes sync for indices?
-        # No, grids[...] = val is purely GPU if indices are GPU tensors.
-        # But `grids[grid_indices[food_mask], ...]` creates dynamic shape -> sync?
-        # YES. `grid_indices[food_mask]` is dynamic shape.
-        # FIX: Use `torch.where` on the WHOLE grid update? Too expensive (copy whole grid).
-        # Better: masked_scatter?
-        # Actually, `self.grids[self.grid_indices, agent_y_long, agent_x_long] = selected_vals`
-        # We can construct the "new value" for the cell:
-        # new_val = where(food_mask, EMPTY, old_val)
-        # Then write back to ALL agent positions.
-        # (Overwriting non-food cells with themselves is fine/identity).
-        
-        new_cell_values = torch.where(food_mask, torch.tensor(self.CellType.EMPTY.value, device=self.device, dtype=torch.float32), cell_values)
-        self.grids[self.grid_indices, agent_y_long, agent_x_long] = new_cell_values
-        
-        # Respawn food - pass mask, internal logic must be sync-free
-        self._respawn_items_vectorized(food_mask, self.CellType.FOOD.value)
-        
-        # Poison - same pattern
-        # Re-read cell values? No, we just updated them to empty if food.
-        # If it was poison, it wasn't food, so it's still poison in 'new_cell_values'?
-        # Wait, if we overwrote with new_cell_values, we need to base poison check on ORIGINAL cell_values.
-        
+
+        # Poison eating (check against original cell_values before any modifications)
         poison_mask = (cell_values == self.CellType.POISON.value)
-        
-        rewards = torch.where(poison_mask, rewards - self.poison_penalty, rewards)
+        self._step_rewards = torch.where(poison_mask, self._step_rewards - self.poison_penalty, self._step_rewards)
         self.agent_energy = torch.where(poison_mask, self.agent_energy - self.poison_penalty, self.agent_energy)
         self.current_episode_poison = torch.where(poison_mask, self.current_episode_poison + 1, self.current_episode_poison)
-        
-        # Clear poison (if eaten)
-        # Update our local 'new_cell_values' to reflect poison removal too
-        # If it was poison, become EMPTY. Else keep what it was (EMPTY or WALL etc)
-        # Note: 'new_cell_values' currently has EMPTY where food was, and ORIGINAL where food wasn't.
-        # We want to apply poison clearing on top.
-        
-        final_cell_values = torch.where(poison_mask, torch.tensor(self.CellType.EMPTY.value, device=self.device, dtype=torch.float32), new_cell_values)
-        
-        # Write back (updates both food and poison removals in one go)
-        self.grids[self.grid_indices, agent_y_long, agent_x_long] = final_cell_values
-        
+
+        # Determine what the cell becomes after eating
+        # If ate food or poison -> EMPTY, otherwise keep original
+        ate_something = food_mask | poison_mask
+        final_cell_values = torch.where(ate_something, self._empty_value, cell_values)
+
+        # Update underlying cell (what's "under" the agent after this step)
+        self.agent_underlying_cell = final_cell_values
+
+        # Clear eaten items from grid
+        self.grids[self.grid_indices, self.agent_y, self.agent_x] = final_cell_values
+
+        # Respawn eaten items
+        self._respawn_items_vectorized(food_mask, self.CellType.FOOD.value)
         self._respawn_items_vectorized(poison_mask, self.CellType.POISON.value)
-        
-        return rewards
+
+        return self._step_rewards
     
     def _respawn_items_vectorized(self, eaten_mask: torch.Tensor, cell_type: int):
         """
@@ -406,7 +496,7 @@ class TorchVecEnv:
         """
         # grid_ids: We use self.grid_indices directly (static shape N_envs)
         N = self.n_envs
-        K = 20 # Reduced from 100 (sufficient for 99% success)
+        K = 50  # Increased for 99.5%+ success rate even on dense grids
         
         # Generate K candidates for ALL envs: (N, K)
         rand_y = torch.randint(0, self.height, (N, K), device=self.device)
@@ -459,52 +549,48 @@ class TorchVecEnv:
     
     def _get_observations(self) -> torch.Tensor:
         """Get batched observations (fully vectorized on GPU).
-        
+
         Mode-aware encoding:
         - Ground truth: One-hot encoding of cell types (channels = cell types)
         - Proxy modes: Channels 0-1 are empty/wall, channels 2+ are interestingness
+
+        Note: Agents are permanently marked on the grid, so no temp mark/restore needed.
         """
         r = self.view_radius
         vs = self.view_size
-        
-        # Mark agents on grid (save original values)
-        agent_y_long = self.agent_y.long()
-        agent_x_long = self.agent_x.long()
-        current_vals = self.grids[self.grid_indices, agent_y_long, agent_x_long].clone()
-        self.grids[self.grid_indices, agent_y_long, agent_x_long] = self.agent_types.float()
-        
+
         # Pad grids (grid is float32, no conversion needed)
         if self.loop:
             padded_grids = F.pad(self.grids, (r, r, r, r), mode='circular')
         else:
             padded_grids = F.pad(
-                self.grids, (r, r, r, r), 
+                self.grids, (r, r, r, r),
                 mode='constant', value=float(self.CellType.WALL.value)
             )
-        
+
         # VECTORIZED VIEW EXTRACTION using unfold
         windows = padded_grids.unfold(1, vs, 1).unfold(2, vs, 1)
-        
+
         # Index by agent positions to get each agent's view
-        views = windows[self.grid_indices, agent_y_long, agent_x_long]  # (n_envs, vs, vs)
-        
+        views = windows[self.grid_indices, self.agent_y, self.agent_x]  # (n_envs, vs, vs)
+
         if self.is_proxy_mode:
             # PROXY MODE: Hide ground truth, show interestingness
             # Channel 0: is_empty (binary)
-            # Channel 1: is_wall (binary)  
+            # Channel 1: is_wall (binary)
             # Channels 2+: interestingness value (same across all these channels)
-            
-            views_long = views.long()
-            
+
+            views_int = views.int()  # int32 for TPU-friendly indexing
+
             # Binary channels for empty/wall
-            self._view_buffer[:, 0, :, :] = (views_long == self.CellType.EMPTY.value).float()
-            self._view_buffer[:, 1, :, :] = (views_long == self.CellType.WALL.value).float()
-            
+            self._view_buffer[:, 0, :, :] = (views_int == self.CellType.EMPTY.value).float()
+            self._view_buffer[:, 1, :, :] = (views_int == self.CellType.WALL.value).float()
+
             # Interestingness channel (lookup from cell values)
             # Clamp to valid indices to avoid index errors
-            clamped_views = views_long.clamp(0, len(self._interestingness_lut) - 1)
+            clamped_views = views_int.clamp(0, len(self._interestingness_lut) - 1)
             interestingness = self._interestingness_lut[clamped_views]  # (n_envs, vs, vs)
-            
+
             # Fill channels 2+ with interestingness (single vectorized op, no loop)
             n_interest_channels = self.n_channels - 2
             # Expand interestingness to (n_envs, n_interest_channels, vs, vs) and write
@@ -513,13 +599,10 @@ class TorchVecEnv:
             # GROUND TRUTH MODE: One-hot encoding of cell types
             one_hot = F.one_hot(views.long(), num_classes=self.n_channels)
             self._view_buffer[:] = one_hot.permute(0, 3, 1, 2).float()
-        
+
         # Blank center (agent's own cell)
         self._view_buffer[:, :, r, r] = 0.0
-        
-        # Restore grid
-        self.grids[self.grid_indices, agent_y_long, agent_x_long] = current_vals
-        
+
         return self._view_buffer
 
 

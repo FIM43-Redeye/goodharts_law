@@ -19,8 +19,9 @@ from typing import Optional
 from goodharts.configs.default_config import get_config
 from goodharts.config import get_training_config
 from goodharts.utils.device import get_device, apply_system_optimizations, is_tpu, sync_device
-from goodharts.behaviors.brains import create_brain
-from goodharts.behaviors.action_space import num_actions
+from goodharts.utils.seed import set_seed
+from goodharts.behaviors.brains import create_brain, save_brain, _clean_state_dict
+from goodharts.behaviors.action_space import create_action_space, ActionSpace
 from goodharts.environments.torch_env import create_torch_vec_env
 from goodharts.training.train_log import TrainingLogger
 from goodharts.modes import RewardComputer
@@ -43,12 +44,14 @@ _COMPILE_LOCK = threading.Lock()
 class PPOConfig:
     """
     Configuration for PPO training.
-    
+
     Use PPOConfig.from_config() to load defaults from config.toml,
     with CLI arguments as optional overrides.
     """
     mode: str = 'ground_truth'
     brain_type: str = 'base_cnn'
+    action_space_type: str = 'discrete_grid'
+    max_move_distance: int = 1
     n_envs: int = 64
     total_timesteps: int = 100_000
     lr: float = 3e-4
@@ -73,6 +76,10 @@ class PPOConfig:
     profile_enabled: bool = True  # Disable with --no-profile for production
     benchmark_mode: bool = False  # Skip saving, just measure throughput
 
+    # Reproducibility
+    seed: Optional[int] = None  # None = random seed (logged for reproducibility)
+    deterministic: bool = False  # Full determinism (slower)
+
     # Validation episodes (periodic eval without exploration)
     validation_interval: int = 8     # Every N updates (0 = disabled)
     validation_episodes: int = 16     # Episodes per validation
@@ -84,23 +91,25 @@ class PPOConfig:
     def from_config(cls, mode: str = 'ground_truth', **overrides) -> 'PPOConfig':
         """
         Create PPOConfig from config.toml with optional CLI overrides.
-        
+
         Config file provides defaults; explicit kwargs override them.
         This allows CLI args to be truly optional.
-        
+
         Args:
             mode: Training mode (ground_truth, proxy, etc.)
             **overrides: Any PPOConfig fields to override
-            
+
         Returns:
             PPOConfig with values from config file + overrides
         """
         train_cfg = get_training_config()
-        
+
         # Build config from file defaults
         config_values = {
             'mode': mode,
             'brain_type': train_cfg.get('brain_type', 'base_cnn'),
+            'action_space_type': train_cfg.get('action_space_type', 'discrete_grid'),
+            'max_move_distance': train_cfg.get('max_move_distance', 1),
             'n_envs': train_cfg.get('n_envs', 64),
             'lr': train_cfg.get('learning_rate', 3e-4),
             'gamma': train_cfg.get('gamma', 0.99),
@@ -120,12 +129,12 @@ class PPOConfig:
             'validation_food': train_cfg.get('validation_food', 100),
             'validation_poison': train_cfg.get('validation_poison', 50),
         }
-        
+
         # Apply overrides (CLI args take precedence)
         for key, value in overrides.items():
             if value is not None:  # Only override if explicitly set
                 config_values[key] = value
-        
+
         return cls(**config_values)
 
 
@@ -254,17 +263,19 @@ class PPOTrainer:
     def _setup(self):
         """Initialize environment, networks, and logging."""
         cfg = self.config
-        
-        # Seeding
-        seed = int(time.time())
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        
+
+        # Reproducibility: set all random seeds
+        self.seed = set_seed(
+            seed=cfg.seed,
+            deterministic=cfg.deterministic,
+            verbose=False
+        )
+
         v = cfg.hyper_verbose
         _vprint("_setup() starting", v)
-        
+
         print(f"\n[PPO] Starting training: {cfg.mode}")
-        print(f"   Device: {self.device}, Envs: {cfg.n_envs}")
+        print(f"   Device: {self.device}, Envs: {cfg.n_envs}, Seed: {self.seed}")
         if is_tpu(self.device):
             print("   Note: TPU uses XLA - first step compiles the graph (may take a few minutes)")
         
@@ -280,7 +291,13 @@ class PPOTrainer:
         # Observation spec
         _vprint("Creating observation spec...", v)
         self.spec = sim_config['get_observation_spec'](cfg.mode)
-        n_actions = num_actions(1)
+
+        # Action space (pluggable - stored for serialization)
+        self.action_space = create_action_space(
+            cfg.action_space_type,
+            max_move_distance=cfg.max_move_distance
+        )
+        n_actions = self.action_space.n_outputs
         
         # Environment - ALWAYS use GPU-native TorchVecEnv
         _vprint("Creating TorchVecEnv...", v)
@@ -294,6 +311,8 @@ class PPOTrainer:
         _vprint("Creating networks...", v)
         self.policy = create_brain(cfg.brain_type, self.spec, output_size=n_actions).to(self.device)
         self.value_head = ValueHead(input_size=self.policy.hidden_size).to(self.device)
+        # Store architecture info before potential torch.compile (for serialization)
+        self._policy_arch_info = self.policy.get_architecture_info()
         _vprint("Networks created and moved to device", v)
 
         # AMP
@@ -472,8 +491,8 @@ class PPOTrainer:
         while self.total_steps < cfg.total_timesteps:
             self.profiler.start()
             
-            # Check stop signal (don't clear it - let outer loop handle that)
-            if os.path.exists('.training_stop_signal'):
+            # Check stop signal via dashboard (if available)
+            if self.dashboard and hasattr(self.dashboard, 'should_stop') and self.dashboard.should_stop():
                 print(f"\n[PPO] Stop signal received!")
                 break
             
@@ -488,8 +507,8 @@ class PPOTrainer:
                 if v:
                     _vprint(f"Step {self.total_steps}: running inference...", v)
                 with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                    logits = self.policy(states_t)
-                    features = self.policy.get_features(states_t)
+                    # Use combined forward to avoid computing CNN features twice
+                    logits, features = self.policy.forward_with_features(states_t)
                     values = self.value_head(features).squeeze(-1)
                     
                     dist = Categorical(logits=logits, validate_args=False)
@@ -544,7 +563,7 @@ class PPOTrainer:
                 # Get bootstrap value (keep on GPU)
                 with torch.no_grad():
                     states_t = states.float()
-                    features = self.policy.get_features(states_t)
+                    _, features = self.policy.forward_with_features(states_t)
                     next_value = self.value_head(features).squeeze(-1)
                 
                 # Compute GAE
@@ -740,18 +759,26 @@ class PPOTrainer:
                     self._save_checkpoint()
     
     def _save_checkpoint(self):
-        """Save training checkpoint."""
+        """Save training checkpoint with full architecture metadata."""
         checkpoint_path = os.path.join(
             self.checkpoint_dir,
             f"checkpoint_{self.config.mode}_u{self.update_count}_s{self.total_steps}.pth"
         )
         torch.save({
+            # Brain metadata (for architecture-agnostic loading)
+            'brain_type': self.config.brain_type,
+            'architecture': self._policy_arch_info,
+            'action_space': self.action_space.get_config(),
+            'mode': self.config.mode,
+            'seed': self.seed,
+            # Training state
             'update': self.update_count,
             'total_steps': self.total_steps,
-            'policy_state_dict': self.policy.state_dict(),
-            'value_head_state_dict': self.value_head.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
             'best_reward': self.best_reward,
+            # Model weights (cleaned of torch.compile prefixes)
+            'state_dict': _clean_state_dict(self.policy.state_dict()),
+            'value_head_state_dict': _clean_state_dict(self.value_head.state_dict()),
+            'optimizer_state_dict': self.optimizer.state_dict(),
         }, checkpoint_path)
         print(f"   Checkpoint saved: {checkpoint_path}")
     
@@ -861,8 +888,18 @@ class PPOTrainer:
             print(f"  Best reward:    {self.best_reward:.1f}")
             print(f"{'='*60}")
         else:
-            torch.save(self.policy.state_dict(), cfg.output_path)
-            print(f"\n[PPO] Training complete: {cfg.output_path}")
+            # Save with full metadata for architecture-agnostic loading
+            checkpoint = {
+                'brain_type': cfg.brain_type,
+                'architecture': self._policy_arch_info,
+                'action_space': self.action_space.get_config(),
+                'state_dict': _clean_state_dict(self.policy.state_dict()),
+                'mode': cfg.mode,
+                'training_steps': self.total_steps,
+                'seed': self.seed,
+            }
+            torch.save(checkpoint, cfg.output_path)
+            print(f"\n[PPO] Training complete: {cfg.output_path} (seed={self.seed})")
 
             if self.logger:
                 self.logger.finalize(best_efficiency=self.best_reward, final_model_path=cfg.output_path)

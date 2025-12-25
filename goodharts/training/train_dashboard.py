@@ -33,16 +33,21 @@ QUEUE_MAX_SIZE = 1000             # Maximum pending updates in queue
 
 @dataclass
 class RunState:
-    """State for a single training run."""
+    """State for a single training run.
+
+    Metrics are stored both raw and smoothed. Smoothed values are computed
+    incrementally as new data arrives (O(1) per update) rather than
+    recomputing the full EMA each frame (O(n) per frame).
+    """
     mode: str
     n_actions: int = 8
-    
+
     # Current snapshot
     episode: int = 0
     total_steps: int = 0
     current_action_probs: np.ndarray = field(default_factory=lambda: np.zeros(8))
-    
-    # Metrics history (aligned by Update)
+
+    # Raw metrics history (aligned by Update)
     rewards: list = field(default_factory=list)
     policy_losses: list = field(default_factory=list)
     value_losses: list = field(default_factory=list)
@@ -50,34 +55,101 @@ class RunState:
     explained_variances: list = field(default_factory=list)
     food_history: list = field(default_factory=list)
     poison_history: list = field(default_factory=list)
-    
+
+    # Pre-smoothed metrics (computed incrementally on append)
+    rewards_smoothed: list = field(default_factory=list)
+    policy_losses_smoothed: list = field(default_factory=list)
+    value_losses_smoothed: list = field(default_factory=list)
+    explained_variances_smoothed: list = field(default_factory=list)
+    food_smoothed: list = field(default_factory=list)
+    poison_smoothed: list = field(default_factory=list)
+
     # Status
     is_running: bool = True
     is_finished: bool = False
-    
+
     # Timestamps
     last_update: float = 0.0
+
+    def append_metrics(self, p_loss: float, v_loss: float, ent: float,
+                       ev: float, reward: float, food: float, poison: float,
+                       alpha: float = EMA_SMOOTHING_ALPHA):
+        """Append new metrics with incremental EMA smoothing.
+
+        This is O(1) per call instead of O(n) per frame.
+        """
+        # Raw values
+        self.policy_losses.append(p_loss)
+        self.value_losses.append(v_loss)
+        self.entropies.append(ent)
+        self.explained_variances.append(ev)
+        self.rewards.append(reward)
+        self.food_history.append(food)
+        self.poison_history.append(poison)
+
+        # Incremental EMA: smoothed = alpha * prev_smoothed + (1-alpha) * new_value
+        def ema_append(smoothed_list: list, raw_value: float) -> None:
+            if smoothed_list:
+                prev = smoothed_list[-1]
+                smoothed_list.append(alpha * prev + (1 - alpha) * raw_value)
+            else:
+                smoothed_list.append(raw_value)
+
+        ema_append(self.policy_losses_smoothed, p_loss)
+        ema_append(self.value_losses_smoothed, v_loss)
+        ema_append(self.explained_variances_smoothed, ev)
+        ema_append(self.rewards_smoothed, reward)
+        ema_append(self.food_smoothed, food)
+        ema_append(self.poison_smoothed, poison)
+
+        # Trim to max points to prevent unbounded growth
+        max_pts = DASHBOARD_MAX_POINTS
+        if len(self.rewards) > max_pts * 2:
+            # Trim all lists to last max_pts
+            trim_from = len(self.rewards) - max_pts
+            self.rewards = self.rewards[trim_from:]
+            self.policy_losses = self.policy_losses[trim_from:]
+            self.value_losses = self.value_losses[trim_from:]
+            self.entropies = self.entropies[trim_from:]
+            self.explained_variances = self.explained_variances[trim_from:]
+            self.food_history = self.food_history[trim_from:]
+            self.poison_history = self.poison_history[trim_from:]
+            self.rewards_smoothed = self.rewards_smoothed[trim_from:]
+            self.policy_losses_smoothed = self.policy_losses_smoothed[trim_from:]
+            self.value_losses_smoothed = self.value_losses_smoothed[trim_from:]
+            self.explained_variances_smoothed = self.explained_variances_smoothed[trim_from:]
+            self.food_smoothed = self.food_smoothed[trim_from:]
+            self.poison_smoothed = self.poison_smoothed[trim_from:]
 
 
 class TrainingDashboard:
     """
     Unified visualization dashboard for training runs.
     """
-    
-    def __init__(self, modes: list[str], n_actions: int = 8):
+
+    def __init__(self, modes: list[str], n_actions: int = 8, training_stop_event=None):
+        """
+        Args:
+            modes: List of training modes to display
+            n_actions: Number of actions for distribution plot
+            training_stop_event: Optional multiprocessing.Event to signal training stop.
+                                 If provided, the Stop button sets this event.
+                                 If None, Stop button has no effect (standalone mode).
+        """
         self.modes = modes
         self.n_actions = n_actions
         self.n_runs = len(modes)
-        
+        self._training_stop_event = training_stop_event
+
         # State per run
         self.runs: dict[str, RunState] = {
             mode: RunState(mode=mode, n_actions=n_actions)
             for mode in modes
         }
-        
+
         # Thread-safe update queue
         self.update_queue: queue.Queue = queue.Queue()
-        
+
         # UI State
         self.paused = False
         self.dirty = False  # Set when new data arrives, cleared after redraw
@@ -122,37 +194,28 @@ class TrainingDashboard:
                     #   'episodes': { 'reward': ..., 'food': ..., 'poison': ... } OR None
                     #   'steps': int
                     # }
-                    
+
                     ppo = data.get('ppo')
                     episodes = data.get('episodes')
                     steps = data.get('steps', 0)
-                    
+
                     if ppo:
-                        # 1. PPO Stats (Always present)
                         p_loss, v_loss, ent, probs, ev = ppo
-                        run.policy_losses.append(p_loss)
-                        run.value_losses.append(v_loss)
-                        run.entropies.append(ent)
-                        run.explained_variances.append(ev)
                         run.current_action_probs = np.array(probs)
-                        
-                        # 2. Episode Stats (Forward fill if missing)
-                        # If no episodes finished this update, repeat the last known value
-                        # to maintain graph continuity with the "Update" axis.
+
+                        # Episode stats (forward fill if missing)
                         if episodes:
-                            run.rewards.append(episodes['reward'])
-                            run.food_history.append(episodes['food'])
-                            run.poison_history.append(episodes['poison'])
+                            reward = episodes['reward']
+                            food = episodes['food']
+                            poison = episodes['poison']
                         else:
-                            # Forward fill
-                            last_reward = run.rewards[-1] if run.rewards else 0.0
-                            last_food = run.food_history[-1] if run.food_history else 0.0
-                            last_poison = run.poison_history[-1] if run.poison_history else 0.0
-                            
-                            run.rewards.append(last_reward)
-                            run.food_history.append(last_food)
-                            run.poison_history.append(last_poison)
-                            
+                            reward = run.rewards[-1] if run.rewards else 0.0
+                            food = run.food_history[-1] if run.food_history else 0.0
+                            poison = run.poison_history[-1] if run.poison_history else 0.0
+
+                        # Append with incremental smoothing (O(1) per update)
+                        run.append_metrics(p_loss, v_loss, ent, ev, reward, food, poison)
+
                     run.total_steps = steps
                 
                 elif update_type == 'finished':
@@ -163,20 +226,6 @@ class TrainingDashboard:
                 
             except queue.Empty:
                 break
-    
-    def _smooth(self, data: list[float], alpha: float = EMA_SMOOTHING_ALPHA, max_points: int = DASHBOARD_MAX_POINTS) -> list[float]:
-        """Apply exponential moving average smoothing (limited to last N points)."""
-        if not data:
-            return []
-        # Limit to recent data to avoid O(n) growth that starves training thread
-        if len(data) > max_points:
-            data = data[-max_points:]
-        smoothed = []
-        last = data[0]
-        for val in data:
-            last = last * alpha + val * (1 - alpha)
-            smoothed.append(last)
-        return smoothed
 
     def _create_figure(self):
         """Create the matplotlib figure with concise layout."""
@@ -302,23 +351,21 @@ class TrainingDashboard:
             
         self.btn_pause.on_clicked(toggle_pause)
         
-        # Stop button - creates signal file that trainers check
+        # Stop button - sets event that trainers check via should_stop()
         ax_stop = self.fig.add_axes([0.51, 0.02, 0.08, 0.04])
         self.btn_stop = Button(ax_stop, 'Stop', color='#442222', hovercolor='#663333')
         self.btn_stop.label.set_color('#ff6666')
-        
+
         def request_stop(event):
-            import os
-            try:
-                with open('.training_stop_signal', 'w') as f:
-                    f.write('stop')
+            if self._training_stop_event is not None:
+                self._training_stop_event.set()
                 self.btn_stop.label.set_text('Stopping...')
                 self.btn_stop.color = '#222222'
                 self.btn_stop.hovercolor = '#222222'
                 print("[Dashboard] Stop signal sent - training will stop at next update cycle")
-            except Exception as e:
-                print(f"[Dashboard] Failed to create stop signal: {e}")
-        
+            else:
+                print("[Dashboard] No training stop event configured (standalone mode)")
+
         self.btn_stop.on_clicked(request_stop)
         
     def _update_frame(self, frame):
@@ -339,66 +386,59 @@ class TrainingDashboard:
             artists = self.artists[mode]
             axes = self.axes[mode]
             
-            # Common X-axis (Updates) - limit to recent data window
-            n_updates = len(run.rewards)
+            # Common X-axis (Updates)
+            n_updates = len(run.rewards_smoothed)
             if n_updates < 2:
                 continue
-            
-            # Window for display (matches _smooth max_points)
-            start_idx = max(0, n_updates - DASHBOARD_MAX_POINTS)
-            x_data = list(range(start_idx, n_updates))
-            
-            # 1. Rewards
-            y_rew = self._smooth(run.rewards)
-            artists['reward'].set_data(x_data, y_rew)
-            axes['reward'].set_xlim(start_idx, n_updates + 5)
-            # Auto-scale Y with padding
-            if y_rew:
-                mn, mx = min(y_rew), max(y_rew)
-                rng = mx - mn if mx != mn else 1.0
-                axes['reward'].set_ylim(mn - rng*0.1, mx + rng*0.1)
-                
-            # 2. Policy Loss
-            y_pol = self._smooth(run.policy_losses)
-            artists['policy'].set_data(x_data, y_pol)
-            axes['pol_loss'].set_xlim(start_idx, n_updates + 5)
-            if y_pol:
-                mn, mx = min(y_pol), max(y_pol)
-                rng = mx - mn if mx != mn else 1.0
-                axes['pol_loss'].set_ylim(mn - rng*0.1, mx + rng*0.1)
 
-            # 3. Value Loss
-            y_val = self._smooth(run.value_losses)
+            # X-axis data (pre-smoothed lists are already trimmed by append_metrics)
+            x_data = list(range(n_updates))
+
+            # Helper for Y-axis auto-scaling
+            def autoscale_y(ax, data):
+                if data:
+                    mn, mx = min(data), max(data)
+                    rng = mx - mn if mx != mn else 1.0
+                    ax.set_ylim(mn - rng * 0.1, mx + rng * 0.1)
+
+            # 1. Rewards (pre-smoothed)
+            y_rew = run.rewards_smoothed
+            artists['reward'].set_data(x_data, y_rew)
+            axes['reward'].set_xlim(0, n_updates + 5)
+            autoscale_y(axes['reward'], y_rew)
+
+            # 2. Policy Loss (pre-smoothed)
+            y_pol = run.policy_losses_smoothed
+            artists['policy'].set_data(x_data, y_pol)
+            axes['pol_loss'].set_xlim(0, n_updates + 5)
+            autoscale_y(axes['pol_loss'], y_pol)
+
+            # 3. Value Loss (pre-smoothed)
+            y_val = run.value_losses_smoothed
             artists['value'].set_data(x_data, y_val)
-            axes['val_loss'].set_xlim(start_idx, n_updates + 5)
-            if y_val:
-                mn, mx = min(y_val), max(y_val)
-                rng = mx - mn if mx != mn else 1.0
-                axes['val_loss'].set_ylim(mn - rng*0.1, mx + rng*0.1)
-                
-            # 4. Entropy (window but no smoothing needed)
-            ent_data = run.entropies[-DASHBOARD_MAX_POINTS:] if len(run.entropies) > DASHBOARD_MAX_POINTS else run.entropies
-            ent_x = x_data if len(ent_data) == len(x_data) else list(range(start_idx, start_idx + len(ent_data)))
-            artists['entropy'].set_data(ent_x, ent_data)
-            axes['entropy'].set_xlim(start_idx, n_updates + 5)
-            
-            # 5. Explained Variance
-            y_ev = self._smooth(run.explained_variances)
+            axes['val_loss'].set_xlim(0, n_updates + 5)
+            autoscale_y(axes['val_loss'], y_val)
+
+            # 4. Entropy (raw, no smoothing)
+            artists['entropy'].set_data(x_data, run.entropies)
+            axes['entropy'].set_xlim(0, n_updates + 5)
+
+            # 5. Explained Variance (pre-smoothed)
+            y_ev = run.explained_variances_smoothed
             artists['ev'].set_data(x_data, y_ev)
-            axes['ev'].set_xlim(start_idx, n_updates + 5)
-            
-            # 6. Behavior
-            y_food = self._smooth(run.food_history)
-            y_pois = self._smooth(run.poison_history)
+            axes['ev'].set_xlim(0, n_updates + 5)
+
+            # 6. Behavior (pre-smoothed)
+            y_food = run.food_smoothed
+            y_pois = run.poison_smoothed
             artists['food'].set_data(x_data, y_food)
             artists['poison'].set_data(x_data, y_pois)
-            axes['beh'].set_xlim(start_idx, n_updates + 5)
-            # Scale
+            axes['beh'].set_xlim(0, n_updates + 5)
             all_beh = y_food + y_pois
             if all_beh:
                 mn, mx = min(all_beh), max(all_beh)
                 rng = mx - mn if mx != mn else 1.0
-                axes['beh'].set_ylim(max(0, mn - rng*0.1), mx + rng*0.1)
+                axes['beh'].set_ylim(max(0, mn - rng * 0.1), mx + rng * 0.1)
                 
             # 6. Action Distribution
             probs = run.current_action_probs
@@ -457,18 +497,26 @@ import multiprocessing as mp
 from multiprocessing import Process, Queue as MPQueue
 
 
-def _dashboard_process_worker(modes: list[str], n_actions: int, update_queue: MPQueue, stop_event):
+def _dashboard_process_worker(modes: list[str], n_actions: int, update_queue: MPQueue,
+                               stop_event, training_stop_event=None):
     """
     Worker function that runs in separate process.
-    
+
     Completely isolated from training process - has its own GIL and GPU context.
+
+    Args:
+        modes: Training modes to display
+        n_actions: Number of actions for action distribution plot
+        update_queue: IPC queue for receiving updates from training
+        stop_event: Event to signal dashboard shutdown
+        training_stop_event: Event to signal training should stop (set by Stop button)
     """
     # Create dashboard in this process
-    dashboard = TrainingDashboard(modes, n_actions)
-    
+    dashboard = TrainingDashboard(modes, n_actions, training_stop_event=training_stop_event)
+
     # Override the queue to use multiprocessing queue
     # We'll poll the mp queue and put items into the dashboard's internal queue
-    
+
     def poll_queue():
         """Poll mp queue and transfer to dashboard queue."""
         while not stop_event.is_set():
@@ -481,12 +529,12 @@ def _dashboard_process_worker(modes: list[str], n_actions: int, update_queue: MP
                 dashboard.update(mode, update_type, data)
             except queue.Empty:
                 pass  # Queue empty or timeout
-    
+
     # Start polling thread within dashboard process
     import threading
     poll_thread = threading.Thread(target=poll_queue, daemon=True)
     poll_thread.start()
-    
+
     # Run dashboard (blocks until window closed)
     try:
         dashboard.run()
@@ -499,31 +547,34 @@ def _dashboard_process_worker(modes: list[str], n_actions: int, update_queue: MP
 class DashboardProcess:
     """
     Dashboard that runs in a completely separate process.
-    
+
     This eliminates GIL contention and GPU/display sync overhead by keeping
     matplotlib in its own isolated process. Training communicates via IPC queue.
-    
+
     Usage:
         dashboard = DashboardProcess(modes=['ground_truth', 'proxy'])
         dashboard.start()
-        
+
         # In training loop:
         dashboard.send_update('ground_truth', 'update', {'ppo': (...), ...})
-        
+        if dashboard.should_stop():
+            break
+
         # When done:
         dashboard.stop()
     """
-    
+
     def __init__(self, modes: list[str], n_actions: int = 8):
         self.modes = modes
         self.n_actions = n_actions
-        
+
         # Use 'spawn' context to ensure clean process (no forked state)
         # This is critical for CUDA/ROCm to work correctly in child process
         ctx = mp.get_context('spawn')
-        
+
         self._queue: MPQueue = ctx.Queue(maxsize=QUEUE_MAX_SIZE)
-        self._stop_event = ctx.Event()
+        self._stop_event = ctx.Event()  # Dashboard process shutdown
+        self._training_stop_event = ctx.Event()  # User requested training stop
         self._process: Process = None
     
     def start(self):
@@ -531,7 +582,8 @@ class DashboardProcess:
         ctx = mp.get_context('spawn')
         self._process = ctx.Process(
             target=_dashboard_process_worker,
-            args=(self.modes, self.n_actions, self._queue, self._stop_event),
+            args=(self.modes, self.n_actions, self._queue,
+                  self._stop_event, self._training_stop_event),
             daemon=True
         )
         self._process.start()
@@ -561,7 +613,15 @@ class DashboardProcess:
     def is_alive(self) -> bool:
         """Check if dashboard process is still running."""
         return self._process is not None and self._process.is_alive()
-    
+
+    def should_stop(self) -> bool:
+        """Check if user requested training stop via dashboard button.
+
+        This replaces the file-based stop signal with proper IPC.
+        Trainers should call this periodically in their update loop.
+        """
+        return self._training_stop_event.is_set()
+
     def stop(self, timeout: float = 2.0):
         """Stop the dashboard process gracefully."""
         self._stop_event.set()
