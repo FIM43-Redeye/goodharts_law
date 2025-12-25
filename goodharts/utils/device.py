@@ -9,6 +9,16 @@ Priority order:
 2. GOODHARTS_DEVICE environment variable
 3. config.toml [runtime] device setting
 4. Auto-detect (CUDA > TPU > CPU)
+
+TODO: The following functions are kept for future use but are not currently working:
+- probe_amp_support(): Subprocess-based AMP detection that crashes on some systems
+- get_amp_support(): Wrapper for probe_amp_support()
+- reset_amp_cache(): Clears cached AMP support status
+- get_device_info(): Device information gathering
+- empty_cache(): Wrapper for torch.cuda.empty_cache()
+These were disabled while debugging AMD ROCm compatibility issues. The core
+get_device() function works correctly; these auxiliary functions need testing
+before re-enabling.
 """
 import os
 import torch

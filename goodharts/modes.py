@@ -9,6 +9,8 @@ from abc import ABC, abstractmethod
 from typing import Type
 import torch
 
+from goodharts.utils.device import get_device
+
 
 @dataclass
 class ObservationSpec:
@@ -92,11 +94,10 @@ class RewardComputer(ABC):
                  shaping_coef: float = 0.5, device: torch.device = None):
         """
         Initialize reward computer.
-        
+
         Args:
             mode: Training mode name
             spec: Observation specification
-            gamma: Discount factor (for potential-based shaping)
             gamma: Discount factor (for potential-based shaping)
             shaping_coef: Magnitude of the potential (e.g. 0.5 for food)
             device: Torch device (auto-detected if None)
@@ -105,7 +106,7 @@ class RewardComputer(ABC):
         self.spec = spec
         self.gamma = gamma
         self.shaping_coef = shaping_coef
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device or get_device()
         self.prev_potentials: torch.Tensor = None
         # Cache constant tensor to avoid per-call allocation
         self._inf_tensor = torch.tensor(float('inf'), device=self.device)

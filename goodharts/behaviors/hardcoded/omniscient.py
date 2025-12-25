@@ -86,8 +86,8 @@ class OmniscientSeeker(BehaviorStrategy):
             dx = target_x - center
             dy = target_y - center
             
-            step_x = int(np_sign_torch(dx))
-            step_y = int(np_sign_torch(dy))
+            step_x = sign_scalar(dx)
+            step_y = sign_scalar(dy)
             
             # Check if immediate step would hit poison or wall
             # indices for check:
@@ -144,7 +144,18 @@ class OmniscientSeeker(BehaviorStrategy):
         return 0, 0  # Completley stuck
 
 
-def np_sign_torch(x):
-    if x > 0: return 1
-    if x < 0: return -1
+def sign_scalar(x: int | float) -> int:
+    """
+    Return the sign of a scalar value.
+
+    Args:
+        x: Numeric value
+
+    Returns:
+        1 if x > 0, -1 if x < 0, 0 if x == 0
+    """
+    if x > 0:
+        return 1
+    if x < 0:
+        return -1
     return 0

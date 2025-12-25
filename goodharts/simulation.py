@@ -8,7 +8,9 @@ import torch
 from goodharts.behaviors.learned import LEARNED_PRESETS
 from goodharts.environments import create_vec_env
 from goodharts.behaviors import get_behavior, create_learned_behavior
+from goodharts.behaviors.utils import get_behavior_name
 from goodharts.utils.logging_config import get_logger
+from goodharts.utils.device import get_device
 from goodharts.modes import ObservationSpec, get_mode_for_requirement
 
 
@@ -79,7 +81,7 @@ class Simulation:
     def __init__(self, config: dict):
         logger.info("Initializing Simulation (Vectorized - PyTorch)")
         self.config: dict = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = get_device()
         
         # 1. Setup Agents Configuration
         agents_setup = []
@@ -223,10 +225,7 @@ class Simulation:
                     reason = "Old Age" # Not really implemented yet
                 
                 # Log death
-                b_name = str(agent.behavior)
-                if b_name.startswith('<'):
-                    b_name = type(agent.behavior).__name__
-                    
+                b_name = get_behavior_name(agent.behavior)
                 self.stats['deaths'].append({
                     'step': self.step_count,
                     'id': agent.id,
@@ -245,10 +244,7 @@ class Simulation:
             self.stats['heatmap']['all'][agent.y, agent.x] += 1
             
             # Per-behavior heatmap
-            b_name = str(agent.behavior)
-            if b_name.startswith('<'):
-                b_name = type(agent.behavior).__name__
-            
+            b_name = get_behavior_name(agent.behavior)
             if b_name not in self.stats['heatmap']:
                 self.stats['heatmap'][b_name] = torch.zeros((self.vec_env.height, self.vec_env.width), device=self.device)
             self.stats['heatmap'][b_name][agent.y, agent.x] += 1

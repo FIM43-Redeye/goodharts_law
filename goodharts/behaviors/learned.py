@@ -9,6 +9,9 @@ from goodharts.behaviors import BehaviorStrategy
 from goodharts.behaviors.brains.base_cnn import BaseCNN
 from goodharts.behaviors.action_space import build_action_space
 from goodharts.utils.device import get_device
+from goodharts.utils.logging_config import get_logger
+
+logger = get_logger("learned_behavior")
 
 
 class LearnedBehavior(BehaviorStrategy):
@@ -114,16 +117,16 @@ class LearnedBehavior(BehaviorStrategy):
                         # Skip 'critic' - not needed for inference
                     
                     self.brain.load_state_dict(new_state_dict)
-                    print(f"[LearnedBehavior] Loaded PPO ActorCritic model from {self.model_path}")
+                    logger.info(f"Loaded PPO ActorCritic model from {self.model_path}")
                 else:
                     # Standard BaseCNN model
                     self.brain.load_state_dict(state_dict)
-                    print(f"[LearnedBehavior] Loaded BaseCNN model from {self.model_path}")
-                    
+                    logger.info(f"Loaded BaseCNN model from {self.model_path}")
+
             except FileNotFoundError:
-                print(f"[LearnedBehavior] Model not found at {self.model_path}, using random weights")
+                logger.warning(f"Model not found at {self.model_path}, using random weights")
             except Exception as e:
-                print(f"[LearnedBehavior] Error loading model: {e}, using random weights")
+                logger.warning(f"Error loading model: {e}, using random weights")
         
         self.brain.to(self.device)
         self.brain.eval()

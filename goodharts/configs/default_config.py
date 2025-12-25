@@ -102,80 +102,39 @@ class CellType:
         """Number of distinct cell types."""
         return len(cls.all_types())
 
-# Simulation Physics / Hyperparameters
-# These should match config.default.toml
-ENERGY_START = 50.0
-ENERGY_MOVE_COST = 0.1          # Matches config.default.toml (was 0.1)
-MOVE_COST_EXPONENT = 1.5
-MAX_MOVE_DISTANCE = 3
-
-# Grid Settings
-GRID_WIDTH = 100
-GRID_HEIGHT = 100
-GRID_FOOD_INIT = 500             # Matches config.default.toml (resources.food)
-GRID_POISON_INIT = 10
-AGENTS_SETUP = [
-    {'behavior_class': 'OmniscientSeeker', 'count': 5},
-    {'behavior_class': 'ProxySeeker', 'count': 5}
-]
-
-# Agent Properties
-AGENT_VIEW_RANGE = 5
-
-# World Topology
-WORLD_LOOP = True                # Matches config.default.toml (world.loop)
-
-# Training Defaults (Matches config.default.toml [training])
-TRAINING_DEFAULTS = {
-    'initial_food': 200,
-    'final_food': 50,
-    'curriculum_fraction': 0.7,
-    # Density ranges for curriculum randomization
-    'min_food': 50,
-    'max_food': 200,
-    'min_poison': 20,
-    'max_poison': 100,
-    'steps_per_episode': 500,
-    'learning_rate': 0.001,
-    'gamma': 0.99,
-    'eps_clip': 0.2,
-    'k_epochs': 4,
-    'steps_per_env': 128,
-    'n_minibatches': 4,
-    'reward_scale': 0.1,
-    'entropy_coef': 0.02,
-    'shaping_food_attract': 0.5,
-    'shaping_poison_repel': 0.3,
-    'enable_shaping': True
-}
-
-
 def get_config(config_path: str | None = None):
     """
     Build runtime config dictionary from TOML config file.
-    
+
     This bridges the TOML config to the legacy dictionary format
     expected by simulation code.
-    
+
+    All config values MUST be present in the TOML file - there are no
+    fallback defaults. This ensures config.default.toml is the single
+    source of truth.
+
     Args:
         config_path: Optional path to specific config file.
                      If None, uses auto-detection (config.toml > config.default.toml)
+
+    Raises:
+        KeyError: If required config keys are missing from TOML.
     """
     from goodharts.modes import ObservationSpec
     from goodharts.config import load_config, get_config as get_toml_config
-    
+
     # Load TOML config
     if config_path:
         toml_cfg = load_config(config_path)
     else:
         toml_cfg = get_toml_config()
-    
-    # Extract sections with defaults
-    world = toml_cfg.get('world', {})
-    resources = toml_cfg.get('resources', {})
-    agent_cfg = toml_cfg.get('agent', {})
+
+    # Extract required sections (will raise KeyError if missing)
+    world = toml_cfg['world']
+    resources = toml_cfg['resources']
+    agent_cfg = toml_cfg['agent']
     agents_list = toml_cfg.get('agents', [])
-    
+
     # Build agents setup from [[agents]] list
     agents_setup = []
     for agent in agents_list:
@@ -186,43 +145,43 @@ def get_config(config_path: str | None = None):
         if 'model' in agent:
             setup['model_path'] = agent['model']
         agents_setup.append(setup)
-    
-    # Default agents if none specified
+
+    # Default agents if none specified (this is acceptable as [[agents]] is optional)
     if not agents_setup:
         agents_setup = [
             {'behavior_class': 'OmniscientSeeker', 'count': 5},
             {'behavior_class': 'ProxySeeker', 'count': 5}
         ]
-    
-    # Build runtime config
+
+    # Build runtime config - all values required from TOML
     config = {
-        # World
-        'GRID_WIDTH': world.get('width', GRID_WIDTH),
-        'GRID_HEIGHT': world.get('height', GRID_HEIGHT),
-        'WORLD_LOOP': world.get('loop', WORLD_LOOP),
-        
-        # Resources
-        'GRID_FOOD_INIT': resources.get('food', GRID_FOOD_INIT),
-        'GRID_POISON_INIT': resources.get('poison', GRID_POISON_INIT),
+        # World (required)
+        'GRID_WIDTH': world['width'],
+        'GRID_HEIGHT': world['height'],
+        'WORLD_LOOP': world['loop'],
+
+        # Resources (required)
+        'GRID_FOOD_INIT': resources['food'],
+        'GRID_POISON_INIT': resources['poison'],
         'RESPAWN_RESOURCES': resources.get('respawn', True),
-        
-        # Agent physics
-        'ENERGY_START': agent_cfg.get('energy_start', ENERGY_START),
-        'ENERGY_MOVE_COST': agent_cfg.get('energy_move_cost', ENERGY_MOVE_COST),
-        'MOVE_COST_EXPONENT': agent_cfg.get('move_cost_exponent', MOVE_COST_EXPONENT),
-        'MAX_MOVE_DISTANCE': agent_cfg.get('max_move_distance', MAX_MOVE_DISTANCE),
-        'AGENT_VIEW_RANGE': agent_cfg.get('view_range', AGENT_VIEW_RANGE),
-        
+
+        # Agent physics (required)
+        'ENERGY_START': agent_cfg['energy_start'],
+        'ENERGY_MOVE_COST': agent_cfg['energy_move_cost'],
+        'MOVE_COST_EXPONENT': agent_cfg['move_cost_exponent'],
+        'MAX_MOVE_DISTANCE': agent_cfg['max_move_distance'],
+        'AGENT_VIEW_RANGE': agent_cfg['view_range'],
+
         # Agents
         'AGENTS_SETUP': agents_setup,
-        
+
         # Cell types (always from Python - these are code, not config)
         'CellType': CellType,
     }
-    
+
     # Observation spec factory
     config['get_observation_spec'] = lambda mode: ObservationSpec.for_mode(mode, config)
-    
+
     return config
 
 

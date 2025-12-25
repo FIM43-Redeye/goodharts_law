@@ -13,6 +13,7 @@ from typing import Tuple, Optional
 from goodharts.modes import ObservationSpec
 from goodharts.configs.default_config import CellType, get_config
 from goodharts.config import get_training_config
+from goodharts.utils.device import get_device
 
 
 # Build action deltas as a torch tensor
@@ -65,21 +66,21 @@ class TorchVecEnv:
         self.obs_spec = obs_spec
         self.shared_grid = shared_grid
         
-        # Device selection
+        # Device selection - use centralized get_device()
         if device is None:
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            device = get_device()
         self.device = device
-        
-        # Get config
+
+        # Get config - all values required from TOML
         if config is None:
             config = get_config()
         self.config = config
         train_cfg = get_training_config()
-        
-        # Dimensions from config
-        self.width = config.get('GRID_WIDTH', 100)
-        self.height = config.get('GRID_HEIGHT', 100)
-        self.loop = config.get('WORLD_LOOP', False)
+
+        # Dimensions from config (required)
+        self.width = config['GRID_WIDTH']
+        self.height = config['GRID_HEIGHT']
+        self.loop = config['WORLD_LOOP']
         
         # View settings from obs_spec
         self.view_radius = obs_spec.view_size // 2
@@ -99,13 +100,13 @@ class TorchVecEnv:
         for ct in cell_types:
             self._interestingness_lut[ct.value] = ct.interestingness
         
-        # Agent settings
-        self.initial_energy = config.get('ENERGY_START', 50.0)
-        self.energy_move_cost = config.get('ENERGY_MOVE_COST', 0.1)
-        
-        # Training settings
-        default_food = config.get('GRID_FOOD_INIT', 500)
-        default_poison = config.get('GRID_POISON_INIT', 30)
+        # Agent settings (required)
+        self.initial_energy = config['ENERGY_START']
+        self.energy_move_cost = config['ENERGY_MOVE_COST']
+
+        # Training settings (required)
+        default_food = config['GRID_FOOD_INIT']
+        default_poison = config['GRID_POISON_INIT']
         self.max_steps = train_cfg.get('steps_per_episode', 500)
         
         # Curriculum ranges

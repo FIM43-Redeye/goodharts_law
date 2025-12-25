@@ -472,7 +472,7 @@ def _dashboard_process_worker(modes: list[str], n_actions: int, update_queue: MP
                     break
                 mode, update_type, data = item
                 dashboard.update(mode, update_type, data)
-            except:
+            except queue.Empty:
                 pass  # Queue empty or timeout
     
     # Start polling thread within dashboard process
@@ -543,7 +543,7 @@ class DashboardProcess:
         """
         try:
             self._queue.put_nowait((mode, update_type, data))
-        except:
+        except queue.Full:
             pass  # Queue full, drop update
     
     # Alias for compatibility with existing code

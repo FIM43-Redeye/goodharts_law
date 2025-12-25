@@ -62,25 +62,13 @@ def run_survival_test(behavior_setup_func, behavior_name: str,
         
         # However, checking vec_env.py:
         # train_cfg = get_training_config()
-        # self.max_steps = train_cfg.get('steps_per_episode', 500)
-        
-        # We must update the training config global singleton or mock it.
-        # But wait! We can just run fewer steps than 500 in this test?
-        # Or we step `steps` times. If steps=1000, we need max_steps > 1000.
-        
-        # HACK: Modifying the config.default TRAINING_DEFAULTS dict *might* work 
-        # if get_training_config return a ref? checking config.py... usually loads fresh.
-        # It's better to just accept the reset behavior OR patch VecEnv manually.
-        
-        # Let's manually patch the max_steps on the simulation instance after creation?
-        # Simulation -> self.vec_env
-        
         setup_config = behavior_setup_func(num_agents)
         config['AGENTS_SETUP'] = setup_config
-        
+
         sim = Simulation(config)
-        
-        # AUTO-RESET PREVENTION: Force max_steps to be larger than simulation duration
+
+        # Prevent auto-reset during verification: max_steps comes from training config
+        # but we need to run longer for verification. Patch the env directly.
         if hasattr(sim.vec_env, 'max_steps'):
             sim.vec_env.max_steps = steps + 100
         
