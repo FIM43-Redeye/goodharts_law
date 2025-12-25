@@ -152,3 +152,4 @@ personal/
 .agent/
 config.toml
 misc/
+CLAUDE.local.md

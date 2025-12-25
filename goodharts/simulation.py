@@ -53,10 +53,6 @@ class AgentWrapper:
         # Simulation.step handles death events.
         return True
 
-    def get_observation(self):
-        # Helper mostly for brain viz getting scalars
-        pass
-
     def get_local_view(self, mode: str | None = None):
         # This is inefficient if called individually (re-extracts entire batch).
         # Should be used sparingly (e.g. brain visualizer).
