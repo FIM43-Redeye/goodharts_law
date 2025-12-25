@@ -23,6 +23,14 @@ import queue
 import time
 
 
+# Dashboard constants
+DASHBOARD_MAX_POINTS = 500        # Maximum data points to display in graphs
+EMA_SMOOTHING_ALPHA = 0.9         # Exponential moving average smoothing factor
+ANIMATION_INTERVAL_MS = 200       # Milliseconds between dashboard frame updates
+QUEUE_POLL_TIMEOUT = 0.05         # Seconds to wait when polling update queue
+QUEUE_MAX_SIZE = 1000             # Maximum pending updates in queue
+
+
 @dataclass
 class RunState:
     """State for a single training run."""
@@ -96,7 +104,7 @@ class TrainingDashboard:
     def _process_updates(self):
         """Process all pending updates."""
         updates_processed = 0
-        max_updates = 500  # Process more updates per frame to catch up
+        max_updates = DASHBOARD_MAX_POINTS  # Process more updates per frame to catch up
         
         while not self.update_queue.empty() and updates_processed < max_updates:
             try:
@@ -156,7 +164,7 @@ class TrainingDashboard:
             except queue.Empty:
                 break
     
-    def _smooth(self, data: list[float], alpha: float = 0.9, max_points: int = 500) -> list[float]:
+    def _smooth(self, data: list[float], alpha: float = EMA_SMOOTHING_ALPHA, max_points: int = DASHBOARD_MAX_POINTS) -> list[float]:
         """Apply exponential moving average smoothing (limited to last N points)."""
         if not data:
             return []
@@ -337,12 +345,11 @@ class TrainingDashboard:
                 continue
             
             # Window for display (matches _smooth max_points)
-            max_points = 500
-            start_idx = max(0, n_updates - max_points)
+            start_idx = max(0, n_updates - DASHBOARD_MAX_POINTS)
             x_data = list(range(start_idx, n_updates))
             
             # 1. Rewards
-            y_rew = self._smooth(run.rewards, 0.9, max_points)
+            y_rew = self._smooth(run.rewards)
             artists['reward'].set_data(x_data, y_rew)
             axes['reward'].set_xlim(start_idx, n_updates + 5)
             # Auto-scale Y with padding
@@ -352,7 +359,7 @@ class TrainingDashboard:
                 axes['reward'].set_ylim(mn - rng*0.1, mx + rng*0.1)
                 
             # 2. Policy Loss
-            y_pol = self._smooth(run.policy_losses, 0.9, max_points)
+            y_pol = self._smooth(run.policy_losses)
             artists['policy'].set_data(x_data, y_pol)
             axes['pol_loss'].set_xlim(start_idx, n_updates + 5)
             if y_pol:
@@ -361,7 +368,7 @@ class TrainingDashboard:
                 axes['pol_loss'].set_ylim(mn - rng*0.1, mx + rng*0.1)
 
             # 3. Value Loss
-            y_val = self._smooth(run.value_losses, 0.9, max_points)
+            y_val = self._smooth(run.value_losses)
             artists['value'].set_data(x_data, y_val)
             axes['val_loss'].set_xlim(start_idx, n_updates + 5)
             if y_val:
@@ -370,19 +377,19 @@ class TrainingDashboard:
                 axes['val_loss'].set_ylim(mn - rng*0.1, mx + rng*0.1)
                 
             # 4. Entropy (window but no smoothing needed)
-            ent_data = run.entropies[-max_points:] if len(run.entropies) > max_points else run.entropies
+            ent_data = run.entropies[-DASHBOARD_MAX_POINTS:] if len(run.entropies) > DASHBOARD_MAX_POINTS else run.entropies
             ent_x = x_data if len(ent_data) == len(x_data) else list(range(start_idx, start_idx + len(ent_data)))
             artists['entropy'].set_data(ent_x, ent_data)
             axes['entropy'].set_xlim(start_idx, n_updates + 5)
             
             # 5. Explained Variance
-            y_ev = self._smooth(run.explained_variances, 0.9, max_points)
+            y_ev = self._smooth(run.explained_variances)
             artists['ev'].set_data(x_data, y_ev)
             axes['ev'].set_xlim(start_idx, n_updates + 5)
             
             # 6. Behavior
-            y_food = self._smooth(run.food_history, 0.9, max_points)
-            y_pois = self._smooth(run.poison_history, 0.9, max_points)
+            y_food = self._smooth(run.food_history)
+            y_pois = self._smooth(run.poison_history)
             artists['food'].set_data(x_data, y_food)
             artists['poison'].set_data(x_data, y_pois)
             axes['beh'].set_xlim(start_idx, n_updates + 5)
@@ -424,7 +431,7 @@ class TrainingDashboard:
         self.ani = FuncAnimation(
             self.fig,
             self._update_frame,
-            interval=200,  # Check every 200ms, but only redraw if dirty flag is set
+            interval=ANIMATION_INTERVAL_MS,
             blit=False,
             cache_frame_data=False
         )
@@ -466,7 +473,7 @@ def _dashboard_process_worker(modes: list[str], n_actions: int, update_queue: MP
         """Poll mp queue and transfer to dashboard queue."""
         while not stop_event.is_set():
             try:
-                item = update_queue.get(timeout=0.05)
+                item = update_queue.get(timeout=QUEUE_POLL_TIMEOUT)
                 if item is None:  # Poison pill
                     dashboard.running = False
                     break
@@ -515,7 +522,7 @@ class DashboardProcess:
         # This is critical for CUDA/ROCm to work correctly in child process
         ctx = mp.get_context('spawn')
         
-        self._queue: MPQueue = ctx.Queue(maxsize=1000)
+        self._queue: MPQueue = ctx.Queue(maxsize=QUEUE_MAX_SIZE)
         self._stop_event = ctx.Event()
         self._process: Process = None
     
