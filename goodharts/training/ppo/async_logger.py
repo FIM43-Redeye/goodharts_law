@@ -33,10 +33,12 @@ class LogPayload:
     
     # Profiler summary (string)
     profiler_summary: str
-    
-    # Timing info
-    sps: float
-    
+
+    # Timing info - three sps metrics for different perspectives
+    sps_instant: float   # This update only
+    sps_rolling: float   # Last 4 updates
+    sps_global: float    # Total steps / total time
+
     # Validation metrics (optional, only present on validation runs)
     validation_metrics: Optional[dict] = None
 
@@ -97,8 +99,8 @@ class AsyncLogger:
     
     def _process_payload(self, p: LogPayload):
         """Do I/O work for one update (no GPU access here)."""
-        # Console output
-        print(f"   [{p.mode}] Step {p.total_steps:,}: {p.sps:,.0f} sps | Best R={p.best_reward:.0f} | Ent={p.entropy:.3f} | ValL={p.value_loss:.4f} | ExpV={p.explained_var:.4f}")
+        # Console output - show rolling sps prominently, instant/global in brackets
+        print(f"   [{p.mode}] Step {p.total_steps:,}: {p.sps_rolling:,.0f} sps [{p.sps_instant:,.0f}/{p.sps_global:,.0f}] | Best R={p.best_reward:.0f} | Ent={p.entropy:.3f} | ValL={p.value_loss:.4f} | ExpV={p.explained_var:.4f}")
         if p.profiler_summary and p.profiler_summary != "No data":
             print(f"   [Profile] {p.profiler_summary}")
         

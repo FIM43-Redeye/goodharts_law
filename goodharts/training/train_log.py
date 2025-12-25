@@ -89,43 +89,55 @@ class TrainingLogger:
     """
     
     @staticmethod
-    def archive_existing_logs(output_dir: str = "logs"):
+    def archive_existing_logs(output_dir: str = "logs", mode: str | None = None):
         """
         Move existing log files to logs/previous/ to keep current run clean.
-        
-        Called automatically on first logger creation, or can be called
-        manually before training starts.
+
+        Args:
+            output_dir: Directory containing logs
+            mode: If specified, only archive logs for this mode.
+                  If None, archive all logs.
         """
         logs_dir = Path(output_dir)
         if not logs_dir.exists():
             return
-        
-        # Find all log files (csv, json)
-        log_files = list(logs_dir.glob("*_episodes.csv")) + \
-                    list(logs_dir.glob("*_updates.csv")) + \
-                    list(logs_dir.glob("*_summary.json"))
-        
+
+        # Find log files (optionally filtered by mode)
+        if mode:
+            # Only archive logs for this specific mode
+            log_files = list(logs_dir.glob(f"{mode}_*_episodes.csv")) + \
+                        list(logs_dir.glob(f"{mode}_*_updates.csv")) + \
+                        list(logs_dir.glob(f"{mode}_*_summary.json"))
+        else:
+            # Archive all logs
+            log_files = list(logs_dir.glob("*_episodes.csv")) + \
+                        list(logs_dir.glob("*_updates.csv")) + \
+                        list(logs_dir.glob("*_summary.json"))
+
         if not log_files:
             return
-        
+
         # Create previous directory
         previous_dir = logs_dir / "previous"
         previous_dir.mkdir(exist_ok=True)
-        
+
         # Move files
         moved = 0
         for f in log_files:
             dest = previous_dir / f.name
             f.rename(dest)
             moved += 1
-        
+
         if moved > 0:
-            print(f"[Logs] Archived {moved} previous log files to {previous_dir}/")
+            mode_str = f" ({mode})" if mode else ""
+            print(f"[Logs] Archived {moved} previous{mode_str} log files to {previous_dir}/")
     
     def __init__(self, mode: str, output_dir: str = "logs", log_episodes: bool = True):
         """
         Initialize logger for a training run.
-        
+
+        Archives any existing logs for this mode before creating new ones.
+
         Args:
             mode: Training mode name (e.g., 'ground_truth')
             output_dir: Directory to write logs to
@@ -135,6 +147,9 @@ class TrainingLogger:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.log_episodes = log_episodes
+
+        # Archive existing logs for THIS mode only (keeps other modes' logs in place)
+        self.archive_existing_logs(str(self.output_dir), mode=mode)
         
         # Generate run ID
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

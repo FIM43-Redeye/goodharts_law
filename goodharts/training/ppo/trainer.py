@@ -801,20 +801,27 @@ class PPOTrainer:
                 finished_dones_buffer = []
                 finished_rewards_buffer = []
                 
-                # Progress - use rolling window for sps (excludes first update warmup)
+                # Progress - calculate three sps metrics
                 now = time.perf_counter()
                 update_steps = self.total_steps - last_update_steps
                 update_time = now - last_update_time
 
-                # Add to rolling window (all updates valid post-warmup)
+                # Instantaneous sps (this update only)
+                sps_instant = update_steps / update_time if update_time > 0 else 0
+
+                # Add to rolling window
                 sps_window.append((update_steps, update_time))
                 if len(sps_window) > 4:
                     sps_window.pop(0)
 
-                # Calculate sps from window
+                # Rolling sps (last 4 updates)
                 window_steps = sum(s for s, t in sps_window)
                 window_time = sum(t for s, t in sps_window)
-                sps = window_steps / window_time if window_time > 0 else 0
+                sps_rolling = window_steps / window_time if window_time > 0 else 0
+
+                # Global sps (total steps / total elapsed)
+                elapsed = now - self.start_time
+                sps_global = self.total_steps / elapsed if elapsed > 0 else 0
                 
                 # Prepare episode stats
                 ep_stats = None
@@ -851,7 +858,9 @@ class PPOTrainer:
                     mode=cfg.mode,
                     episode_stats=ep_stats,
                     profiler_summary=self.profiler.summary(),
-                    sps=sps,
+                    sps_instant=sps_instant,
+                    sps_rolling=sps_rolling,
+                    sps_global=sps_global,
                     validation_metrics=val_metrics,
                 )
                 self.async_logger.log_update(log_payload)
