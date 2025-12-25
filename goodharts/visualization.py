@@ -11,6 +11,7 @@ from matplotlib.widgets import RadioButtons
 import numpy as np
 import torch
 
+from goodharts.behaviors.utils import get_behavior_name
 from goodharts.configs.default_config import CellType
 
 
@@ -78,12 +79,7 @@ def build_legend_elements(sim) -> list[Patch]:
     # Add unique behavior types from current agents
     seen_behaviors = set()
     for agent in sim.agents:
-        # Use str(behavior) which maps to behavior.name for LearnedBehavior
-        # Fallback to class name for others if they don't override __str__
-        behavior_name = str(agent.behavior)
-        if behavior_name.startswith('<'): # Fallback for default object repr
-            behavior_name = type(agent.behavior).__name__
-            
+        behavior_name = get_behavior_name(agent.behavior)
         if behavior_name not in seen_behaviors:
             seen_behaviors.add(behavior_name)
             color = '#%02x%02x%02x' % agent.behavior.color
@@ -140,8 +136,7 @@ def create_standard_layout(sim):
     
     # Identify all potential behaviors from current agents
     behavior_names = sorted(list(set(
-        str(a.behavior).split('<')[0] if not str(a.behavior).startswith('<') else type(a.behavior).__name__
-        for a in sim.agents
+        get_behavior_name(a.behavior) for a in sim.agents
     )))
     
     energy_lines = {}
@@ -446,10 +441,9 @@ def update_frame(frame, sim, viz, args):
     # Update energy plot
     for b_name, line in viz['energy_lines'].items():
         # Find agents of this type
-        # Match using the same name logic as in create_standard_layout
         agents_of_type = [
-            a for a in sim.agents 
-            if (str(a.behavior).split('<')[0] if not str(a.behavior).startswith('<') else type(a.behavior).__name__) == b_name
+            a for a in sim.agents
+            if get_behavior_name(a.behavior) == b_name
         ]
         
         avg_energy = np.mean([a.energy for a in agents_of_type]) if agents_of_type else 0
@@ -481,16 +475,7 @@ def update_frame(frame, sim, viz, args):
     poisoned_counts = []
     
     for b_name in behavior_names:
-        # Filter deaths for this behavior name
-        # We need to know the behavior name of dead agents.
-        # Problem: sim.stats['deaths'] currently only stores 'id'. It doesn't store behavior name.
-        # We can't lookup behavior of dead agent because it's removed from sim.agents.
-        # FIX: We need simulation to store behavior name in death stats.
-        # For now, let's assume 0 to prevent crash, and note this needs a sim update.
-        # Or, quick hack: lookup in `sim.stats` if we stored it? No.
-        # We will update `sim.step` in next tool to ensure it saves behavior name.
-        # Assuming `d` has 'behavior':
-        
+        # Filter deaths for this behavior (stored in death stats by simulation.step)
         relevant_deaths = [d for d in deaths if d.get('behavior', 'Unknown') == b_name]
         s = sum(1 for d in relevant_deaths if d['reason'] == 'Starvation')
         p = sum(1 for d in relevant_deaths if d['reason'] == 'Poison')

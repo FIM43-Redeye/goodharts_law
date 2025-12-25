@@ -6,11 +6,14 @@ No manual registration needed - just create a class that inherits from BehaviorS
 and it will be available via get_behavior().
 """
 import importlib
+import logging
 import pkgutil
 from pathlib import Path
 from typing import Type
 
 from goodharts.behaviors.base import BehaviorStrategy
+
+logger = logging.getLogger(__name__)
 
 
 _REGISTRY: dict[str, Type[BehaviorStrategy]] = {}
@@ -48,9 +51,8 @@ def _discover_behaviors() -> None:
             module = importlib.import_module(f'goodharts.behaviors.{name}')
             _register_from_module(module)
         except ImportError as e:
-            # Silently skip modules that fail to import
-            pass
-        
+            logger.debug(f"Could not import behavior module '{name}': {e}")
+
         # Also scan subpackages (hardcoded/, learned/, brains/)
         if ispkg:
             subpkg_path = behaviors_path / name
@@ -60,8 +62,8 @@ def _discover_behaviors() -> None:
                 try:
                     submodule = importlib.import_module(f'goodharts.behaviors.{name}.{subname}')
                     _register_from_module(submodule)
-                except ImportError:
-                    pass
+                except ImportError as e:
+                    logger.debug(f"Could not import behavior submodule '{name}.{subname}': {e}")
     
     _DISCOVERED = True
 
