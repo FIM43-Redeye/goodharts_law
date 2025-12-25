@@ -7,7 +7,12 @@ enabling empirical demonstration of Goodhart's Law.
 import torch
 from goodharts.behaviors import BehaviorStrategy
 from goodharts.behaviors.brains.base_cnn import BaseCNN
-from goodharts.behaviors.action_space import build_action_space
+from goodharts.behaviors.action_space import (
+    ActionSpace,
+    DiscreteGridActionSpace,
+    create_action_space,
+    load_action_space,
+)
 from goodharts.utils.device import get_device
 from goodharts.utils.logging_config import get_logger
 
@@ -25,9 +30,16 @@ class LearnedBehavior(BehaviorStrategy):
     The action space is defined in behaviors.action_space (single source of truth).
     """
     
-    def __init__(self, mode: str = 'ground_truth', model_path: str | None = None, 
-                 epsilon: float = 0.0, max_move_distance: int = 1,
-                 temperature: float = 1.0, name: str = "LearnedBehavior"):
+    def __init__(
+        self,
+        mode: str = 'ground_truth',
+        model_path: str | None = None,
+        epsilon: float = 0.0,
+        max_move_distance: int = 1,
+        temperature: float = 1.0,
+        name: str = "LearnedBehavior",
+        action_space: ActionSpace | None = None,
+    ):
         """
         Args:
             mode: 'ground_truth' or 'proxy' - determines what the agent can see
@@ -38,28 +50,26 @@ class LearnedBehavior(BehaviorStrategy):
                          Low (0.1) = nearly deterministic (like argmax)
                          1.0 = sample from softmax probs
                          High (2.0+) = more random
+            action_space: ActionSpace instance (optional, defaults to DiscreteGridActionSpace)
         """
         if mode not in ('ground_truth', 'ground_truth_handhold', 'proxy', 'proxy_jammed'):
             raise ValueError(f"mode must be 'ground_truth', 'ground_truth_handhold', 'proxy', or 'proxy_jammed', got '{mode}'")
-        
+
         self.name = name
         self._mode = mode
         self.model_path = model_path
         self.epsilon = epsilon
         self.max_move_distance = max_move_distance
         self.temperature = temperature
-        
+
         self.brain: BaseCNN | None = None
         self.device = get_device(verbose=False)
-        
-        # Get action space from centralized module
-        self._actions = build_action_space(max_move_distance)
 
-    # Use centralized functions - keep these as class methods for compatibility
-    @staticmethod
-    def _build_action_space(max_dist: int) -> list[tuple[int, int]]:
-        """Delegate to centralized action_space module."""
-        return build_action_space(max_dist)
+        # Action space (pluggable - defaults to discrete grid)
+        if action_space is not None:
+            self.action_space = action_space
+        else:
+            self.action_space = create_action_space('discrete_grid', max_move_distance)
 
     @property
     def requirements(self) -> list[str]:
@@ -72,7 +82,7 @@ class LearnedBehavior(BehaviorStrategy):
     @property
     def num_actions(self) -> int:
         """Number of possible actions in the action space."""
-        return len(self._actions)
+        return self.action_space.n_outputs
 
     def _init_brain(self, input_shape: tuple[int, int, int]):
         """
@@ -169,41 +179,32 @@ class LearnedBehavior(BehaviorStrategy):
     def decide_action(self, agent, view: torch.Tensor) -> tuple[int, int]:
         """
         Decides the next action using the neural network.
-        
+
         Uses temperature-based sampling from softmax probabilities,
         which provides natural exploration when uncertain.
-        
+
         Args:
             agent: The organism instance (unused but required by interface)
             view: The local view of the environment (Tensor)
-        
+
         Returns:
             (dx, dy) movement vector
         """
         # Epsilon-greedy exploration (for training)
-        # Use torch.rand for consistency
         if self.epsilon > 0 and torch.rand(1).item() < self.epsilon:
-            # Random action
-            from goodharts.behaviors.action_space import num_actions
-            idx = torch.randint(0, num_actions(self.max_move_distance), (1,)).item()
-            return self._actions[idx]
-        
+            # Random action - sample uniformly from action space
+            idx = torch.randint(0, self.action_space.n_outputs, (1,)).item()
+            if isinstance(self.action_space, DiscreteGridActionSpace):
+                return self.action_space.index_to_action(idx)
+            # For other action spaces, generate random logits
+            random_logits = torch.randn(1, self.action_space.n_outputs, device=self.device)
+            return self.action_space.decode(random_logits, sample=True, temperature=1.0)
+
         # Neural network inference
         with torch.no_grad():
             logits = self.get_action_logits(view)
-            
-            # Apply temperature scaling
-            scaled_logits = logits / self.temperature
-            probs = torch.softmax(scaled_logits, dim=1)
-            
-            # Sample from the distribution (not argmax!)
-            # This gives natural exploration when probabilities are uniform
-            action_idx = torch.multinomial(probs, num_samples=1).item()
-        
-        if 0 <= action_idx < len(self._actions):
-            return self._actions[action_idx]
-        
-        return (0, 1)  # Fallback: move down
+            # Delegate decoding to action space
+            return self.action_space.decode(logits, sample=True, temperature=self.temperature)
 
     def set_training_mode(self, training: bool):
         """Switch between training and evaluation mode."""
@@ -218,25 +219,22 @@ class LearnedBehavior(BehaviorStrategy):
         return self.brain
     
     def action_to_index(self, dx: int, dy: int) -> int:
-        """Convert a (dx, dy) action to its index in the action space."""
-        try:
-            return self._actions.index((dx, dy))
-        except ValueError:
-            # If exact action not found, find closest
-            min_dist = float('inf')
-            closest_idx = 0
-            for i, (ax, ay) in enumerate(self._actions):
-                dist = abs(ax - dx) + abs(ay - dy)
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_idx = i
-            return closest_idx
+        """Convert a (dx, dy) action to its index in the action space.
+
+        Only valid for discrete action spaces.
+        """
+        if isinstance(self.action_space, DiscreteGridActionSpace):
+            return self.action_space.action_to_index(dx, dy)
+        raise TypeError(f"action_to_index not supported for {type(self.action_space).__name__}")
 
     def index_to_action(self, idx: int) -> tuple[int, int]:
-        """Convert an action index to (dx, dy)."""
-        if 0 <= idx < len(self._actions):
-            return self._actions[idx]
-        return (0, 1)
+        """Convert an action index to (dx, dy).
+
+        Only valid for discrete action spaces.
+        """
+        if isinstance(self.action_space, DiscreteGridActionSpace):
+            return self.action_space.index_to_action(idx)
+        raise TypeError(f"index_to_action not supported for {type(self.action_space).__name__}")
 
     def __str__(self):
         return self.name

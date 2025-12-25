@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Callable
 
-from goodharts.behaviors.brains.base_cnn import BaseCNN
+from goodharts.behaviors.brains import load_brain
 from goodharts.behaviors import LearnedBehavior
 from goodharts.utils.device import get_device
 
@@ -173,30 +173,40 @@ def visualize_saliency(
 ) -> plt.Figure:
     """
     Create a visualization of input view alongside saliency map.
-    
+
     Args:
         model: Trained neural network
-        view: Agent's view as numpy array (H, W)
+        view: Agent's view as numpy array (H, W) or (C, H, W)
         method: 'gradient', 'guided', or 'integrated'
         figsize: Figure size
         save_path: If provided, save figure to this path
         title_prefix: Prefix for plot title (e.g., "Ground Truth Model")
-    
+
     Returns:
         matplotlib Figure object
     """
     device = next(model.parameters()).device
-    
-    # Prepare input
-    input_tensor = torch.from_numpy(view).float().unsqueeze(0).unsqueeze(0).to(device)
-    
+
+    # Handle different input shapes
+    if view.ndim == 2:
+        # Single channel: (H, W) -> (1, 1, H, W)
+        input_tensor = torch.from_numpy(view).float().unsqueeze(0).unsqueeze(0).to(device)
+        view_display = view
+    elif view.ndim == 3:
+        # Multi-channel: (C, H, W) -> (1, C, H, W)
+        input_tensor = torch.from_numpy(view).float().unsqueeze(0).to(device)
+        # For display, sum channels or use first channel
+        view_display = view.sum(axis=0)  # Aggregate for visualization
+    else:
+        raise ValueError(f"Expected 2D or 3D view, got shape {view.shape}")
+
     # Get prediction
     with torch.no_grad():
         logits = model(input_tensor)
         probs = F.softmax(logits, dim=1)
         action_idx = logits.argmax(dim=1).item()
         confidence = probs[0, action_idx].item()
-    
+
     # Compute saliency
     if method == 'gradient':
         saliency = compute_gradient_saliency(model, input_tensor)
@@ -206,35 +216,39 @@ def visualize_saliency(
         saliency = compute_integrated_gradients(model, input_tensor)
     else:
         raise ValueError(f"Unknown method: {method}")
-    
+
+    # Handle multi-channel saliency output
+    if saliency.ndim == 3:
+        saliency = saliency.sum(axis=0)  # Aggregate across channels
+
     # Create figure
     fig, axes = plt.subplots(1, 3, figsize=figsize)
-    
+
     # Original view
-    im0 = axes[0].imshow(view, cmap='viridis')
+    im0 = axes[0].imshow(view_display, cmap='viridis')
     axes[0].set_title("Agent's View")
     plt.colorbar(im0, ax=axes[0], fraction=0.046)
-    
+
     # Saliency map
     im1 = axes[1].imshow(saliency, cmap='hot')
     axes[1].set_title(f"Saliency ({method})")
     plt.colorbar(im1, ax=axes[1], fraction=0.046)
-    
+
     # Overlay
-    axes[2].imshow(view, cmap='viridis', alpha=0.5)
+    axes[2].imshow(view_display, cmap='viridis', alpha=0.5)
     axes[2].imshow(saliency, cmap='hot', alpha=0.5)
     axes[2].set_title(f"Overlay (action={action_idx}, conf={confidence:.2f})")
-    
+
     for ax in axes:
         ax.axis('off')
-    
+
     fig.suptitle(f"{title_prefix} - {method.title()} Saliency" if title_prefix else f"{method.title()} Saliency")
     plt.tight_layout()
-    
+
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved saliency visualization to {save_path}")
-    
+        print(f"Saved: {save_path}")
+
     return fig
 
 
@@ -303,56 +317,29 @@ def compare_models_saliency(
 
 def load_model_from_path(model_path: str, device: torch.device = None) -> tuple[torch.nn.Module, dict]:
     """
-    Load a BaseCNN model, inferring architecture from the saved weights.
-    
+    Load a brain model with automatic architecture detection.
+
+    Wrapper around load_brain for backward compatibility.
+
     Returns:
-        (model, metadata) where metadata contains inferred architecture info
+        (model, metadata) where metadata contains architecture info
     """
     if device is None:
         device = get_device(verbose=False)
-    
-    state_dict = torch.load(model_path, map_location=device, weights_only=True)
-    
-    # Infer architecture from weight shapes
-    # conv1.weight shape: (out_channels, in_channels, kernel_h, kernel_w)
-    conv1_shape = state_dict['conv1.weight'].shape
-    input_channels = conv1_shape[1]
-    
-    # fc1.weight shape: (hidden_size, flatten_size)
-    fc1_shape = state_dict['fc1.weight'].shape
-    hidden_size = fc1_shape[0]
-    flatten_size = fc1_shape[1]
-    
-    # fc_out.weight shape: (output_size, hidden_size)
-    fc_out_shape = state_dict['fc_out.weight'].shape
-    output_size = fc_out_shape[0]
-    
-    # Infer input spatial size from flatten_size
-    # flatten_size = 32 * H * W (after conv2 with 32 output channels)
-    spatial_size = flatten_size // 32
-    side = int(np.sqrt(spatial_size))
-    input_shape = (side, side)
-    
-    metadata = {
-        'input_channels': input_channels,
-        'input_shape': input_shape,
-        'hidden_size': hidden_size,
-        'output_size': output_size,
-    }
-    
-    print(f"Inferred architecture: {input_channels}ch × {side}×{side} → hidden={hidden_size} → {output_size} actions")
-    
-    model = BaseCNN(
-        input_shape=input_shape,
-        input_channels=input_channels,
-        output_size=output_size,
-        hidden_size=hidden_size,
-    ).to(device)
-    
-    model.load_state_dict(state_dict)
-    model.eval()
-    
-    return model, metadata
+
+    brain, metadata = load_brain(model_path, device=device)
+
+    # Print architecture info
+    arch = metadata.get('architecture', brain.get_architecture_info())
+    print(f"Loaded {metadata.get('brain_type', 'unknown')}: "
+          f"{arch.get('input_channels')}ch x {arch.get('input_shape')} -> "
+          f"hidden={arch.get('hidden_size')} -> {arch.get('output_size')} actions")
+
+    # Merge architecture into metadata for backward compat
+    if 'architecture' in metadata:
+        metadata.update(metadata['architecture'])
+
+    return brain, metadata
 
 
 def find_default_model() -> str:
@@ -457,96 +444,6 @@ def analyze_model_attention(
             plt.close(fig)
     
     print(f"Generated {num_samples} saliency visualizations in {output_dir}/")
-
-
-# Also update visualize_saliency to handle multi-channel inputs
-def visualize_saliency(
-    model: torch.nn.Module,
-    view: np.ndarray,
-    method: str = 'gradient',
-    figsize: tuple[int, int] = (12, 4),
-    save_path: str | None = None,
-    title_prefix: str = '',
-) -> plt.Figure:
-    """
-    Create a visualization of input view alongside saliency map.
-    
-    Args:
-        model: Trained neural network
-        view: Agent's view as numpy array (H, W) or (C, H, W)
-        method: 'gradient', 'guided', or 'integrated'
-        figsize: Figure size
-        save_path: If provided, save figure to this path
-        title_prefix: Prefix for plot title (e.g., "Ground Truth Model")
-    
-    Returns:
-        matplotlib Figure object
-    """
-    device = next(model.parameters()).device
-    
-    # Handle different input shapes
-    if view.ndim == 2:
-        # Single channel: (H, W) -> (1, 1, H, W)
-        input_tensor = torch.from_numpy(view).float().unsqueeze(0).unsqueeze(0).to(device)
-        view_display = view
-    elif view.ndim == 3:
-        # Multi-channel: (C, H, W) -> (1, C, H, W)
-        input_tensor = torch.from_numpy(view).float().unsqueeze(0).to(device)
-        # For display, sum channels or use first channel
-        view_display = view.sum(axis=0)  # Aggregate for visualization
-    else:
-        raise ValueError(f"Expected 2D or 3D view, got shape {view.shape}")
-    
-    # Get prediction
-    with torch.no_grad():
-        logits = model(input_tensor)
-        probs = F.softmax(logits, dim=1)
-        action_idx = logits.argmax(dim=1).item()
-        confidence = probs[0, action_idx].item()
-    
-    # Compute saliency
-    if method == 'gradient':
-        saliency = compute_gradient_saliency(model, input_tensor)
-    elif method == 'guided':
-        saliency = compute_guided_backprop_saliency(model, input_tensor)
-    elif method == 'integrated':
-        saliency = compute_integrated_gradients(model, input_tensor)
-    else:
-        raise ValueError(f"Unknown method: {method}")
-    
-    # Handle multi-channel saliency output
-    if saliency.ndim == 3:
-        saliency = saliency.sum(axis=0)  # Aggregate across channels
-    
-    # Create figure
-    fig, axes = plt.subplots(1, 3, figsize=figsize)
-    
-    # Original view
-    im0 = axes[0].imshow(view_display, cmap='viridis')
-    axes[0].set_title("Agent's View")
-    plt.colorbar(im0, ax=axes[0], fraction=0.046)
-    
-    # Saliency map
-    im1 = axes[1].imshow(saliency, cmap='hot')
-    axes[1].set_title(f"Saliency ({method})")
-    plt.colorbar(im1, ax=axes[1], fraction=0.046)
-    
-    # Overlay
-    axes[2].imshow(view_display, cmap='viridis', alpha=0.5)
-    axes[2].imshow(saliency, cmap='hot', alpha=0.5)
-    axes[2].set_title(f"Overlay (action={action_idx}, conf={confidence:.2f})")
-    
-    for ax in axes:
-        ax.axis('off')
-    
-    fig.suptitle(f"{title_prefix} - {method.title()} Saliency" if title_prefix else f"{method.title()} Saliency")
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved: {save_path}")
-    
-    return fig
 
 
 if __name__ == "__main__":

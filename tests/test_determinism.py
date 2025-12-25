@@ -196,6 +196,8 @@ class TestNetworkDeterminism:
 
     def test_action_sampling_reproducible_with_seed(self, device):
         """Action sampling should be reproducible when torch seed is reset."""
+        from goodharts.behaviors.action_space import DiscreteGridActionSpace
+
         model = BaseCNN(
             input_shape=(11, 11),
             input_channels=6,
@@ -203,22 +205,20 @@ class TestNetworkDeterminism:
         ).to(device)
         model.eval()
 
-        # get_action is designed for single observations
+        action_space = DiscreteGridActionSpace(max_move_distance=1)
         x = torch.randn(1, 6, 11, 11, device=device)
 
         set_all_seeds(42)
         with torch.no_grad():
-            action1, log_prob1 = model.get_action(x)
+            logits = model(x)
+            dx1, dy1 = action_space.decode(logits, sample=True)
 
         set_all_seeds(42)
         with torch.no_grad():
-            action2, log_prob2 = model.get_action(x)
+            logits = model(x)
+            dx2, dy2 = action_space.decode(logits, sample=True)
 
-        # Handle both int and tensor returns
-        a1 = action1 if isinstance(action1, int) else action1.item()
-        a2 = action2 if isinstance(action2, int) else action2.item()
-
-        assert a1 == a2, "Same seed should produce same action"
+        assert dx1 == dx2 and dy1 == dy2, "Same seed should produce same action"
 
 
 class TestGradientDeterminism:

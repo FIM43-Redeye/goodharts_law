@@ -6,6 +6,8 @@ BaseCNN is a flexible architecture that supports:
 - Optional auxiliary scalar inputs (energy, step count, etc.)
 - Both discrete and continuous action outputs
 """
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -92,19 +94,19 @@ class BaseCNN(nn.Module):
     def from_spec(cls, spec: 'ObservationSpec', output_size: int, **kwargs) -> 'BaseCNN':
         """
         Factory: create BaseCNN from an ObservationSpec.
-        
+
         This ensures model architecture is derived from the centralized spec,
         not hardcoded values. Any changes to observation format will
         automatically propagate to models.
-        
+
         Args:
             spec: ObservationSpec defining input dimensions
             output_size: Number of output actions
             **kwargs: Additional args passed to BaseCNN.__init__
-        
+
         Returns:
             BaseCNN configured for the spec
-        
+
         Example:
             spec = config['get_observation_spec']('ground_truth')
             model = BaseCNN.from_spec(spec, output_size=8)
@@ -114,6 +116,42 @@ class BaseCNN(nn.Module):
             input_channels=spec.num_channels,
             output_size=output_size,
             **kwargs
+        )
+
+    def get_architecture_info(self) -> dict:
+        """
+        Return architecture parameters for serialization.
+
+        Returns:
+            Dict with all parameters needed to reconstruct this architecture
+        """
+        return {
+            'input_shape': self.input_shape,
+            'input_channels': self.input_channels,
+            'output_size': self.output_size,
+            'num_aux_inputs': self.num_aux_inputs,
+            'action_mode': self.action_mode,
+            'hidden_size': self.hidden_size,
+        }
+
+    @classmethod
+    def from_architecture_info(cls, info: dict) -> 'BaseCNN':
+        """
+        Reconstruct BaseCNN from architecture info.
+
+        Args:
+            info: Dict from get_architecture_info()
+
+        Returns:
+            New BaseCNN with same architecture (random weights)
+        """
+        return cls(
+            input_shape=info['input_shape'],
+            input_channels=info['input_channels'],
+            output_size=info['output_size'],
+            num_aux_inputs=info.get('num_aux_inputs', 0),
+            action_mode=info.get('action_mode', 'discrete'),
+            hidden_size=info.get('hidden_size', 512),
         )
 
     def get_features(self, x: torch.Tensor, aux: torch.Tensor | None = None) -> torch.Tensor:
@@ -154,13 +192,13 @@ class BaseCNN(nn.Module):
     def logits_from_features(self, features: torch.Tensor) -> torch.Tensor:
         """
         Compute action logits from pre-computed features.
-        
+
         This enables PPO to compute features once and reuse them for both
         action logits and value estimation, avoiding duplicate forward passes.
-        
+
         Args:
             features: Feature tensor from get_features(), shape (batch, hidden_size)
-        
+
         Returns:
             Action logits of shape (batch, output_size)
         """
@@ -168,6 +206,31 @@ class BaseCNN(nn.Module):
         if self.action_mode == 'continuous':
             output = torch.tanh(output)
         return output
+
+    def forward_with_features(
+        self, x: torch.Tensor, aux: torch.Tensor | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute both action logits and features in a single forward pass.
+
+        This is the preferred method for PPO training where both policy and
+        value outputs are needed from the same observation. Avoids computing
+        the CNN features twice.
+
+        Args:
+            x: Grid input of shape (batch, channels, height, width)
+            aux: Optional auxiliary scalars of shape (batch, num_aux_inputs)
+
+        Returns:
+            Tuple of (logits, features):
+            - logits: Action logits/outputs, shape depends on action_mode
+            - features: Hidden features for value head, shape (batch, hidden_size)
+        """
+        features = self.get_features(x, aux)
+        output = self.fc_out(features)
+        if self.action_mode == 'continuous':
+            output = torch.tanh(output)
+        return output, features
 
     def forward(self, x: torch.Tensor, aux: torch.Tensor | None = None) -> torch.Tensor:
         """
@@ -189,51 +252,12 @@ class BaseCNN(nn.Module):
         
         if self.action_mode == 'continuous':
             output = torch.tanh(output)
-        
+
         return output
-    
-    def get_action(self, x: torch.Tensor, aux: torch.Tensor | None = None, 
-                   max_move_distance: int = 1) -> tuple[int, int]:
-        """
-        Convenience method to get (dx, dy) action from network output.
-        
-        Args:
-            x: Grid input
-            aux: Optional auxiliary scalars
-            max_move_distance: Scale factor for continuous mode
-            
-        Returns:
-            (dx, dy) movement tuple
-        """
-        with torch.no_grad():
-            output = self(x, aux)
-            
-            if self.action_mode == 'discrete':
-                action_idx = torch.argmax(output, dim=1).item()
-                # Map index to (dx, dy) - this should match LearnedBehavior's action space
-                return self._index_to_action(action_idx)
-            else:
-                # Continuous: scale tanh output by max_move_distance
-                dx = output[0, 0].item() * max_move_distance
-                dy = output[0, 1].item() * max_move_distance
-                return (int(round(dx)), int(round(dy)))
-    
-    def _index_to_action(self, idx: int) -> tuple[int, int]:
-        """Map action index to (dx, dy) for 8-directional movement."""
-        # Standard mapping for max_move_distance=1
-        actions = [
-            (0, -1),   # 0: Up
-            (0, 1),    # 1: Down
-            (-1, 0),   # 2: Left
-            (1, 0),    # 3: Right
-            (-1, -1),  # 4: Up-Left
-            (1, -1),   # 5: Up-Right
-            (-1, 1),   # 6: Down-Left
-            (1, 1),    # 7: Down-Right
-        ]
-        if 0 <= idx < len(actions):
-            return actions[idx]
-        return (0, 0)
+
+    # NOTE: Action decoding has been moved to ActionSpace classes.
+    # Use action_space.decode(brain_output) instead of brain.get_action().
+    # See goodharts/behaviors/action_space.py
 
 
 class BaseCNNWithMemory(nn.Module):

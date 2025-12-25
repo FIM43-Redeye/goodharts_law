@@ -219,8 +219,10 @@ class TestWeightInitialization:
 class TestActionSampling:
     """Tests for action sampling from the network."""
 
-    def test_get_action_returns_valid_indices(self, device):
-        """get_action should return valid action indices (single input)."""
+    def test_action_space_decodes_valid_movement(self, device):
+        """ActionSpace should decode logits to valid (dx, dy) movement."""
+        from goodharts.behaviors.action_space import DiscreteGridActionSpace
+
         model = BaseCNN(
             input_shape=(11, 11),
             input_channels=6,
@@ -228,19 +230,21 @@ class TestActionSampling:
         ).to(device)
         model.eval()
 
-        # get_action is designed for single observations, not batched
+        action_space = DiscreteGridActionSpace(max_move_distance=1)
         x = torch.randn(1, 6, 11, 11, device=device)
 
         with torch.no_grad():
-            action, log_prob = model.get_action(x)
+            logits = model(x)
+            dx, dy = action_space.decode(logits, sample=True)
 
-        # Action should be a valid index
-        assert isinstance(action, int) or (isinstance(action, torch.Tensor) and action.numel() == 1)
-        action_val = action if isinstance(action, int) else action.item()
-        assert 0 <= action_val < 8, f"Action {action_val} out of valid range [0, 8)"
+        # dx and dy should be valid movement values
+        assert isinstance(dx, int), f"dx should be int, got {type(dx)}"
+        assert isinstance(dy, int), f"dy should be int, got {type(dy)}"
+        assert -1 <= dx <= 1, f"dx {dx} out of valid range [-1, 1]"
+        assert -1 <= dy <= 1, f"dy {dy} out of valid range [-1, 1]"
 
-    def test_sampling_is_stochastic(self, device):
-        """Action sampling should be stochastic (different actions over runs)."""
+    def test_forward_returns_logits(self, device):
+        """forward() should return valid action logits."""
         model = BaseCNN(
             input_shape=(11, 11),
             input_channels=6,
@@ -250,18 +254,12 @@ class TestActionSampling:
 
         x = torch.randn(1, 6, 11, 11, device=device)
 
-        actions = []
         with torch.no_grad():
-            for _ in range(50):
-                action, _ = model.get_action(x)
-                # Handle both int and tensor returns
-                action_val = action if isinstance(action, int) else action.item()
-                actions.append(action_val)
+            logits = model(x)
 
-        # Should have some variety (unless policy is deterministic)
-        unique_actions = len(set(actions))
-        # At least 1 valid action
-        assert unique_actions >= 1, "Sampling produces valid actions"
+        assert logits.shape == (1, 8), f"Expected (1, 8) logits, got {logits.shape}"
+        # Logits can be any real value (not necessarily in [0, 1])
+        assert not torch.isnan(logits).any(), "Logits should not contain NaN"
 
 
 class TestWithRealConfig:

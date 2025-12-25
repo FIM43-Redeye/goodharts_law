@@ -58,13 +58,15 @@ class TestGridMechanics:
 
         grid = env.grids[0]
 
-        # Count each cell type
+        # Count each cell type (agents are now permanently marked on grid as PREY/PREDATOR)
         empty = (grid == CellType.EMPTY.value).sum().item()
         food = (grid == CellType.FOOD.value).sum().item()
         poison = (grid == CellType.POISON.value).sum().item()
+        agents = (grid == CellType.PREY.value).sum().item()
+        agents += (grid == CellType.PREDATOR.value).sum().item()
 
         # Total should equal grid size
-        total = empty + food + poison
+        total = empty + food + poison + agents
         expected = config['GRID_WIDTH'] * config['GRID_HEIGHT']
 
         assert total == expected, f"Cell counts don't sum to grid size: {total} != {expected}"
@@ -525,3 +527,137 @@ class TestRewardMechanics:
         # Reward should be small negative (just move cost)
         assert rewards[0].item() < 0, f"Empty move should have negative reward"
         assert rewards[0].item() > -1.0, f"Empty move reward too negative: {rewards[0].item()}"
+
+
+class TestSpawnCorrectness:
+    """Tests for spawn/placement correctness after refactor.
+
+    These tests verify:
+    - Exact item counts (randperm guarantees no duplicates)
+    - Agents spawn on empty cells only (not on food/poison)
+    - Shared grid mode has no agent overlap
+    - Respawned items don't land on agents
+    """
+
+    def test_exact_food_count_after_reset(self, config, device):
+        """Food count should exactly match config, not 'at least'."""
+        spec = ObservationSpec.for_mode('ground_truth', config)
+
+        for _ in range(10):  # Multiple trials for statistical confidence
+            env = create_torch_vec_env(n_envs=4, obs_spec=spec, config=config, device=device)
+
+            for grid_id in range(4):
+                food_count = (env.grids[grid_id] == CellType.FOOD.value).sum().item()
+                assert food_count == config['GRID_FOOD_INIT'], \
+                    f"Grid {grid_id} has {food_count} food, expected exactly {config['GRID_FOOD_INIT']}"
+
+    def test_exact_poison_count_after_reset(self, config, device):
+        """Poison count should exactly match config."""
+        spec = ObservationSpec.for_mode('ground_truth', config)
+
+        for _ in range(10):
+            env = create_torch_vec_env(n_envs=4, obs_spec=spec, config=config, device=device)
+
+            for grid_id in range(4):
+                poison_count = (env.grids[grid_id] == CellType.POISON.value).sum().item()
+                assert poison_count == config['GRID_POISON_INIT'], \
+                    f"Grid {grid_id} has {poison_count} poison, expected exactly {config['GRID_POISON_INIT']}"
+
+    def test_agents_spawn_on_empty_cells_only(self, config, device):
+        """Agents should never spawn on food or poison."""
+        spec = ObservationSpec.for_mode('ground_truth', config)
+
+        for _ in range(20):  # Many trials
+            env = create_torch_vec_env(n_envs=8, obs_spec=spec, config=config, device=device)
+
+            for env_id in range(8):
+                grid_id = env.grid_indices[env_id].item()
+                ay = env.agent_y[env_id].long().item()
+                ax = env.agent_x[env_id].long().item()
+
+                # The cell where agent spawned should now be marked as agent
+                cell_value = env.grids[grid_id, ay, ax].item()
+                agent_type = env.agent_types[env_id].item()
+
+                assert cell_value == agent_type, \
+                    f"Agent at ({ay}, {ax}) should be marked on grid, got {cell_value}"
+
+                # The underlying cell should be EMPTY (agent spawned on empty)
+                underlying = env.agent_underlying_cell[env_id].item()
+                assert underlying == CellType.EMPTY.value, \
+                    f"Agent {env_id} spawned on non-empty cell (underlying={underlying})"
+
+    def test_shared_grid_no_agent_overlap(self, config, device):
+        """In shared grid mode, all agents should have unique positions."""
+        spec = ObservationSpec.for_mode('ground_truth', config)
+
+        # Use shared_grid mode with multiple agents
+        for _ in range(10):
+            env = create_torch_vec_env(
+                n_envs=4, obs_spec=spec, config=config, device=device, shared_grid=True
+            )
+
+            positions = set()
+            for env_id in range(4):
+                pos = (env.agent_y[env_id].item(), env.agent_x[env_id].item())
+                assert pos not in positions, \
+                    f"Duplicate agent position {pos} in shared grid mode"
+                positions.add(pos)
+
+    def test_no_food_on_agent_positions_after_respawn(self, config, device):
+        """Respawned food should not land on agent positions."""
+        spec = ObservationSpec.for_mode('ground_truth', config)
+        env = create_torch_vec_env(n_envs=4, obs_spec=spec, config=config, device=device)
+
+        # Run many respawn cycles
+        for _ in range(50):
+            eaten_mask = torch.ones(4, dtype=torch.bool, device=device)
+            env._respawn_items_vectorized(eaten_mask, CellType.FOOD.value)
+
+            # Check that no food spawned on agent positions
+            for env_id in range(4):
+                grid_id = env.grid_indices[env_id].item()
+                ay = env.agent_y[env_id].long().item()
+                ax = env.agent_x[env_id].long().item()
+
+                cell_value = env.grids[grid_id, ay, ax].item()
+                # Cell should still be agent (not overwritten by food)
+                assert cell_value == env.agent_types[env_id].item(), \
+                    f"Agent position overwritten by respawn: {cell_value}"
+
+    def test_movement_preserves_underlying_cell(self, config, device):
+        """When agent moves, old cell is properly restored."""
+        spec = ObservationSpec.for_mode('ground_truth', config)
+        env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
+
+        # Place agent and manually set underlying cell
+        env.agent_x[0] = 10
+        env.agent_y[0] = 10
+        env.agent_underlying_cell[0] = CellType.EMPTY.value
+        env.grids[0, 10, 10] = env.agent_types[0].float()
+
+        # Place food at target position
+        env.grids[0, 10, 11] = CellType.FOOD.value
+
+        # Move right
+        right_action = None
+        for idx in range(8):
+            dx, dy = index_to_action(idx)
+            if dx == 1 and dy == 0:
+                right_action = idx
+                break
+
+        actions = torch.tensor([right_action], dtype=torch.long, device=device)
+        env.step(actions)
+
+        # Old position should now be EMPTY (restored)
+        old_cell = env.grids[0, 10, 10].item()
+        assert old_cell == CellType.EMPTY.value, \
+            f"Old cell not restored: {old_cell}"
+
+        # Agent should be at new position
+        assert env.agent_x[0].item() == 11
+        assert env.grids[0, 10, 11].item() == env.agent_types[0].item()
+
+        # Underlying cell should be EMPTY (ate the food)
+        assert env.agent_underlying_cell[0].item() == CellType.EMPTY.value
