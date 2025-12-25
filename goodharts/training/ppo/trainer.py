@@ -182,7 +182,59 @@ class PPOTrainer:
         self.update_count = 0
         self.best_reward = float('-inf')
         self.episode_count = 0
-    
+
+    def _warmup_forward_backward(self, batch_size: int, include_backward: bool = True, label: str = "Warmup") -> float:
+        """
+        Run forward (and optionally backward) pass to warm up JIT/cuDNN.
+
+        This triggers algorithm selection for cuDNN benchmark mode and compiles
+        torch.compile graphs. Running this once at startup avoids the compilation
+        penalty during actual training.
+
+        Args:
+            batch_size: Batch size for dummy tensors (should match training batch)
+            include_backward: Whether to run backward pass (needed for gradient kernels)
+            label: Label for progress messages
+
+        Returns:
+            Time taken in seconds
+        """
+        cfg = self.config
+        start_time = time.time()
+
+        # Create dummy tensors matching training shapes
+        dummy_obs = torch.zeros(
+            (batch_size, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size),
+            device=self.device, requires_grad=False
+        )
+
+        with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+            logits = self.policy(dummy_obs)
+            features = self.policy.get_features(dummy_obs)
+            values = self.value_head(features).squeeze(-1)
+
+            if include_backward:
+                dummy_actions = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+                dummy_returns = torch.zeros(batch_size, device=self.device)
+
+                dist = Categorical(logits=logits, validate_args=False)
+                log_probs = dist.log_prob(dummy_actions)
+                dummy_loss = -log_probs.mean() + F.mse_loss(values, dummy_returns)
+                dummy_loss.backward()
+
+        # Synchronize to ensure kernels complete
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()
+
+        # Clean up
+        if include_backward:
+            self.policy.zero_grad()
+            self.value_head.zero_grad()
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+        return time.time() - start_time
+
     def train(self) -> dict:
         """
         Run the full training loop.
@@ -254,20 +306,8 @@ class PPOTrainer:
         if not cfg.skip_warmup and self.device.type == 'cuda' and torch.backends.cudnn.benchmark:
             warmup_batch = (cfg.n_envs * cfg.steps_per_env) // cfg.n_minibatches
             print(f"   [cuDNN] Warming up benchmark mode (batch={warmup_batch})...", flush=True)
-            warmup_start = time.time()
-
-            dummy_obs = torch.zeros(
-                (warmup_batch, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size),
-                device=self.device, requires_grad=False
-            )
-
-            # Eager forward pass to trigger cuDNN algorithm selection
-            with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                _ = self.policy(dummy_obs)
-                _ = self.policy.get_features(dummy_obs)
-            torch.cuda.synchronize()
-
-            print(f"   [cuDNN] Benchmark complete ({time.time()-warmup_start:.1f}s)", flush=True)
+            elapsed = self._warmup_forward_backward(warmup_batch, include_backward=False, label="cuDNN")
+            print(f"   [cuDNN] Benchmark complete ({elapsed:.1f}s)", flush=True)
 
         # Compile models for extra speed if torch.compile is available (PyTorch 2.0+)
         # Use lock to serialize compilation - Dynamo's global state is not thread-safe
@@ -289,40 +329,9 @@ class PPOTrainer:
                         # Explicit JIT Warmup - MUST use actual training batch size
                         # Otherwise torch.compile recompiles on first real batch (85s+ forward, 270s+ backward!)
                         warmup_batch = (cfg.n_envs * cfg.steps_per_env) // cfg.n_minibatches
-
                         print(f"   [JIT] Warming up torch.compile (batch={warmup_batch})...", flush=True)
-                        warmup_start = time.time()
-
-                        dummy_obs = torch.zeros(
-                            (warmup_batch, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size),
-                            device=self.device, requires_grad=False
-                        )
-                        dummy_actions = torch.zeros(warmup_batch, dtype=torch.long, device=self.device)
-                        dummy_returns = torch.zeros(warmup_batch, device=self.device)
-
-                        # Forward warmup (with autocast if using AMP)
-                        with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                            logits = self.policy(dummy_obs)
-                            features = self.policy.get_features(dummy_obs)
-                            values = self.value_head(features).squeeze(-1)
-
-                            # Compute dummy loss (triggers backward graph compilation)
-                            dist = Categorical(logits=logits, validate_args=False)
-                            log_probs = dist.log_prob(dummy_actions)
-                            dummy_loss = -log_probs.mean() + F.mse_loss(values, dummy_returns)
-
-                        # Backward warmup (compiles gradient kernels)
-                        dummy_loss.backward()
-                        if self.device.type == 'cuda':
-                            torch.cuda.synchronize()
-
-                        # Clear gradients and CUDA cache
-                        self.policy.zero_grad()
-                        self.value_head.zero_grad()
-                        torch.cuda.empty_cache() if self.device.type == 'cuda' else None
-
-                        warmup_time = time.time() - warmup_start
-                        print(f"   [JIT] Compilation complete ({warmup_time:.1f}s)", flush=True)
+                        elapsed = self._warmup_forward_backward(warmup_batch, include_backward=True, label="JIT")
+                        print(f"   [JIT] Compilation complete ({elapsed:.1f}s)", flush=True)
                     
                 except RuntimeError as e:
                     # Fallback if compilation fails (common in complex multi-threaded setups)
@@ -339,31 +348,8 @@ class PPOTrainer:
         if not cfg.skip_warmup:
             warmup_batch = (cfg.n_envs * cfg.steps_per_env) // cfg.n_minibatches
             print(f"   [Warmup] Running eager warmup (cuDNN + autograd)...", flush=True)
-            warmup_start = time.time()
-            
-            dummy_obs = torch.zeros(
-                (warmup_batch, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size), 
-                device=self.device, requires_grad=False
-            )
-            dummy_actions = torch.zeros(warmup_batch, dtype=torch.long, device=self.device)
-            dummy_returns = torch.zeros(warmup_batch, device=self.device)
-            
-            # Forward + backward warmup
-            with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                logits = self.policy(dummy_obs)
-                features = self.policy.get_features(dummy_obs)
-                values = self.value_head(features).squeeze(-1)
-                
-                dist = Categorical(logits=logits, validate_args=False)
-                log_probs = dist.log_prob(dummy_actions)
-                dummy_loss = -log_probs.mean() + F.mse_loss(values, dummy_returns)
-            
-            dummy_loss.backward()
-            self.policy.zero_grad()
-            self.value_head.zero_grad()
-            torch.cuda.empty_cache() if self.device.type == 'cuda' else None
-            
-            print(f"   [Warmup] Complete ({time.time() - warmup_start:.1f}s)", flush=True)
+            elapsed = self._warmup_forward_backward(warmup_batch, include_backward=True, label="Eager")
+            print(f"   [Warmup] Complete ({elapsed:.1f}s)", flush=True)
         
         # Optimizer
         self.optimizer = optim.Adam(
