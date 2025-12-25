@@ -5,9 +5,10 @@ Goodhart's Law Simulation - Visual Demo
 Run with: python main.py [options]
 
 Examples:
-    python main.py                          # Default: OmniscientSeeker vs ProxySeeker
-    python main.py --learned                # Use trained CNN agents (requires models/)
-    python main.py --show-observations      # Show what agents "see"
+    python main.py                    # Default: all trained agents (shows Goodhart's Law)
+    python main.py --baseline         # Baseline: OmniscientSeeker vs ProxySeeker
+    python main.py -a ground_truth    # Single agent type
+    python main.py --brain-view -a proxy  # Neural network visualization
 """
 import argparse
 import matplotlib.pyplot as plt
@@ -17,63 +18,92 @@ from goodharts.simulation import Simulation
 from goodharts.configs.default_config import get_config
 from goodharts.utils.logging_config import setup_logging
 from goodharts.visualization import (
-    create_standard_layout, 
+    create_standard_layout,
     create_brain_layout,
-    update_frame, 
+    update_frame,
     update_brain_frame
 )
+from goodharts.behaviors.learned import LEARNED_PRESETS
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Goodhart's Law Simulation")
-    parser.add_argument('--learned', action='store_true',
-                        help='Use learned CNN agents instead of hardcoded (requires trained models)')
-    parser.add_argument('--show-observations', action='store_true',
-                        help='Show a panel of what agents observe (one-hot channels)')
-    parser.add_argument('--steps', type=int, default=None,
-                        help='Run for fixed number of steps then exit (default: run forever)')
-    parser.add_argument('--speed', type=int, default=None,
-                        help='Animation interval in ms (default: 50, lower=faster)')
-    parser.add_argument('--agents', type=int, default=None,
-                        help='Number of each agent type (default: 5)')
-    parser.add_argument('--brain-view', action='store_true',
-                        help='Show single agent with live neural network visualization')
-    parser.add_argument('--loop', action='store_true',
-                        help='Enable looping world (edges wrap around, no walls)')
-    # Config file
-    parser.add_argument('--config', type=str, default=None,
-                        help='Path to TOML config file (CLI flags override config)')
-    # Brain-view specific options (CLI overrides)
-    parser.add_argument('--agent', type=str, default=None,
-                        choices=['ground_truth', 'ground_truth_handhold', 'proxy', 'proxy_jammed'],
-                        help='Agent type for brain-view (preset name)')
-    parser.add_argument('--model', type=str, default=None,
-                        help='Path to model weights')
-    parser.add_argument('--food', type=int, default=None,
-                        help='Override food count')
-    parser.add_argument('--poison', type=int, default=None,
-                        help='Override poison count')
+    # Get available preset names for help text
+    preset_names = list(LEARNED_PRESETS.keys())
+    all_agent_choices = preset_names + ['OmniscientSeeker', 'ProxySeeker']
+
+    parser = argparse.ArgumentParser(
+        description="Goodhart's Law Simulation - Visual Demo",
+        epilog='Default: Shows all trained agents demonstrating Goodhart\'s Law',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    # Agent selection
+    agents_group = parser.add_argument_group('Agent Selection')
+    agents_group.add_argument('-a', '--agent', type=str, default=None, nargs='+',
+                              metavar='TYPE',
+                              help=f'Specific agent(s): {", ".join(all_agent_choices)}')
+    agents_group.add_argument('--baseline', action='store_true',
+                              help='Show only baseline agents (OmniscientSeeker vs ProxySeeker)')
+    agents_group.add_argument('--all', action='store_true', dest='show_all',
+                              help='Show all agents (baseline + learned)')
+    agents_group.add_argument('-n', '--count', type=int, default=5, metavar='N',
+                              help='Number of each agent type [default: 5]')
+
+    # Visualization modes
+    viz_group = parser.add_argument_group('Visualization')
+    viz_group.add_argument('--brain-view', action='store_true',
+                           help='Focus on single agent with neural network visualization')
+    viz_group.add_argument('--show-observations', action='store_true',
+                           help='Show observation panels (what agents see)')
+    viz_group.add_argument('--speed', type=int, default=None, metavar='MS',
+                           help='Animation interval in ms [default: 50, lower=faster]')
+    viz_group.add_argument('--steps', type=int, default=None, metavar='N',
+                           help='Run for N steps then exit [default: forever]')
+
+    # World settings
+    world_group = parser.add_argument_group('World')
+    world_group.add_argument('--loop', action='store_true',
+                             help='Enable toroidal world (edges wrap around)')
+    world_group.add_argument('--food', type=int, default=None, metavar='N',
+                             help='Override food count')
+    world_group.add_argument('--poison', type=int, default=None, metavar='N',
+                             help='Override poison count')
+
+    # Advanced
+    advanced_group = parser.add_argument_group('Advanced')
+    advanced_group.add_argument('--config', type=str, default=None, metavar='PATH',
+                                help='Custom TOML config file')
+    advanced_group.add_argument('--model', type=str, default=None, metavar='PATH',
+                                help='Custom model weights (for --brain-view)')
+
     return parser.parse_args()
 
 
 def setup_config(args):
     """
     Load config and apply CLI overrides.
-    
-    Config is loaded from TOML (config.toml > config.default.toml).
-    CLI flags override config values for quick experiments.
+
+    Agent selection priority:
+    1. --brain-view with -a: Single agent for neural network visualization
+    2. -a/--agent: Specific agent(s) by name
+    3. --baseline: Hardcoded agents only (OmniscientSeeker vs ProxySeeker)
+    4. --all: All agents (baseline + learned)
+    5. Default: All learned agents (demonstrates Goodhart's Law)
     """
-    from goodharts.config import load_config, get_config as get_toml_config, get_brain_view_config, get_visualization_config
-    
+    from goodharts.config import (
+        load_config, get_config as get_toml_config,
+        get_brain_view_config, get_visualization_config
+    )
+    from goodharts.behaviors import list_behavior_names
+
     # Load TOML config
     if args.config:
         load_config(args.config)
         print(f"Using config: {args.config}")
-    
+
     # Get runtime config
     config = get_config(args.config)
-    toml_cfg = get_toml_config()
-    
+
     # Get visualization settings from TOML
     viz_cfg = get_visualization_config()
     if args.speed is None:
@@ -81,80 +111,98 @@ def setup_config(args):
     if args.steps is None:
         steps = viz_cfg.get('steps', 0)
         args.steps = steps if steps > 0 else None
-    
-    # Check brain_view from config
+
+    # Check brain_view from TOML config
     bv_cfg = get_brain_view_config()
     if bv_cfg.get('enabled', False) and not args.brain_view:
         args.brain_view = True
         if args.agent is None:
-            args.agent = bv_cfg.get('agent_type')
+            agent_type = bv_cfg.get('agent_type')
+            if agent_type:
+                args.agent = [agent_type]
         if args.model is None and bv_cfg.get('model'):
             args.model = bv_cfg['model']
-    
-    # CLI overrides
+
+    # CLI overrides for world
     if args.loop:
         config['WORLD_LOOP'] = True
     if args.food is not None:
         config['GRID_FOOD_INIT'] = args.food
     if args.poison is not None:
         config['GRID_POISON_INIT'] = args.poison
-    
-    # Print status
+
+    # Print world status
     if config.get('WORLD_LOOP'):
         print("Loop mode: World wraps at edges (toroidal)")
-    
-    # Mode selection
+
+    # Determine agent setup based on args
+    count = args.count
+
     if args.brain_view:
-        if args.agent is None:
-            print("ERROR: brain_view requires agent_type")
-            print("  Set in config: [brain_view] agent_type = \"ground_truth\"")
-            print("  Or use CLI: --brain-view --agent ground_truth")
+        # Brain view: single agent with neural network visualization
+        if not args.agent:
+            print("ERROR: --brain-view requires -a/--agent")
+            print("  Example: python main.py --brain-view -a ground_truth")
             import sys
             sys.exit(1)
-        
-        agent_cfg = {'behavior_class': args.agent, 'count': 1}
+
+        agent_name = args.agent[0]  # Only first agent for brain view
+        agent_cfg = {'behavior_class': agent_name, 'count': 1}
         if args.model:
             agent_cfg['model_path'] = args.model
         config['AGENTS_SETUP'] = [agent_cfg]
-        
-        # Freeze energy in brain view by default (agent doesn't know its energy)
+
+        # Freeze energy in brain view by default
         freeze_energy = bv_cfg.get('freeze_energy', True)
         config['FREEZE_ENERGY'] = freeze_energy
-        
-        status_parts = [f"BRAIN VIEW: {args.agent}"]
+
+        status = [f"BRAIN VIEW: {agent_name}"]
         if args.model:
-            status_parts.append(f"model={args.model}")
+            status.append(f"model={args.model}")
         if freeze_energy:
-            status_parts.append("energy=frozen")
-        print(" | ".join(status_parts))
-    elif args.learned:
-        # Load EVERYTHING: all hardcoded behaviors + all learned presets
-        from goodharts.behaviors import list_behavior_names, LEARNED_PRESETS, BehaviorStrategy, LearnedBehavior
-        
-        count = args.agents or 5
-        config['AGENTS_SETUP'] = []
-        
-        # 1. Hardcoded behaviors from registry
-        # Filter out base classes if they appear
+            status.append("energy=frozen")
+        print(" | ".join(status))
+
+    elif args.agent:
+        # Specific agent(s) requested
+        config['AGENTS_SETUP'] = [
+            {'behavior_class': name, 'count': count}
+            for name in args.agent
+        ]
+        print(f"Agents: {', '.join(args.agent)} (x{count} each)")
+
+    elif args.baseline:
+        # Baseline: hardcoded agents only
+        config['AGENTS_SETUP'] = [
+            {'behavior_class': 'OmniscientSeeker', 'count': count},
+            {'behavior_class': 'ProxySeeker', 'count': count},
+        ]
+        print(f"Baseline agents: OmniscientSeeker vs ProxySeeker (x{count} each)")
+
+    elif args.show_all:
+        # All agents: baseline + learned
         skip_list = {'BehaviorStrategy', 'LearnedBehavior', 'Agent'}
+        config['AGENTS_SETUP'] = []
+
+        # Hardcoded behaviors
         for name in list_behavior_names():
-            if name not in skip_list and name not in LEARNED_PRESETS: # Presets handled separately
-                 # Also make sure it's valid to be instantiated directly (not abstract)
-                 config['AGENTS_SETUP'].append({
-                     'behavior_class': name,
-                     'count': count
-                 })
-        
-        # 2. Learned presets
-        for preset_name in LEARNED_PRESETS.keys():
-            config['AGENTS_SETUP'].append({
-                'behavior_class': preset_name,
-                'count': count
-            })
-            
-        print(f"Using ALL agents (Hardcoded + Learned Presets)")
-        print(f"Agent types: {len(config['AGENTS_SETUP'])}")
-    
+            if name not in skip_list and name not in LEARNED_PRESETS:
+                config['AGENTS_SETUP'].append({'behavior_class': name, 'count': count})
+
+        # Learned presets
+        for preset_name in LEARNED_PRESETS:
+            config['AGENTS_SETUP'].append({'behavior_class': preset_name, 'count': count})
+
+        print(f"All agents: {len(config['AGENTS_SETUP'])} types (x{count} each)")
+
+    else:
+        # Default: all learned agents (demonstrates Goodhart's Law)
+        config['AGENTS_SETUP'] = [
+            {'behavior_class': preset_name, 'count': count}
+            for preset_name in LEARNED_PRESETS
+        ]
+        print(f"Learned agents: {', '.join(LEARNED_PRESETS.keys())} (x{count} each)")
+
     return config
 
 
