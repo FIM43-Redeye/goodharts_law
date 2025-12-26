@@ -172,9 +172,10 @@ class Profiler:
         self.sync_cuda = (device.type == 'cuda')
 
     def start(self):
-        """Start the timer."""
-        if self.sync_cuda:
-            torch.cuda.synchronize()
+        """Start the timer (no sync - saves sync for tick())."""
+        # NOTE: No sync here! This is called every step, but we only need
+        # accurate timing at tick() boundaries. Syncing here causes massive
+        # overhead (261 syncs for 50k steps vs 5 syncs per update).
         self.last_t = time.perf_counter()
 
     def tick(self, name: str):
