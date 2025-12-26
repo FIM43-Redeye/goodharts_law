@@ -44,6 +44,44 @@ _COMPILE_LOCK = threading.Lock()
 _WARMUP_LOCK = threading.Lock()
 _WARMUP_DONE = False
 
+# Global abort flag - checked by all trainers to enable coordinated shutdown
+_ABORT_LOCK = threading.Lock()
+_ABORT_REQUESTED = False
+
+
+def request_abort():
+    """Signal all trainers to abort gracefully."""
+    global _ABORT_REQUESTED
+    with _ABORT_LOCK:
+        _ABORT_REQUESTED = True
+
+
+def clear_abort():
+    """Clear the abort flag (call before starting new training)."""
+    global _ABORT_REQUESTED
+    with _ABORT_LOCK:
+        _ABORT_REQUESTED = False
+
+
+def is_abort_requested() -> bool:
+    """Check if abort has been requested."""
+    with _ABORT_LOCK:
+        return _ABORT_REQUESTED
+
+
+def reset_training_state():
+    """
+    Reset all global training state.
+
+    Call this after an aborted run to ensure clean state for the next run.
+    This is important because globals persist across runs in the same process.
+    """
+    global _WARMUP_DONE, _ABORT_REQUESTED
+    with _WARMUP_LOCK:
+        _WARMUP_DONE = False
+    with _ABORT_LOCK:
+        _ABORT_REQUESTED = False
+
 
 @dataclass
 class PPOConfig:
@@ -196,6 +234,7 @@ class PPOTrainer:
         self.update_count = 0
         self.best_reward = float('-inf')
         self.episode_count = 0
+        self._aborted = False  # Track if training was aborted
 
     def _warmup_forward_backward(self, batch_size: int, include_backward: bool = True, label: str = "Warmup") -> float:
         """
@@ -348,18 +387,79 @@ class PPOTrainer:
     def train(self) -> dict:
         """
         Run the full training loop.
-        
+
         Returns:
             Summary dict with training results
         """
         self._setup()
-        
+
         try:
             self._training_loop()
         except KeyboardInterrupt:
-            print("\nTraining interrupted by user")
-        
+            self._aborted = True
+            print(f"\n[{self.config.mode}] Training interrupted by user")
+        except Exception as e:
+            self._aborted = True
+            print(f"\n[{self.config.mode}] Training failed: {e}")
+            self.cleanup()
+            raise
+
+        # Check if abort was requested globally (e.g., by signal handler)
+        if is_abort_requested():
+            self._aborted = True
+
         return self._finalize()
+
+    def cleanup(self):
+        """
+        Release all resources.
+
+        Call this after training completes or on abort to ensure
+        GPU memory, threads, and file handles are properly released.
+        """
+        # Shutdown async logger first (flushes any pending logs)
+        if self.async_logger:
+            try:
+                self.async_logger.shutdown(timeout=2.0)
+            except Exception:
+                pass  # Best effort
+            self.async_logger = None
+
+        # Close TensorBoard writer
+        if self.tb_writer:
+            try:
+                self.tb_writer.close()
+            except Exception:
+                pass
+            self.tb_writer = None
+
+        # Release environment (frees GPU tensors)
+        if self.vec_env:
+            try:
+                # VecEnv doesn't have an explicit close(), but we can
+                # release references to allow garbage collection
+                del self.vec_env
+            except Exception:
+                pass
+            self.vec_env = None
+
+        # Release model tensors
+        if self.policy:
+            del self.policy
+            self.policy = None
+        if self.value_head:
+            del self.value_head
+            self.value_head = None
+        if self.optimizer:
+            del self.optimizer
+            self.optimizer = None
+
+        # Clear GPU cache
+        if self.device and self.device.type == 'cuda':
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
     
     def _setup(self):
         """Initialize environment, networks, and logging."""
@@ -601,9 +701,14 @@ class PPOTrainer:
         while self.total_steps < cfg.total_timesteps:
             self.profiler.start()
             
+            # Check for abort request (signal handler or dashboard stop button)
+            if is_abort_requested():
+                print(f"\n[{cfg.mode}] Abort signal received")
+                break
+
             # Check stop signal via dashboard (if available)
             if self.dashboard and hasattr(self.dashboard, 'should_stop') and self.dashboard.should_stop():
-                print(f"\n[PPO] Stop signal received!")
+                print(f"\n[{cfg.mode}] Dashboard stop requested")
                 break
             
             if v:
@@ -990,10 +1095,34 @@ class PPOTrainer:
         """Save final model and return summary."""
         cfg = self.config
 
-        # Calculate throughput (warmup is now separate, so all steps are valid)
-        elapsed = time.perf_counter() - self.start_time
-        throughput = self.total_steps / elapsed if elapsed > 0 else 0
+        # Calculate throughput (handle case where start_time wasn't set)
+        elapsed = 0.0
+        throughput = 0.0
+        if hasattr(self, 'start_time'):
+            elapsed = time.perf_counter() - self.start_time
+            throughput = self.total_steps / elapsed if elapsed > 0 else 0
 
+        # Handle aborted training
+        if self._aborted:
+            print(f"\n[{cfg.mode}] Training aborted after {self.total_steps:,} steps")
+            # Still try to flush logs
+            if self.async_logger:
+                self.async_logger.shutdown(timeout=2.0)
+            if self.dashboard:
+                self.dashboard.update(cfg.mode, 'aborted', None)
+            # Full cleanup
+            self.cleanup()
+            return {
+                'mode': cfg.mode,
+                'total_steps': self.total_steps,
+                'elapsed_seconds': elapsed,
+                'throughput': throughput,
+                'best_reward': self.best_reward,
+                'model_path': None,
+                'aborted': True,
+            }
+
+        # Normal completion path
         # Shutdown async logger first - flushes all queued logs
         if self.async_logger:
             self.async_logger.shutdown()
@@ -1032,6 +1161,9 @@ class PPOTrainer:
         if self.dashboard:
             self.dashboard.update(cfg.mode, 'finished', None)
 
+        # Full cleanup after normal completion too
+        self.cleanup()
+
         return {
             'mode': cfg.mode,
             'total_steps': self.total_steps,
@@ -1039,4 +1171,5 @@ class PPOTrainer:
             'throughput': throughput,
             'best_reward': self.best_reward,
             'model_path': None if cfg.benchmark_mode else cfg.output_path,
+            'aborted': False,
         }

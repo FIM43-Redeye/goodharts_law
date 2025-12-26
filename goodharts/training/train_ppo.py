@@ -17,6 +17,8 @@ os.makedirs(_CACHE_DIR, exist_ok=True)
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", _CACHE_DIR)
 
 import argparse
+import signal
+import sys
 import threading
 
 from goodharts.modes import get_all_mode_names
@@ -24,11 +26,54 @@ from goodharts.configs.default_config import get_config
 from goodharts.config import get_training_config
 from goodharts.behaviors.brains import get_brain_names
 from goodharts.training.ppo import PPOTrainer, PPOConfig
+from goodharts.training.ppo.trainer import (
+    request_abort, clear_abort, is_abort_requested, reset_training_state
+)
 
 
 # Global synchronization for stop signal (multi-threaded training)
 _TRAINING_LOCK = threading.Lock()
 _TRAINING_COUNTER = 0
+
+# Track if we're currently handling a signal (prevent re-entrancy)
+_SIGNAL_RECEIVED = False
+
+
+def _signal_handler(signum, frame):
+    """
+    Handle termination signals (SIGINT, SIGTERM) for graceful shutdown.
+
+    This signals all trainers to abort and exit cleanly, ensuring:
+    - Async loggers flush remaining data
+    - GPU memory is released
+    - No partial/corrupted model saves
+    """
+    global _SIGNAL_RECEIVED
+
+    # Prevent re-entrancy (user pressing Ctrl+C multiple times)
+    if _SIGNAL_RECEIVED:
+        print("\n[Signal] Forced exit (second signal received)")
+        sys.exit(1)
+
+    _SIGNAL_RECEIVED = True
+    sig_name = signal.Signals(signum).name
+    print(f"\n[Signal] {sig_name} received - initiating graceful shutdown...")
+
+    # Signal all trainers to abort
+    request_abort()
+
+
+def _install_signal_handlers():
+    """Install signal handlers for graceful shutdown."""
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+
+def _reset_signal_state():
+    """Reset signal state for new training run."""
+    global _SIGNAL_RECEIVED
+    _SIGNAL_RECEIVED = False
+    clear_abort()
 
 
 def train_ppo(
@@ -198,12 +243,21 @@ def main():
         overrides['deterministic'] = True
 
     modes_to_train = all_modes if args.mode == 'all' else [args.mode]
-    
+
+    # Install signal handlers for graceful shutdown
+    _install_signal_handlers()
+    _reset_signal_state()
+    reset_training_state()  # Clear any stale global state from previous runs
+
     # Training execution
-    if args.dashboard:
-        _run_with_dashboard(modes_to_train, overrides, args.sequential)
-    else:
-        _run_without_dashboard(modes_to_train, overrides, args.sequential)
+    try:
+        if args.dashboard:
+            _run_with_dashboard(modes_to_train, overrides, args.sequential)
+        else:
+            _run_without_dashboard(modes_to_train, overrides, args.sequential)
+    finally:
+        # Always reset state on exit (clean or aborted)
+        reset_training_state()
  
  
 def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool):
@@ -221,14 +275,18 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool)
         if sequential:
             # Sequential: run training in main thread (better GPU perf)
             for mode in modes_to_train:
+                # Check if abort was requested (signal handler)
+                if is_abort_requested():
+                    print(f"[Sequential] Abort signal received, stopping")
+                    break
                 # Check if stop was requested or dashboard closed
                 if dashboard.should_stop():
-                    print(f"[Sequential] Stop signal detected, skipping remaining modes")
+                    print(f"[Sequential] Dashboard stop requested, skipping remaining modes")
                     break
                 if not dashboard.is_alive():
                     print("[Sequential] Dashboard closed, stopping training")
                     break
-                    
+
                 train_ppo(
                     mode=mode,
                     dashboard=dashboard,
@@ -254,60 +312,85 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool)
                 threads.append(t)
                 t.start()
 
-            # Wait for all threads to complete
+            # Wait for all threads to complete (with abort check)
             for t in threads:
-                t.join()
-                
+                while t.is_alive():
+                    t.join(timeout=0.5)
+                    if is_abort_requested():
+                        # Signal received - threads will see it and exit
+                        break
+
     except KeyboardInterrupt:
-        print("\nTraining interrupted")
-    
+        # KeyboardInterrupt may still happen if signal handler hasn't run yet
+        request_abort()
+        print("\n[Dashboard] Training interrupted")
+
     # Don't auto-close dashboard - let user take screenshots
     # Dashboard will close when user closes the window
     if dashboard.is_alive():
-        print("\n[Dashboard] Training complete. Close the dashboard window when done.")
+        if is_abort_requested():
+            print("\n[Dashboard] Training aborted. Close the dashboard window when done.")
+        else:
+            print("\n[Dashboard] Training complete. Close the dashboard window when done.")
 
 
 def _run_without_dashboard(modes_to_train: list, overrides: dict, sequential: bool):
     """Run training without dashboard."""
-    if len(modes_to_train) > 1 and not sequential:
-        # Parallel training (first trainer warms up, others skip via global flag)
-        print(f"\nParallel training: {len(modes_to_train)} modes")
+    try:
+        if len(modes_to_train) > 1 and not sequential:
+            # Parallel training (first trainer warms up, others skip via global flag)
+            print(f"\nParallel training: {len(modes_to_train)} modes")
 
-        threads = []
-        for mode in modes_to_train:
-            t = threading.Thread(
-                target=train_ppo,
-                kwargs={
-                    'mode': mode,
-                    'output_path': f'models/ppo_{mode}.pth',
-                    'log_to_file': True,
+            threads = []
+            for mode in modes_to_train:
+                t = threading.Thread(
+                    target=train_ppo,
+                    kwargs={
+                        'mode': mode,
+                        'output_path': f'models/ppo_{mode}.pth',
+                        'log_to_file': True,
+                        **overrides
+                    },
+                    daemon=True
+                )
+                threads.append(t)
+                t.start()
+
+            # Wait for all threads to complete (with abort check)
+            for t in threads:
+                while t.is_alive():
+                    t.join(timeout=0.5)
+                    if is_abort_requested():
+                        # Signal received - threads will see it and exit
+                        break
+        else:
+            # Sequential training
+            if len(modes_to_train) > 1:
+                print(f"\nSequential training: {len(modes_to_train)} modes")
+            for mode in modes_to_train:
+                # Check if abort was requested (signal handler)
+                if is_abort_requested():
+                    print(f"[Sequential] Abort signal received, stopping")
+                    break
+                # Legacy file-based stop signal (for compatibility)
+                if os.path.exists('.training_stop_signal'):
+                    print(f"[Sequential] Stop signal file detected, skipping remaining modes")
+                    try:
+                        os.remove('.training_stop_signal')
+                    except OSError:
+                        pass
+                    break
+                train_ppo(
+                    mode=mode,
+                    output_path=f'models/ppo_{mode}.pth',
+                    log_to_file=len(modes_to_train) > 1,
                     **overrides
-                }
-            )
-            threads.append(t)
-            t.start()
+                )
 
-        for t in threads:
-            t.join()
-    else:
-        # Sequential training
-        if len(modes_to_train) > 1:
-            print(f"\nSequential training: {len(modes_to_train)} modes")
-        for mode in modes_to_train:
-            # Check if stop was requested before starting next run
-            if os.path.exists('.training_stop_signal'):
-                print(f"[Sequential] Stop signal detected, skipping remaining modes")
-                try:
-                    os.remove('.training_stop_signal')
-                except OSError:
-                    pass
-                break
-            train_ppo(
-                mode=mode,
-                output_path=f'models/ppo_{mode}.pth',
-                log_to_file=len(modes_to_train) > 1,
-                **overrides
-            )
+    except KeyboardInterrupt:
+        # KeyboardInterrupt may still happen if signal handler hasn't run yet
+        request_abort()
+        print("\nTraining interrupted")
 
 
 if __name__ == '__main__':
