@@ -114,6 +114,8 @@ class TorchVecEnv:
         self.poison_range = (default_poison, default_poison)
         self._default_food = default_food
         self._default_poison = default_poison
+        # Max items for fixed-size topk in _place_items (avoids sync)
+        self._max_items_per_grid = max(default_food, default_poison, 1)
         
         # CellType enum - all cell values accessed dynamically from this
         self.CellType = config['CellType']
@@ -175,50 +177,62 @@ class TorchVecEnv:
         # Initialize
         self.reset()
     
-    def set_curriculum_ranges(self, food_min: int, food_max: int, 
+    def set_curriculum_ranges(self, food_min: int, food_max: int,
                                poison_min: int, poison_max: int):
         """Set curriculum ranges for per-environment randomization."""
         self.food_range = (food_min, food_max)
         self.poison_range = (poison_min, poison_max)
+        # Update max for fixed-size topk in _place_items
+        self._max_items_per_grid = max(food_max, poison_max, 1)
     
     def reset(self, env_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Reset environments and return observations."""
         if env_ids is None:
-            # Reset all
+            # Reset all - this path is only at initialization
             for grid_id in range(self.n_grids):
                 self._reset_grid(grid_id)
             for env_id in range(self.n_envs):
                 self._reset_agent(env_id)
         else:
-            # Reset specific envs
-            done_grids = set()
-            for env_id in env_ids.tolist():
-                grid_id = self.grid_indices[env_id].item()
-                if grid_id not in done_grids and not self.shared_grid:
-                    self._reset_grid(grid_id)
-                    done_grids.add(grid_id)
-                self._reset_agent(env_id)
-        
+            # Reset specific envs - called during training when episodes end
+            # Single sync to get Python-iterable env IDs
+            env_id_list = env_ids.tolist()
+
+            if self.shared_grid:
+                # Shared grid mode: reset grid 0 once, then all agents
+                self._reset_grid(0)
+                for env_id in env_id_list:
+                    self._reset_agent(env_id)
+            else:
+                # Independent mode: grid_id == env_id (no lookup needed)
+                done_grids = set()
+                for env_id in env_id_list:
+                    # Each env has its own grid with matching index
+                    if env_id not in done_grids:
+                        self._reset_grid(env_id)
+                        done_grids.add(env_id)
+                    self._reset_agent(env_id)
+
         return self._get_observations()
     
     def _reset_grid(self, grid_id: int):
         """Clear and repopulate a specific grid."""
         self.grids[grid_id].fill_(self.CellType.EMPTY.value)
-        
-        # Randomize counts - use int32 for XLA/TPU compatibility
+
+        # Randomize counts on GPU (stays on device, no sync)
         food_count = torch.randint(
             self.food_range[0], self.food_range[1] + 1, (1,),
             dtype=torch.int32, device=self.device
-        ).item()
+        ).squeeze()
         poison_count = torch.randint(
             self.poison_range[0], self.poison_range[1] + 1, (1,),
             dtype=torch.int32, device=self.device
-        ).item()
-        
+        ).squeeze()
+
         self.grid_food_counts[grid_id] = food_count
         self.grid_poison_counts[grid_id] = poison_count
-        
-        # Place items
+
+        # Place items (accepts tensor counts)
         self._place_items(grid_id, self.CellType.FOOD.value, food_count)
         self._place_items(grid_id, self.CellType.POISON.value, poison_count)
     
@@ -375,28 +389,52 @@ class TorchVecEnv:
         # Mark agents on grids (vectorized advanced indexing)
         self.grids[grid_ids, new_y, new_x] = self.agent_types[env_ids].float()
     
-    def _place_items(self, grid_id: int, cell_type: int, count: int):
-        """Place items at random empty positions (guaranteed unique positions)."""
-        if count <= 0:
-            return
+    def _place_items(self, grid_id: int, cell_type: int, count):
+        """Place items at random empty positions using noise-based selection.
 
+        Fully GPU-native: no .item(), .nonzero(), or .shape[] calls.
+        Uses topk on masked random noise to select random empty cells.
+
+        Args:
+            grid_id: Grid index
+            cell_type: Cell type value to place
+            count: Number to place (int or scalar tensor)
+        """
+        # Determine max items we might place (for fixed-size topk)
+        max_k = self._max_items_per_grid
+
+        # Generate random noise for all cells
+        noise = torch.rand(self.height, self.width, device=self.device)
+
+        # Mask non-empty cells to -inf so they can't be selected
         empty_mask = (self.grids[grid_id] == self.CellType.EMPTY.value)
-        # Use as_tuple for XLA compatibility (returns tuple of 1D tensors)
-        empty_y, empty_x = empty_mask.nonzero(as_tuple=True)
-        n_empty = empty_y.shape[0]
+        masked_noise = torch.where(empty_mask, noise, self._neg_inf)
 
-        if n_empty == 0:
-            return
+        # Get top max_k candidates (fixed k avoids sync)
+        flat_noise = masked_noise.view(-1)
+        _, top_indices = torch.topk(flat_noise, k=max_k, largest=True)
 
-        n_to_place = min(count, n_empty)
+        # Convert to grid coordinates
+        chosen_y = top_indices // self.width
+        chosen_x = top_indices % self.width
 
-        # Use randperm for sampling WITHOUT replacement (guarantees unique positions)
-        # randperm returns int64 which is fine for indexing
-        perm = torch.randperm(n_empty, device=self.device)[:n_to_place]
-        chosen_y = empty_y[perm]
-        chosen_x = empty_x[perm]
+        # Create position mask: only first `count` positions are valid
+        # This works with tensor count without sync (element-wise comparison)
+        position_idx = torch.arange(max_k, device=self.device, dtype=torch.int32)
+        if isinstance(count, torch.Tensor):
+            valid_mask = position_idx < count
+        else:
+            valid_mask = position_idx < count
 
-        self.grids[grid_id, chosen_y, chosen_x] = cell_type
+        # Use scatter to place items: write cell_type where valid, EMPTY where not
+        # Since we're targeting empty cells, writing EMPTY is a no-op
+        flat_grid = self.grids[grid_id].view(-1)
+        scatter_values = torch.where(
+            valid_mask,
+            torch.tensor(cell_type, device=self.device, dtype=flat_grid.dtype),
+            torch.tensor(self.CellType.EMPTY.value, device=self.device, dtype=flat_grid.dtype)
+        ).expand(max_k)
+        flat_grid.scatter_(0, top_indices, scatter_values)
     
     def step(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Execute batched actions with proper grid updates."""

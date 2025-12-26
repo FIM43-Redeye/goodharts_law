@@ -24,7 +24,7 @@ import time
 
 
 # Dashboard constants
-DASHBOARD_MAX_POINTS = 500        # Maximum data points to display in graphs
+DASHBOARD_MAX_POINTS = 1024       # Maximum data points to display in graphs
 EMA_SMOOTHING_ALPHA = 0.9         # Exponential moving average smoothing factor
 ANIMATION_INTERVAL_MS = 200       # Milliseconds between dashboard frame updates
 QUEUE_POLL_TIMEOUT = 0.05         # Seconds to wait when polling update queue

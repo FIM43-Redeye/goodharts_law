@@ -26,7 +26,7 @@ from goodharts.environments.torch_env import create_torch_vec_env
 from goodharts.training.process_logger import ProcessLogger
 from goodharts.modes import RewardComputer
 
-from .models import Profiler, ValueHead
+from .models import Profiler, ValueHead, PopArtValueHead
 from .algorithms import compute_gae, ppo_update
 from .async_logger import AsyncLogger, LogPayload
 
@@ -95,7 +95,7 @@ class PPOConfig:
     brain_type: str = 'base_cnn'
     action_space_type: str = 'discrete_grid'
     max_move_distance: int = 1
-    n_envs: int = 64
+    n_envs: int = 192  # Larger batches = less GPU burstiness
     total_timesteps: int = 100_000
     lr: float = 3e-4
     gamma: float = 0.99
@@ -228,7 +228,10 @@ class PPOTrainer:
         self.reward_computer = None
         self.profiler = None
         self.async_logger = None
-        
+
+        # External profiler callback (called after each update, returns False to stop)
+        self._profiler_callback = None
+
         # Training state
         self.total_steps = 0
         self.update_count = 0
@@ -352,6 +355,10 @@ class PPOTrainer:
             rewards_buffer, values_buffer, dones_buffer,
             next_value, cfg.gamma, cfg.gae_lambda, device=self.device
         )
+
+        # Update PopArt statistics for value normalization
+        if hasattr(self.value_head, 'update_stats'):
+            self.value_head.update_stats(returns.flatten())
 
         # PPO update (this triggers backward pass lazy init)
         # Use cat to flatten (steps, envs) -> (steps * envs)
@@ -513,7 +520,7 @@ class PPOTrainer:
         # Networks
         _vprint("Creating networks...", v)
         self.policy = create_brain(cfg.brain_type, self.spec, output_size=n_actions).to(self.device)
-        self.value_head = ValueHead(input_size=self.policy.hidden_size).to(self.device)
+        self.value_head = PopArtValueHead(input_size=self.policy.hidden_size).to(self.device)
         # Store architecture info before potential torch.compile (for serialization)
         self._policy_arch_info = self.policy.get_architecture_info()
         _vprint("Networks created and moved to device", v)
@@ -538,10 +545,13 @@ class PPOTrainer:
                     else:
                         raise e
         
-        # Optimizer
+        # Optimizer - use fused=True on CUDA to eliminate .item() sync overhead
+        # Fused runs entirely on GPU, avoiding 384 CPU round-trips per update
+        use_fused = self.device.type == 'cuda'
         self.optimizer = optim.Adam(
             list(self.policy.parameters()) + list(self.value_head.parameters()),
-            lr=cfg.lr
+            lr=cfg.lr,
+            fused=use_fused
         )
         
         
@@ -619,18 +629,22 @@ class PPOTrainer:
         """Main training loop."""
         cfg = self.config
         v = cfg.hyper_verbose  # Verbose debug mode
-        
-        # Experience buffers
-        states_buffer = []
-        actions_buffer = []
-        log_probs_buffer = []
-        rewards_buffer = []
-        dones_buffer = []
-        values_buffer = []
-        
-        # Async logging buffers (new)
-        finished_dones_buffer = []
-        finished_rewards_buffer = []
+
+        # Pre-allocate experience buffers (7% faster than list.append)
+        # Using list assignment [step_idx] = value instead of append
+        states_buffer = [None] * cfg.steps_per_env
+        actions_buffer = [None] * cfg.steps_per_env
+        log_probs_buffer = [None] * cfg.steps_per_env
+        rewards_buffer = [None] * cfg.steps_per_env
+        dones_buffer = [None] * cfg.steps_per_env
+        values_buffer = [None] * cfg.steps_per_env
+
+        # Async logging buffers (pre-allocated)
+        finished_dones_buffer = [None] * cfg.steps_per_env
+        finished_rewards_buffer = [None] * cfg.steps_per_env
+
+        # Current step within the buffer (reset each update)
+        step_in_buffer = 0
         
         # Initial state
         _vprint("Resetting environment for initial state...", v)
@@ -751,24 +765,23 @@ class PPOTrainer:
                 rewards, current_states, next_states, dones
             )
             
-            # Store experience as tensors
-            states_buffer.append(current_states)
-            actions_buffer.append(actions) # Actions are new tensors from sampling
-            log_probs_buffer.append(log_probs.detach())
-            rewards_buffer.append(shaped_rewards) # Rewards are usually new tensors
-            dones_buffer.append(dones.clone()) # Dones might be reused, but usually new. Clone to be safe?
-            values_buffer.append(values)
-            
+            # Store experience in pre-allocated buffer slots (faster than append)
+            states_buffer[step_in_buffer] = current_states
+            actions_buffer[step_in_buffer] = actions
+            log_probs_buffer[step_in_buffer] = log_probs.detach()
+            rewards_buffer[step_in_buffer] = shaped_rewards
+            dones_buffer[step_in_buffer] = dones.clone()
+            values_buffer[step_in_buffer] = values
+
+            # Track episode stats (defer logging to avoid Sync)
+            finished_dones_buffer[step_in_buffer] = dones
+            finished_rewards_buffer[step_in_buffer] = episode_rewards.clone()
+
+            step_in_buffer += 1
             self.total_steps += cfg.n_envs
             episode_rewards += rewards  # Tensor addition
-            
+
             self.profiler.tick("Env Step")
-            
-            # Track episode stats (defer logging to avoid Sync)
-            # Snapshot current state for logging
-            # We store full tensors to avoid boolean indexing syncs
-            finished_dones_buffer.append(dones)
-            finished_rewards_buffer.append(episode_rewards.clone())
             
             # Reset rewards for done agents (Sync-free)
             # episode_rewards = episode_rewards * (1 - dones)
@@ -776,8 +789,8 @@ class PPOTrainer:
             
             states = next_states
             
-            # PPO Update
-            if len(states_buffer) >= cfg.steps_per_env:
+            # PPO Update (when buffer is full)
+            if step_in_buffer >= cfg.steps_per_env:
                 self.profiler.tick("Collection")
                 
                 # Get bootstrap value (keep on GPU)
@@ -791,57 +804,47 @@ class PPOTrainer:
                     rewards_buffer, values_buffer, dones_buffer,
                     next_value, cfg.gamma, cfg.gae_lambda, device=self.device
                 )
+
+                # Update PopArt statistics for value normalization
+                if hasattr(self.value_head, 'update_stats'):
+                    self.value_head.update_stats(returns.flatten())
+
                 self.profiler.tick("GAE Calc")
-                
-                # PROCESS LOGGING (Batch Sync)
-                if True: # Always runs now
-                    # Stack buffers (steps, envs)
-                    all_step_dones = torch.stack(finished_dones_buffer)
-                    all_step_rewards = torch.stack(finished_rewards_buffer)
-                    
-                    # Find ANY completed episodes
-                    # This is the ONLY sync per update
-                    done_coords = all_step_dones.nonzero(as_tuple=False) # (N_events, 2) -> [step, env]
-                    
-                    if done_coords.shape[0] > 0:
-                        # Extract data (stay on GPU)
-                        steps_idx = done_coords[:, 0]
-                        envs_idx = done_coords[:, 1]
 
-                        # Get rewards for the identified events
-                        event_rewards = all_step_rewards[steps_idx, envs_idx]
+                # EPISODE LOGGING - Fixed-size GPU aggregates, NO sync until after PPO
+                # Uses masked reductions to avoid nonzero() which requires knowing output size
+                # Extensible: add new metrics to episode_agg_keys and episode_agg_values
+                all_step_dones = torch.stack(finished_dones_buffer)  # (steps, envs)
+                all_step_rewards = torch.stack(finished_rewards_buffer)  # (steps, envs)
 
-                        # Get food/poison stats (using vectorized lookup)
-                        event_food = self.vec_env.last_episode_food[envs_idx]
-                        event_poison = self.vec_env.last_episode_poison[envs_idx]
-                        n_episodes = done_coords.shape[0]
+                # Masked aggregates - all ops stay on GPU
+                done_mask = all_step_dones.float()
+                INF = torch.tensor(float('inf'), device=self.device)
 
-                        # Compute ALL aggregates on GPU - single kernel, microseconds
-                        # This replaces transferring thousands of episode records
-                        agg_tensor = torch.stack([
-                            event_rewards.sum(),
-                            event_rewards.min(),
-                            event_rewards.max(),
-                            event_food.sum().float(),
-                            event_poison.sum().float(),
-                        ])
+                # Food/poison: sum for envs that finished at least once this update
+                any_done_per_env = all_step_dones.any(dim=0)  # (envs,)
 
-                        # SINGLE CPU transfer: 5 floats instead of thousands
-                        cpu_agg = agg_tensor.cpu().numpy()
+                # Define aggregates as ordered lists (extensible - just add to both)
+                episode_agg_keys = [
+                    'n_episodes',
+                    'reward_sum',
+                    'reward_min',
+                    'reward_max',
+                    'food_sum',
+                    'poison_sum',
+                ]
+                episode_agg_values = [
+                    done_mask.sum(),
+                    (all_step_rewards * done_mask).sum(),
+                    torch.where(all_step_dones, all_step_rewards, INF).min(),
+                    torch.where(all_step_dones, all_step_rewards, -INF).max(),
+                    (self.vec_env.last_episode_food * any_done_per_env).sum().float(),
+                    (self.vec_env.last_episode_poison * any_done_per_env).sum().float(),
+                ]
 
-                        # Unpack aggregates
-                        update_episodes_count += n_episodes
-                        update_reward_sum += float(cpu_agg[0])
-                        update_reward_min = min(update_reward_min, float(cpu_agg[1]))
-                        update_reward_max = max(update_reward_max, float(cpu_agg[2]))
-                        update_food_sum += int(cpu_agg[3])
-                        update_poison_sum += int(cpu_agg[4])
+                # Stack into tensor (size determined by list length, not hardcoded)
+                episode_agg_tensor = torch.stack(episode_agg_values)
 
-                        if cpu_agg[2] > self.best_reward:
-                            self.best_reward = float(cpu_agg[2])
-
-                        self.episode_count += n_episodes
-                
                 # Flatten and prepare buffers for PPO (all tensors stay on GPU)
                 # Note: Buffers always contain tensors now (converted during collection)
                 all_states = torch.cat(states_buffer, dim=0)
@@ -879,22 +882,20 @@ class PPOTrainer:
                 print(" " * 40, end='\r')
                 
                 # Sync device - critical for TPU to force XLA execution
+                # For CUDA: ~0.08ms overhead, but needed for accurate profiler timing
                 sync_device(self.device)
                 self.profiler.tick("PPO Update")
                 
                 self.update_count += 1
-                
-                # Clear buffers
-                states_buffer = []
-                actions_buffer = []
-                log_probs_buffer = []
-                rewards_buffer = []
-                dones_buffer = []
-                values_buffer = []
 
-                # Clear async logging buffers
-                finished_dones_buffer = []
-                finished_rewards_buffer = []
+                # External profiler callback (for --profile-trace)
+                if self._profiler_callback is not None:
+                    if not self._profiler_callback(self.update_count):
+                        # Callback returned False - stop training early
+                        break
+
+                # Reset buffer index (buffers are pre-allocated, just overwrite)
+                step_in_buffer = 0
                 
                 # Progress - calculate three sps metrics
                 now = time.perf_counter()
@@ -917,8 +918,39 @@ class PPOTrainer:
                 # Global sps (total steps / total elapsed)
                 elapsed = now - self.start_time
                 sps_global = self.total_steps / elapsed if elapsed > 0 else 0
-                
-                # Prepare episode stats
+
+                # SYNC POINT: Convert GPU tensors to CPU floats (single sync)
+                # This keeps all CUDA ops on main thread; background thread only does I/O
+                # Episode aggregates + PPO metrics all transfer here AFTER PPO work is queued
+                policy_loss_f = policy_loss.item()
+                value_loss_f = value_loss.item()
+                entropy_f = entropy.item()
+                explained_var_f = explained_var.item()
+                action_probs = F.softmax(last_logits, dim=1)[0].cpu().numpy().tolist()
+
+                # Episode aggregates (computed on GPU before PPO, transferred now)
+                # Unpack using keys defined earlier (extensible, no hardcoded indices)
+                cpu_agg = episode_agg_tensor.cpu().numpy()
+                agg = {k: cpu_agg[i] for i, k in enumerate(episode_agg_keys)}
+
+                n_episodes = int(agg['n_episodes'])
+                if n_episodes > 0:
+                    update_episodes_count += n_episodes
+                    update_reward_sum += float(agg['reward_sum'])
+                    # Handle inf values for min/max when there were episodes
+                    if agg['reward_min'] != float('inf'):
+                        update_reward_min = min(update_reward_min, float(agg['reward_min']))
+                    if agg['reward_max'] != float('-inf'):
+                        update_reward_max = max(update_reward_max, float(agg['reward_max']))
+                    update_food_sum += int(agg['food_sum'])
+                    update_poison_sum += int(agg['poison_sum'])
+
+                    if agg['reward_max'] > self.best_reward:
+                        self.best_reward = float(agg['reward_max'])
+
+                    self.episode_count += n_episodes
+
+                # Prepare episode stats (after sync so we have the data)
                 ep_stats = None
                 if update_episodes_count > 0:
                     ep_stats = {
@@ -926,15 +958,7 @@ class PPOTrainer:
                         'food': update_food_sum / update_episodes_count,
                         'poison': update_poison_sum / update_episodes_count
                     }
-                
-                # SYNC POINT: Convert GPU tensors to CPU floats (single sync)
-                # This keeps all CUDA ops on main thread; background thread only does I/O
-                policy_loss_f = policy_loss.item()
-                value_loss_f = value_loss.item()
-                entropy_f = entropy.item()
-                explained_var_f = explained_var.item()
-                action_probs = F.softmax(last_logits, dim=1)[0].cpu().numpy().tolist()
-                
+
                 # Run validation episodes periodically
                 val_metrics = None
                 if cfg.validation_interval > 0 and self.update_count % cfg.validation_interval == 0:

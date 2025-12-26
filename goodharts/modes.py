@@ -188,10 +188,10 @@ class RewardComputer(ABC):
 
 
 class GroundTruthRewards(RewardComputer):
-    """Standard ground truth rewards."""
+    """Standard ground truth rewards - no shaping, just raw energy delta."""
     def _compute_potentials(self, states: torch.Tensor) -> torch.Tensor:
-        target = states[:, 2, :, :] > 0.5
-        return self._calculate_potential_from_target(states, target)
+        # No potential-based shaping for ground truth mode
+        return torch.zeros(states.shape[0], device=states.device)
 
 
 class HandholdRewards(RewardComputer):
@@ -233,28 +233,28 @@ class ProxyJammedRewards(RewardComputer):
     """
     Rewards for proxy_jammed mode (information asymmetry).
     Agent sees interestingness, rewarded for energy delta.
+    No potential-based shaping - agent must learn from raw energy rewards.
     """
     def _compute_potentials(self, states: torch.Tensor) -> torch.Tensor:
-        interestingness = states[:, 2:, :, :].max(dim=1).values
-        target = interestingness > 0.5
-        return self._calculate_potential_from_target(states, target)
+        # No potential-based shaping for proxy_jammed mode
+        return torch.zeros(states.shape[0], device=states.device)
 
 
 class ProxyRewards(RewardComputer):
     """
     Rewards for proxy mode (main Goodhart failure case).
     Agent sees interestingness, rewarded for interestingness consumption.
+    No potential-based shaping - demonstrates pure Goodhart failure.
     """
     def _scale_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
         scaled = torch.zeros_like(rewards)
         scaled[rewards > 0] = 1.0
         scaled[rewards < 0] = 0.9
         return scaled
-        
+
     def _compute_potentials(self, states: torch.Tensor) -> torch.Tensor:
-        interestingness = states[:, 2:, :, :].max(dim=1).values
-        target = interestingness > 0.5
-        return self._calculate_potential_from_target(states, target)
+        # No potential-based shaping for proxy mode
+        return torch.zeros(states.shape[0], device=states.device)
 
 @dataclass
 class ModeSpec:

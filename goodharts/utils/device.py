@@ -387,6 +387,49 @@ def get_device_info() -> dict:
     return info
 
 
+def create_optimizer(
+    params,
+    lr: float = 3e-4,
+    device: torch.device = None,
+    optimizer_type: str = 'adam',
+    **kwargs
+) -> torch.optim.Optimizer:
+    """
+    Create an optimizer with GPU-native settings.
+
+    Automatically uses fused=True on CUDA to eliminate .item() sync overhead.
+    The fused optimizer runs entirely on GPU without CPU synchronization.
+
+    Args:
+        params: Model parameters (or list of param groups)
+        lr: Learning rate
+        device: Device to optimize for (auto-detected if None)
+        optimizer_type: 'adam' or 'adamw'
+        **kwargs: Additional optimizer arguments
+
+    Returns:
+        Configured optimizer
+
+    Example:
+        from goodharts.utils.device import create_optimizer, get_device
+
+        device = get_device()
+        optimizer = create_optimizer(model.parameters(), lr=3e-4, device=device)
+    """
+    if device is None:
+        device = get_device(verbose=False)
+
+    # Use fused optimizer on CUDA (no .item() sync overhead)
+    use_fused = device.type == 'cuda'
+
+    if optimizer_type == 'adam':
+        return torch.optim.Adam(params, lr=lr, fused=use_fused, **kwargs)
+    elif optimizer_type == 'adamw':
+        return torch.optim.AdamW(params, lr=lr, fused=use_fused, **kwargs)
+    else:
+        raise ValueError(f"Unknown optimizer type: {optimizer_type}")
+
+
 def apply_system_optimizations(device: torch.device = None, verbose: bool = True):
     """
     Apply global performance optimizations for the given device.
