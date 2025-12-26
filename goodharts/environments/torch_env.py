@@ -388,6 +388,107 @@ class TorchVecEnv:
 
         # Mark agents on grids (vectorized advanced indexing)
         self.grids[grid_ids, new_y, new_x] = self.agent_types[env_ids].float()
+
+    def _reset_agents_masked(self, done_mask: torch.Tensor):
+        """
+        Fully masked reset - NO GPU sync required.
+
+        Uses torch.where everywhere instead of indexing, so we never need
+        to know which agents are done (no .any(), .nonzero(), or len()).
+
+        This runs operations on ALL agents but only applies changes where
+        done_mask is True. Slightly more compute but zero sync overhead.
+
+        Args:
+            done_mask: Boolean tensor (n_envs,) indicating which agents are done
+        """
+        # Expand mask for broadcasting where needed
+        done_f = done_mask.float()  # For numeric operations
+        done_int = done_mask.int()
+
+        # Update episode stats (only where done)
+        self.last_episode_food = torch.where(
+            done_mask, self.current_episode_food, self.last_episode_food
+        )
+        self.last_episode_poison = torch.where(
+            done_mask, self.current_episode_poison, self.last_episode_poison
+        )
+        self.current_episode_food = torch.where(
+            done_mask, torch.zeros_like(self.current_episode_food), self.current_episode_food
+        )
+        self.current_episode_poison = torch.where(
+            done_mask, torch.zeros_like(self.current_episode_poison), self.current_episode_poison
+        )
+
+        # Restore old cells where done (clear agent markers)
+        old_y = self.agent_y
+        old_x = self.agent_x
+        grid_ids = self.grid_indices
+        old_cell_values = self.grids[grid_ids, old_y, old_x]
+        agent_types_f = self.agent_types.float()
+
+        # Only restore where agent is marked AND agent is done
+        actually_marked = (old_cell_values == agent_types_f)
+        should_restore = done_mask & actually_marked
+        restore_values = torch.where(
+            should_restore,
+            self.agent_underlying_cell,
+            old_cell_values
+        )
+        self.grids[grid_ids, old_y, old_x] = restore_values
+
+        # Reset energy, steps, dones where done
+        self.agent_energy = torch.where(
+            done_mask, self.initial_energy, self.agent_energy
+        )
+        self.agent_steps = torch.where(
+            done_mask,
+            torch.zeros_like(self.agent_steps),
+            self.agent_steps
+        )
+        self.dones = torch.where(
+            done_mask,
+            torch.zeros_like(self.dones),
+            self.dones
+        )
+
+        # Spawn new positions for ALL agents (cheap), only apply where done
+        # Generate random noise for all agents' grids
+        noise = torch.rand(self.n_envs, self.height, self.width, device=self.device)
+
+        # Get empty masks for all grids
+        grids = self.grids[grid_ids]  # (n_envs, height, width)
+        empty_mask = (grids == self.CellType.EMPTY.value)
+
+        # Mask non-empty cells
+        masked_noise = torch.where(empty_mask, noise, self._neg_inf)
+
+        # Find random empty cell for each agent
+        flat_noise = masked_noise.view(self.n_envs, -1)
+        flat_idx = flat_noise.argmax(dim=1)
+        new_y = (flat_idx // self.width).int()
+        new_x = (flat_idx % self.width).int()
+
+        # Only update positions where done
+        self.agent_y = torch.where(done_mask, new_y, self.agent_y)
+        self.agent_x = torch.where(done_mask, new_x, self.agent_x)
+        self.agent_underlying_cell = torch.where(
+            done_mask,
+            torch.full_like(self.agent_underlying_cell, self.CellType.EMPTY.value),
+            self.agent_underlying_cell
+        )
+
+        # Mark agents on grids where done
+        # Need to use scatter or advanced indexing carefully
+        # The new positions for done agents need to be marked
+        new_positions_y = torch.where(done_mask, new_y, old_y)
+        new_positions_x = torch.where(done_mask, new_x, old_x)
+
+        # Get current values at new positions
+        current_at_new = self.grids[grid_ids, new_positions_y, new_positions_x]
+        # Only mark where done (set to agent type)
+        new_values = torch.where(done_mask, agent_types_f, current_at_new)
+        self.grids[grid_ids, new_positions_y, new_positions_x] = new_values
     
     def _place_items(self, grid_id: int, cell_type: int, count):
         """Place items at random empty positions using noise-based selection.
@@ -483,10 +584,18 @@ class TorchVecEnv:
         # Save dones before reset (reuse pre-allocated buffer)
         self._dones_return.copy_(self.dones)
 
-        # Auto-reset done agents (vectorized - no Python loop)
-        if self.dones.any():
-            done_indices = self.dones.nonzero(as_tuple=True)[0]
-            self._reset_agents_batch(done_indices)
+        # Auto-reset done agents
+        # Use masked reset for independent grids (training) - no GPU sync
+        # Use indexed reset for shared grid (visualization) - handles collisions
+        if self.shared_grid:
+            # Shared grid: need sequential spawning to avoid collisions
+            # This path still syncs but is only used for visualization
+            if self.dones.any():
+                done_indices = self.dones.nonzero(as_tuple=True)[0]
+                self._reset_agents_batch(done_indices)
+        else:
+            # Independent grids: fully masked reset - ZERO GPU sync
+            self._reset_agents_masked(self.dones)
 
         return self._get_observations(), rewards, self._dones_return
     

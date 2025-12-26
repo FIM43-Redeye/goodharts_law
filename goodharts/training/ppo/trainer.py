@@ -824,15 +824,7 @@ class PPOTrainer:
                 # Food/poison: sum for envs that finished at least once this update
                 any_done_per_env = all_step_dones.any(dim=0)  # (envs,)
 
-                # Define aggregates as ordered lists (extensible - just add to both)
-                episode_agg_keys = [
-                    'n_episodes',
-                    'reward_sum',
-                    'reward_min',
-                    'reward_max',
-                    'food_sum',
-                    'poison_sum',
-                ]
+                # Episode aggregates - order must match metrics_keys in sync section
                 episode_agg_values = [
                     done_mask.sum(),
                     (all_step_rewards * done_mask).sum(),
@@ -919,19 +911,45 @@ class PPOTrainer:
                 elapsed = now - self.start_time
                 sps_global = self.total_steps / elapsed if elapsed > 0 else 0
 
-                # SYNC POINT: Convert GPU tensors to CPU floats (single sync)
+                # SINGLE SYNC POINT: Pack ALL metrics into one tensor, transfer once
                 # This keeps all CUDA ops on main thread; background thread only does I/O
-                # Episode aggregates + PPO metrics all transfer here AFTER PPO work is queued
-                policy_loss_f = policy_loss.item()
-                value_loss_f = value_loss.item()
-                entropy_f = entropy.item()
-                explained_var_f = explained_var.item()
-                action_probs = F.softmax(last_logits, dim=1)[0].cpu().numpy().tolist()
+                #
+                # Metrics registry: define once, pack on GPU, unpack on CPU
+                # To add a metric: add key to list, add value to list (same index)
+                n_actions = last_logits.shape[1]
+                action_probs_gpu = F.softmax(last_logits, dim=1)[0]  # (n_actions,)
 
-                # Episode aggregates (computed on GPU before PPO, transferred now)
-                # Unpack using keys defined earlier (extensible, no hardcoded indices)
-                cpu_agg = episode_agg_tensor.cpu().numpy()
-                agg = {k: cpu_agg[i] for i, k in enumerate(episode_agg_keys)}
+                metrics_keys = [
+                    # Episode aggregates (6 values)
+                    'n_episodes', 'reward_sum', 'reward_min', 'reward_max',
+                    'food_sum', 'poison_sum',
+                    # PPO metrics (4 values)
+                    'policy_loss', 'value_loss', 'entropy', 'explained_var',
+                    # Action probs will be unpacked separately (n_actions values)
+                ]
+                metrics_values = torch.cat([
+                    episode_agg_tensor,           # 6 values (already stacked)
+                    policy_loss.unsqueeze(0),     # 1 value
+                    value_loss.unsqueeze(0),      # 1 value
+                    entropy.unsqueeze(0),         # 1 value
+                    explained_var.unsqueeze(0),   # 1 value
+                    action_probs_gpu,             # n_actions values
+                ])
+
+                # ONE transfer - all metrics in single tensor
+                cpu_metrics = metrics_values.cpu().numpy()
+
+                # Unpack using registry (action_probs are the tail)
+                n_scalar_metrics = len(metrics_keys)
+                metrics = {k: cpu_metrics[i] for i, k in enumerate(metrics_keys)}
+                action_probs = cpu_metrics[n_scalar_metrics:].tolist()
+
+                # Extract for readability
+                policy_loss_f = float(metrics['policy_loss'])
+                value_loss_f = float(metrics['value_loss'])
+                entropy_f = float(metrics['entropy'])
+                explained_var_f = float(metrics['explained_var'])
+                agg = metrics  # Episode aggregates use same dict
 
                 n_episodes = int(agg['n_episodes'])
                 if n_episodes > 0:
