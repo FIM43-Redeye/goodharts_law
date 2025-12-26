@@ -23,7 +23,7 @@ from goodharts.utils.seed import set_seed
 from goodharts.behaviors.brains import create_brain, save_brain, _clean_state_dict
 from goodharts.behaviors.action_space import create_action_space, ActionSpace
 from goodharts.environments.torch_env import create_torch_vec_env
-from goodharts.training.train_log import TrainingLogger
+from goodharts.training.process_logger import ProcessLogger
 from goodharts.modes import RewardComputer
 
 from .models import Profiler, ValueHead
@@ -444,13 +444,15 @@ class PPOTrainer:
             self.vec_env = None
 
         # Release model tensors
-        if self.policy:
+        # Note: Can't use truthiness check on torch.compile wrapped modules
+        # (they don't support __len__), so check against None explicitly
+        if self.policy is not None:
             del self.policy
             self.policy = None
-        if self.value_head:
+        if self.value_head is not None:
             del self.value_head
             self.value_head = None
-        if self.optimizer:
+        if self.optimizer is not None:
             del self.optimizer
             self.optimizer = None
 
@@ -551,8 +553,10 @@ class PPOTrainer:
         )
         
         # Logger (skip in benchmark mode)
+        # Uses process-isolated logging to completely escape the GIL
         if cfg.log_to_file and not cfg.benchmark_mode:
-            self.logger = TrainingLogger(mode=cfg.mode, output_dir=cfg.log_dir)
+            self.logger = ProcessLogger(mode=cfg.mode, output_dir=cfg.log_dir)
+            self.logger.start()  # Start writer process
             self.logger.set_hyperparams(
                 mode=cfg.mode,
                 brain_type=cfg.brain_type,
@@ -683,10 +687,11 @@ class PPOTrainer:
             self.reward_computer.initialize(states)
             episode_rewards.zero_()
 
-        # Dashboard aggregation (per-update)
-        # We track how many episodes finished during this collection phase
+        # Episode aggregation (per-update) - computed on GPU, only aggregates transferred
         update_episodes_count = 0
         update_reward_sum = 0.0
+        update_reward_min = float('inf')
+        update_reward_max = float('-inf')
         update_food_sum = 0
         update_poison_sum = 0
 
@@ -799,58 +804,43 @@ class PPOTrainer:
                     done_coords = all_step_dones.nonzero(as_tuple=False) # (N_events, 2) -> [step, env]
                     
                     if done_coords.shape[0] > 0:
-                        # Extract data
+                        # Extract data (stay on GPU)
                         steps_idx = done_coords[:, 0]
                         envs_idx = done_coords[:, 1]
-                        
+
                         # Get rewards for the identified events
                         event_rewards = all_step_rewards[steps_idx, envs_idx]
-                        
+
                         # Get food/poison stats (using vectorized lookup)
-                        # Note: last_episode_food might have been overwritten if env finished twice.
-                        # We accept this inaccuracy for performance.
                         event_food = self.vec_env.last_episode_food[envs_idx]
                         event_poison = self.vec_env.last_episode_poison[envs_idx]
-                        
-                        # Move to CPU for loop
-                        cpu_rewards = event_rewards.cpu().numpy()
-                        cpu_food = event_food.cpu().numpy()
-                        cpu_poison = event_poison.cpu().numpy()
-                        cpu_env_ids = envs_idx.cpu().numpy()
-                        
-                        # Log
-                        for j, env_id in enumerate(cpu_env_ids):
-                            self.episode_count += 1
-                            r = float(cpu_rewards[j])
-                            f = int(cpu_food[j])
-                            p = int(cpu_poison[j])
-                            
-                            update_episodes_count += 1
-                            update_reward_sum += r
-                            update_food_sum += f
-                            update_poison_sum += p
-                            
-                            if r > self.best_reward:
-                                self.best_reward = r
-                            
-                            if self.logger:
-                                grid_id = self.vec_env.grid_indices[env_id]
-                                if isinstance(grid_id, torch.Tensor):
-                                    grid_id = grid_id.item()
-                                food_density = self.vec_env.grid_food_counts[grid_id]
-                                if isinstance(food_density, torch.Tensor):
-                                    food_density = food_density.item()
-                                avg_food = (self.min_food + self.max_food) / 2
-                                self.logger.log_episode(
-                                    episode=self.episode_count,
-                                    reward=r,
-                                    length=500,
-                                    food_eaten=f,
-                                    poison_eaten=p,
-                                    food_density=food_density,
-                                    curriculum_progress=(avg_food - self.min_food) / (self.max_food - self.min_food + 1e-8),
-                                    action_prob_std=0.0,
-                                )
+                        n_episodes = done_coords.shape[0]
+
+                        # Compute ALL aggregates on GPU - single kernel, microseconds
+                        # This replaces transferring thousands of episode records
+                        agg_tensor = torch.stack([
+                            event_rewards.sum(),
+                            event_rewards.min(),
+                            event_rewards.max(),
+                            event_food.sum().float(),
+                            event_poison.sum().float(),
+                        ])
+
+                        # SINGLE CPU transfer: 5 floats instead of thousands
+                        cpu_agg = agg_tensor.cpu().numpy()
+
+                        # Unpack aggregates
+                        update_episodes_count += n_episodes
+                        update_reward_sum += float(cpu_agg[0])
+                        update_reward_min = min(update_reward_min, float(cpu_agg[1]))
+                        update_reward_max = max(update_reward_max, float(cpu_agg[2]))
+                        update_food_sum += int(cpu_agg[3])
+                        update_poison_sum += int(cpu_agg[4])
+
+                        if cpu_agg[2] > self.best_reward:
+                            self.best_reward = float(cpu_agg[2])
+
+                        self.episode_count += n_episodes
                 
                 # Flatten and prepare buffers for PPO (all tensors stay on GPU)
                 # Note: Buffers always contain tensors now (converted during collection)
@@ -949,6 +939,12 @@ class PPOTrainer:
                 val_metrics = None
                 if cfg.validation_interval > 0 and self.update_count % cfg.validation_interval == 0:
                     val_metrics = self._run_validation_episodes()
+                    # Validation with training env resets environment state.
+                    # Re-sync training loop state to avoid stale observations.
+                    if cfg.validation_mode == "training":
+                        states = self.vec_env.reset()
+                        self.reward_computer.initialize(states)
+                        episode_rewards.zero_()
                 
                 # ASYNC LOGGING - queue CPU data only, no GPU access in background
                 log_payload = LogPayload(
@@ -967,6 +963,13 @@ class PPOTrainer:
                     sps_rolling=sps_rolling,
                     sps_global=sps_global,
                     validation_metrics=val_metrics,
+                    # Episode aggregates (computed on GPU, 5 floats only)
+                    episodes_count=update_episodes_count,
+                    reward_sum=update_reward_sum,
+                    reward_min=update_reward_min if update_episodes_count > 0 else 0.0,
+                    reward_max=update_reward_max if update_episodes_count > 0 else 0.0,
+                    food_sum=update_food_sum,
+                    poison_sum=update_poison_sum,
                 )
                 self.async_logger.log_update(log_payload)
                 self.profiler.reset()
@@ -974,10 +977,15 @@ class PPOTrainer:
                 # Reset episode aggregators
                 update_episodes_count = 0
                 update_reward_sum = 0.0
+                update_reward_min = float('inf')
+                update_reward_max = float('-inf')
                 update_food_sum = 0
                 update_poison_sum = 0
-                
-                last_update_time = now
+
+                # Update timing reference AFTER all update work (including validation)
+                # This ensures validation time is charged to the update that runs it,
+                # not the following update
+                last_update_time = time.perf_counter()
                 last_update_steps = self.total_steps
                 
                 # Checkpoint

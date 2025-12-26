@@ -71,9 +71,12 @@ class TestPPOLearning(unittest.TestCase):
         # and checking regarding NaNs.
         
         summary = trainer.train()
-        
-        # Check for numerical instability in weights
-        for name, param in trainer.policy.named_parameters():
+
+        # Load the saved model to check for numerical instability
+        # (trainer.policy is cleared by cleanup() after train())
+        checkpoint = torch.load(self.model_path)
+        saved_weights = checkpoint['state_dict']
+        for name, param in saved_weights.items():
             self.assertFalse(torch.isnan(param).any(), f"NaNs found in model parameter: {name}")
             self.assertFalse(torch.isinf(param).any(), f"Infs found in model parameter: {name}")
 
@@ -128,9 +131,11 @@ class TestPPOLearning(unittest.TestCase):
         
         # 2. Run Training
         summary = trainer.train()
-        
+
         # 3. Check Final Weights (Should have changed)
-        final_weights = trainer.policy.state_dict()
+        # Load from saved model since trainer.policy is cleared by cleanup()
+        checkpoint = torch.load(self.model_path)
+        final_weights = checkpoint['state_dict']
         
         changed_layers = []
         for name, param in initial_weights.items():

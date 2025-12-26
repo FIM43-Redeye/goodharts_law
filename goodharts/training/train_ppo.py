@@ -134,9 +134,9 @@ def main():
 
     # Training options
     training = parser.add_argument_group('Training')
-    training.add_argument('-m', '--mode', default='ground_truth', choices=all_modes + ['all'],
+    training.add_argument('-m', '--mode', default='ground_truth',
                           metavar='MODE',
-                          help=f'Training mode: {", ".join(all_modes)}, or "all" [default: ground_truth]')
+                          help=f'Training mode(s): {", ".join(all_modes)}, "all", or comma-separated list [default: ground_truth]')
     training.add_argument('-t', '--timesteps', type=int, default=None, metavar='N',
                           help='Total environment steps')
     training.add_argument('-u', '--updates', type=int, default=None, metavar='N',
@@ -165,6 +165,10 @@ def main():
                          help='Enable TensorBoard logging')
     monitor.add_argument('-v', '--verbose', action='store_true', dest='hyper_verbose',
                          help='Debug mode: print at every major step')
+    monitor.add_argument('--log', action='store_true', dest='force_log',
+                         help='Force file logging (for debugging)')
+    monitor.add_argument('--no-log', action='store_true', dest='no_log',
+                         help='Disable file logging even in multi-mode')
 
     # Experiment settings
     experiment = parser.add_argument_group('Experiment')
@@ -242,25 +246,45 @@ def main():
     if args.deterministic:
         overrides['deterministic'] = True
 
-    modes_to_train = all_modes if args.mode == 'all' else [args.mode]
+    # Parse mode(s) - supports "all", single mode, or comma-separated list
+    if args.mode == 'all':
+        modes_to_train = all_modes
+    elif ',' in args.mode:
+        modes_to_train = [m.strip() for m in args.mode.split(',')]
+        invalid = [m for m in modes_to_train if m not in all_modes]
+        if invalid:
+            parser.error(f"Invalid mode(s): {', '.join(invalid)}. Valid: {', '.join(all_modes)}")
+    else:
+        if args.mode not in all_modes:
+            parser.error(f"Invalid mode: {args.mode}. Valid: {', '.join(all_modes)}, or 'all'")
+        modes_to_train = [args.mode]
 
     # Install signal handlers for graceful shutdown
     _install_signal_handlers()
     _reset_signal_state()
     reset_training_state()  # Clear any stale global state from previous runs
 
+    # Determine file logging: --log forces on, --no-log forces off, otherwise auto
+    if args.force_log:
+        log_to_file = True
+    elif args.no_log:
+        log_to_file = False
+    else:
+        # Default: log when training multiple modes
+        log_to_file = len(modes_to_train) > 1
+
     # Training execution
     try:
         if args.dashboard:
-            _run_with_dashboard(modes_to_train, overrides, args.sequential)
+            _run_with_dashboard(modes_to_train, overrides, args.sequential, log_to_file)
         else:
-            _run_without_dashboard(modes_to_train, overrides, args.sequential)
+            _run_without_dashboard(modes_to_train, overrides, args.sequential, log_to_file)
     finally:
         # Always reset state on exit (clean or aborted)
         reset_training_state()
  
  
-def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool):
+def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool, log_to_file: bool):
     """Run training with live dashboard in separate process."""
     from goodharts.training.train_dashboard import create_dashboard_process
     from goodharts.behaviors.action_space import num_actions
@@ -291,7 +315,7 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool)
                     mode=mode,
                     dashboard=dashboard,
                     output_path=f'models/ppo_{mode}.pth',
-                    log_to_file=True,
+                    log_to_file=log_to_file,
                     **overrides
                 )
         else:
@@ -304,7 +328,7 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool)
                         'mode': mode,
                         'dashboard': dashboard,
                         'output_path': f'models/ppo_{mode}.pth',
-                        'log_to_file': True,
+                        'log_to_file': log_to_file,
                         **overrides
                     },
                     daemon=True
@@ -334,7 +358,7 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool)
             print("\n[Dashboard] Training complete. Close the dashboard window when done.")
 
 
-def _run_without_dashboard(modes_to_train: list, overrides: dict, sequential: bool):
+def _run_without_dashboard(modes_to_train: list, overrides: dict, sequential: bool, log_to_file: bool):
     """Run training without dashboard."""
     try:
         if len(modes_to_train) > 1 and not sequential:
@@ -348,7 +372,7 @@ def _run_without_dashboard(modes_to_train: list, overrides: dict, sequential: bo
                     kwargs={
                         'mode': mode,
                         'output_path': f'models/ppo_{mode}.pth',
-                        'log_to_file': True,
+                        'log_to_file': log_to_file,
                         **overrides
                     },
                     daemon=True
@@ -383,7 +407,7 @@ def _run_without_dashboard(modes_to_train: list, overrides: dict, sequential: bo
                 train_ppo(
                     mode=mode,
                     output_path=f'models/ppo_{mode}.pth',
-                    log_to_file=len(modes_to_train) > 1,
+                    log_to_file=log_to_file,
                     **overrides
                 )
 
