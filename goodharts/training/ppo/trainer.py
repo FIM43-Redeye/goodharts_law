@@ -13,6 +13,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.distributions import Categorical
+from torch.profiler import record_function
 from dataclasses import dataclass
 from typing import Optional
 
@@ -311,34 +312,40 @@ class PPOTrainer:
         """
         cfg = self.config
 
-        # Collect one update worth of experience
-        states_buffer = []
-        actions_buffer = []
-        log_probs_buffer = []
-        rewards_buffer = []
-        dones_buffer = []
-        values_buffer = []
+        # Use pre-allocated buffers (same as main training loop)
+        states_buf = self._states_buf
+        actions_buf = self._actions_buf
+        log_probs_buf = self._log_probs_buf
+        rewards_buf = self._rewards_buf
+        dones_buf = self._dones_buf
+        values_buf = self._values_buf
 
-        for _ in range(cfg.steps_per_env):
+        for step in range(cfg.steps_per_env):
             with torch.no_grad():
-                states_t = states.float()
-                with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                    logits, features = self.policy.forward_with_features(states_t)
-                    values = self.value_head(features).squeeze(-1)
-                    dist = Categorical(logits=logits, validate_args=False)
-                    actions = dist.sample()
-                    log_probs = dist.log_prob(actions)
+                # Use compiled functions if available (triggers compilation on first call)
+                if self._compiled_inference is not None:
+                    logits, features, values = self._compiled_inference(states)
+                    actions, log_probs = self._compiled_sample(logits)
+                else:
+                    states_t = states.float()
+                    with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                        logits, features = self.policy.forward_with_features(states_t)
+                        values = self.value_head(features).squeeze(-1)
+                        dist = Categorical(logits=logits, validate_args=False)
+                        actions = dist.sample()
+                        log_probs = dist.log_prob(actions)
 
             current_states = states.clone()
             next_states, rewards, dones = self.vec_env.step(actions)
             shaped_rewards = self.reward_computer.compute(rewards, current_states, next_states, dones)
 
-            states_buffer.append(current_states)
-            actions_buffer.append(actions)
-            log_probs_buffer.append(log_probs.detach())
-            rewards_buffer.append(shaped_rewards)
-            dones_buffer.append(dones.clone())
-            values_buffer.append(values)
+            # Store in pre-allocated tensor buffers
+            states_buf[step] = current_states
+            actions_buf[step] = actions
+            log_probs_buf[step] = log_probs.detach()
+            rewards_buf[step] = shaped_rewards
+            dones_buf[step] = dones
+            values_buf[step] = values
 
             episode_rewards += rewards
             episode_rewards *= (~dones)
@@ -350,9 +357,9 @@ class PPOTrainer:
             _, features = self.policy.forward_with_features(states_t)
             next_value = self.value_head(features).squeeze(-1)
 
-        # Compute GAE
+        # Compute GAE (pass tensors directly, no stacking needed)
         advantages, returns = compute_gae(
-            rewards_buffer, values_buffer, dones_buffer,
+            rewards_buf, values_buf, dones_buf,
             next_value, cfg.gamma, cfg.gae_lambda, device=self.device
         )
 
@@ -361,11 +368,12 @@ class PPOTrainer:
             self.value_head.update_stats(returns.flatten())
 
         # PPO update (this triggers backward pass lazy init)
-        # Use cat to flatten (steps, envs) -> (steps * envs)
-        all_states = torch.cat(states_buffer, dim=0)
-        all_actions = torch.cat(actions_buffer, dim=0)
-        all_log_probs = torch.cat(log_probs_buffer, dim=0)
-        all_values = torch.cat(values_buffer, dim=0)
+        # Reshape pre-allocated buffers (no torch.cat needed)
+        batch_size = cfg.steps_per_env * cfg.n_envs
+        all_states = states_buf.reshape(batch_size, -1, self.vec_env.view_size, self.vec_env.view_size).float()
+        all_actions = actions_buf.flatten()
+        all_log_probs = log_probs_buf.flatten()
+        all_values = values_buf.flatten()
         all_returns = returns.flatten()
         all_advantages = advantages.flatten()
 
@@ -533,12 +541,49 @@ class PPOTrainer:
         # Use lock to serialize compilation - Dynamo's global state is not thread-safe
         # Skip on TPU - XLA uses its own JIT compilation
         # Note: Actual warmup happens in _training_loop via _run_warmup_update()
+        #
+        # Key insight: Compiling just the models helps, but compiling the ENTIRE
+        # inference step (forward + sampling) eliminates inter-update gaps by fusing
+        # many small kernels into fewer large ones. This reduces kernel launch overhead
+        # from ~1ms to ~0.006ms per update.
+        self._compiled_inference = None
+        self._compiled_sample = None
+
         with _COMPILE_LOCK:
             if cfg.compile_models and hasattr(torch, 'compile') and not is_tpu(self.device):
                 try:
-                    self.policy = torch.compile(self.policy)
-                    self.value_head = torch.compile(self.value_head)
-                    print(f"   [JIT] torch.compile enabled (warmup deferred)")
+                    # Use max-autotune-no-cudagraphs for best kernel optimization
+                    # without CUDA graph tensor reuse conflicts
+                    compile_mode = 'max-autotune-no-cudagraphs'
+
+                    # Compile the full inference step, not just individual models
+                    # This fuses .float(), autocast, forward, and squeeze into one graph
+                    policy = self.policy
+                    value_head = self.value_head
+                    device_type = self.device_type
+                    use_amp = cfg.use_amp
+
+                    @torch.compile(mode=compile_mode)
+                    def compiled_inference(states):
+                        """Fused inference: float conversion + policy + value."""
+                        states_t = states.float()
+                        with autocast(device_type=device_type, enabled=use_amp):
+                            logits, features = policy.forward_with_features(states_t)
+                            values = value_head(features).squeeze(-1)
+                        return logits, features, values
+
+                    @torch.compile(mode=compile_mode)
+                    def compiled_sample(logits):
+                        """Fused sampling: distribution + sample + log_prob."""
+                        dist = Categorical(logits=logits, validate_args=False)
+                        actions = dist.sample()
+                        log_probs = dist.log_prob(actions)
+                        return actions, log_probs
+
+                    self._compiled_inference = compiled_inference
+                    self._compiled_sample = compiled_sample
+
+                    print(f"   [JIT] torch.compile enabled (max-autotune-no-cudagraphs)")
                 except RuntimeError as e:
                     if "FX" in str(e) or "dynamo" in str(e).lower():
                         print(f"   [JIT] Warning: torch.compile failed ({e}). Using eager mode.")
@@ -621,7 +666,24 @@ class PPOTrainer:
         # Checkpoint settings
         self.checkpoint_interval = train_cfg.get('checkpoint_interval', 0)
         self.checkpoint_dir = os.path.dirname(cfg.output_path) or 'models'
-        
+
+        # Pre-allocate rollout buffers (eliminates torch.cat burstiness)
+        # These are GPU tensors that get overwritten each update cycle
+        obs_shape = (cfg.steps_per_env, cfg.n_envs,
+                     self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size)
+        scalar_shape = (cfg.steps_per_env, cfg.n_envs)
+
+        self._states_buf = torch.zeros(obs_shape, device=self.device, dtype=torch.uint8)
+        self._actions_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.long)
+        self._log_probs_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
+        self._rewards_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
+        self._dones_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
+        self._values_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
+
+        # Episode tracking buffers (for async logging)
+        self._finished_dones_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
+        self._finished_rewards_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
+
         print(f"   Brain: {cfg.brain_type} (hidden={self.policy.hidden_size})")
         print(f"   AMP: {'Enabled' if cfg.use_amp else 'Disabled'}")
     
@@ -630,18 +692,16 @@ class PPOTrainer:
         cfg = self.config
         v = cfg.hyper_verbose  # Verbose debug mode
 
-        # Pre-allocate experience buffers (7% faster than list.append)
-        # Using list assignment [step_idx] = value instead of append
-        states_buffer = [None] * cfg.steps_per_env
-        actions_buffer = [None] * cfg.steps_per_env
-        log_probs_buffer = [None] * cfg.steps_per_env
-        rewards_buffer = [None] * cfg.steps_per_env
-        dones_buffer = [None] * cfg.steps_per_env
-        values_buffer = [None] * cfg.steps_per_env
-
-        # Async logging buffers (pre-allocated)
-        finished_dones_buffer = [None] * cfg.steps_per_env
-        finished_rewards_buffer = [None] * cfg.steps_per_env
+        # Use pre-allocated GPU tensor buffers (from _setup)
+        # These eliminate torch.cat overhead that caused GPU burstiness
+        states_buf = self._states_buf
+        actions_buf = self._actions_buf
+        log_probs_buf = self._log_probs_buf
+        rewards_buf = self._rewards_buf
+        dones_buf = self._dones_buf
+        values_buf = self._values_buf
+        finished_dones_buf = self._finished_dones_buf
+        finished_rewards_buf = self._finished_rewards_buf
 
         # Current step within the buffer (reset each update)
         step_in_buffer = 0
@@ -735,47 +795,53 @@ class PPOTrainer:
             
             # Collect experience
             with torch.no_grad():
-                # States are already tensors on device
-                states_t = states.float()
-                
                 if v:
                     _vprint(f"Step {self.total_steps}: running inference...", v)
-                with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                    # Use combined forward to avoid computing CNN features twice
-                    logits, features = self.policy.forward_with_features(states_t)
-                    values = self.value_head(features).squeeze(-1)
-                    
-                    dist = Categorical(logits=logits, validate_args=False)
-                    actions = dist.sample()
-                    log_probs = dist.log_prob(actions)
-                    # Store last logits for action_probs logging (computed once per update)
-                    last_logits = logits
-            
+
+                # Use compiled functions if available (fuses many small kernels)
+                with record_function("INFERENCE"):
+                    if self._compiled_inference is not None:
+                        logits, features, values = self._compiled_inference(states)
+                        actions, log_probs = self._compiled_sample(logits)
+                    else:
+                        # Fallback to eager mode
+                        states_t = states.float()
+                        with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                            logits, features = self.policy.forward_with_features(states_t)
+                            values = self.value_head(features).squeeze(-1)
+                            dist = Categorical(logits=logits, validate_args=False)
+                            actions = dist.sample()
+                            log_probs = dist.log_prob(actions)
+
+                # Store last logits for action_probs logging (computed once per update)
+                last_logits = logits
+
             self.profiler.tick("Inference")
-            
+
             # Environment step
             # GPU-native path: everything stays on GPU
             # CRITICAL: Snapshot state BEFORE step because env may mutate it in-place!
-            current_states = states.clone()
-            
-            next_states, rewards, dones = self.vec_env.step(actions)
-            
+            with record_function("ENV_STEP"):
+                current_states = states.clone()
+                next_states, rewards, dones = self.vec_env.step(actions)
+
             # Compute shaped rewards (torch-native, stays on GPU)
-            shaped_rewards = self.reward_computer.compute(
-                rewards, current_states, next_states, dones
-            )
+            with record_function("REWARD_SHAPE"):
+                shaped_rewards = self.reward_computer.compute(
+                    rewards, current_states, next_states, dones
+                )
             
-            # Store experience in pre-allocated buffer slots (faster than append)
-            states_buffer[step_in_buffer] = current_states
-            actions_buffer[step_in_buffer] = actions
-            log_probs_buffer[step_in_buffer] = log_probs.detach()
-            rewards_buffer[step_in_buffer] = shaped_rewards
-            dones_buffer[step_in_buffer] = dones.clone()
-            values_buffer[step_in_buffer] = values
+            # Store experience in pre-allocated tensor buffers (no torch.cat needed)
+            states_buf[step_in_buffer] = current_states
+            actions_buf[step_in_buffer] = actions
+            log_probs_buf[step_in_buffer] = log_probs.detach()
+            rewards_buf[step_in_buffer] = shaped_rewards
+            dones_buf[step_in_buffer] = dones
+            values_buf[step_in_buffer] = values
 
             # Track episode stats (defer logging to avoid Sync)
-            finished_dones_buffer[step_in_buffer] = dones
-            finished_rewards_buffer[step_in_buffer] = episode_rewards.clone()
+            finished_dones_buf[step_in_buffer] = dones
+            finished_rewards_buf[step_in_buffer] = episode_rewards
 
             step_in_buffer += 1
             self.total_steps += cfg.n_envs
@@ -792,82 +858,85 @@ class PPOTrainer:
             # PPO Update (when buffer is full)
             if step_in_buffer >= cfg.steps_per_env:
                 self.profiler.tick("Collection")
-                
-                # Get bootstrap value (keep on GPU)
-                with torch.no_grad():
-                    states_t = states.float()
-                    _, features = self.policy.forward_with_features(states_t)
-                    next_value = self.value_head(features).squeeze(-1)
-                
-                # Compute GAE
-                advantages, returns = compute_gae(
-                    rewards_buffer, values_buffer, dones_buffer,
-                    next_value, cfg.gamma, cfg.gae_lambda, device=self.device
-                )
 
-                # Update PopArt statistics for value normalization
-                if hasattr(self.value_head, 'update_stats'):
-                    self.value_head.update_stats(returns.flatten())
+                # Get bootstrap value (keep on GPU)
+                with record_function("GAE_COMPUTE"):
+                    with torch.no_grad():
+                        states_t = states.float()
+                        _, features = self.policy.forward_with_features(states_t)
+                        next_value = self.value_head(features).squeeze(-1)
+
+                    # Compute GAE (pass pre-allocated tensors directly, no stacking)
+                    advantages, returns = compute_gae(
+                        rewards_buf, values_buf, dones_buf,
+                        next_value, cfg.gamma, cfg.gae_lambda, device=self.device
+                    )
+
+                    # Update PopArt statistics for value normalization
+                    if hasattr(self.value_head, 'update_stats'):
+                        self.value_head.update_stats(returns.flatten())
 
                 self.profiler.tick("GAE Calc")
 
                 # EPISODE LOGGING - Fixed-size GPU aggregates, NO sync until after PPO
-                # Uses masked reductions to avoid nonzero() which requires knowing output size
-                # Extensible: add new metrics to episode_agg_keys and episode_agg_values
-                all_step_dones = torch.stack(finished_dones_buffer)  # (steps, envs)
-                all_step_rewards = torch.stack(finished_rewards_buffer)  # (steps, envs)
+                with record_function("BUFFER_FLATTEN"):
+                    # Pre-allocated buffers are already (steps, envs) tensors
+                    all_step_dones = finished_dones_buf  # Already (steps, envs)
+                    all_step_rewards = finished_rewards_buf  # Already (steps, envs)
 
-                # Masked aggregates - all ops stay on GPU
-                done_mask = all_step_dones.float()
-                INF = torch.tensor(float('inf'), device=self.device)
+                    # Masked aggregates - all ops stay on GPU
+                    done_mask = all_step_dones.float()
+                    INF = torch.tensor(float('inf'), device=self.device)
 
-                # Food/poison: sum for envs that finished at least once this update
-                any_done_per_env = all_step_dones.any(dim=0)  # (envs,)
+                    # Food/poison: sum for envs that finished at least once this update
+                    any_done_per_env = all_step_dones.any(dim=0)  # (envs,)
 
-                # Episode aggregates - order must match metrics_keys in sync section
-                episode_agg_values = [
-                    done_mask.sum(),
-                    (all_step_rewards * done_mask).sum(),
-                    torch.where(all_step_dones, all_step_rewards, INF).min(),
-                    torch.where(all_step_dones, all_step_rewards, -INF).max(),
-                    (self.vec_env.last_episode_food * any_done_per_env).sum().float(),
-                    (self.vec_env.last_episode_poison * any_done_per_env).sum().float(),
-                ]
+                    # Episode aggregates - order must match metrics_keys in sync section
+                    episode_agg_values = [
+                        done_mask.sum(),
+                        (all_step_rewards * done_mask).sum(),
+                        torch.where(all_step_dones, all_step_rewards, INF).min(),
+                        torch.where(all_step_dones, all_step_rewards, -INF).max(),
+                        (self.vec_env.last_episode_food * any_done_per_env).sum().float(),
+                        (self.vec_env.last_episode_poison * any_done_per_env).sum().float(),
+                    ]
 
-                # Stack into tensor (size determined by list length, not hardcoded)
-                episode_agg_tensor = torch.stack(episode_agg_values)
+                    # Stack into tensor (size determined by list length, not hardcoded)
+                    episode_agg_tensor = torch.stack(episode_agg_values)
 
-                # Flatten and prepare buffers for PPO (all tensors stay on GPU)
-                # Note: Buffers always contain tensors now (converted during collection)
-                all_states = torch.cat(states_buffer, dim=0)
-                all_actions = torch.cat(actions_buffer, dim=0)
-                all_log_probs = torch.cat(log_probs_buffer, dim=0)
-                all_old_values = torch.cat(values_buffer, dim=0)
-                
-                # Returns and advantages from compute_gae (always tensors now)
-                all_returns = returns.flatten()
-                all_advantages = advantages.flatten()
-                
-                if v:
-                    _vprint(f"   [DEBUG] Rewards: mean={torch.cat(rewards_buffer).mean():.4f}, std={torch.cat(rewards_buffer).std():.4f}", v)
-                    _vprint(f"   [DEBUG] Advantages: mean={all_advantages.mean():.4f}, std={all_advantages.std():.4f}", v)
-                    _vprint(f"   [DEBUG] Returns: mean={all_returns.mean():.4f}, std={all_returns.std():.4f}", v)
-                
-                # Normalize advantages
-                all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
-                
+                    # Reshape pre-allocated buffers (no torch.cat needed!)
+                    # states_buf is (steps, envs, C, H, W) -> flatten to (steps*envs, C, H, W)
+                    batch_size = cfg.steps_per_env * cfg.n_envs
+                    all_states = states_buf.reshape(batch_size, -1, self.vec_env.view_size, self.vec_env.view_size).float()
+                    all_actions = actions_buf.flatten()
+                    all_log_probs = log_probs_buf.flatten()
+                    all_old_values = values_buf.flatten()
+
+                    # Returns and advantages from compute_gae
+                    all_returns = returns.flatten()
+                    all_advantages = advantages.flatten()
+
+                    if v:
+                        _vprint(f"   [DEBUG] Rewards: mean={rewards_buf.mean():.4f}, std={rewards_buf.std():.4f}", v)
+                        _vprint(f"   [DEBUG] Advantages: mean={all_advantages.mean():.4f}, std={all_advantages.std():.4f}", v)
+                        _vprint(f"   [DEBUG] Returns: mean={all_returns.mean():.4f}, std={all_returns.std():.4f}", v)
+
+                    # Normalize advantages
+                    all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
+
                 # PPO update - tensors go in directly, no CPU sync needed
-                policy_loss, value_loss, entropy, explained_var = ppo_update(
-                    self.policy, self.value_head, self.optimizer,
-                    all_states, all_actions, all_log_probs,
-                    all_returns, all_advantages, all_old_values,
-                    self.device,
-                    eps_clip=cfg.eps_clip,
-                    k_epochs=cfg.k_epochs,
-                    entropy_coef=cfg.entropy_coef,
-                    value_coef=cfg.value_coef,
-                    n_minibatches=cfg.n_minibatches,
-                    scaler=self.scaler,
+                with record_function("PPO_UPDATE"):
+                    policy_loss, value_loss, entropy, explained_var = ppo_update(
+                        self.policy, self.value_head, self.optimizer,
+                        all_states, all_actions, all_log_probs,
+                        all_returns, all_advantages, all_old_values,
+                        self.device,
+                        eps_clip=cfg.eps_clip,
+                        k_epochs=cfg.k_epochs,
+                        entropy_coef=cfg.entropy_coef,
+                        value_coef=cfg.value_coef,
+                        n_minibatches=cfg.n_minibatches,
+                        scaler=self.scaler,
                     verbose=True,
                 )
                 # Clear progress line
@@ -936,7 +1005,7 @@ class PPOTrainer:
                     action_probs_gpu,             # n_actions values
                 ])
 
-                # ONE transfer - all metrics in single tensor
+                # ONE transfer - all metrics in single tensor (sync point)
                 cpu_metrics = metrics_values.cpu().numpy()
 
                 # Unpack using registry (action_probs are the tail)
