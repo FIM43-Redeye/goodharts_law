@@ -86,8 +86,8 @@ freeze_energy = true # If true, agent energy stays constant (for visualization)
 # cuDNN benchmark mode - runs algorithm selection to find fastest kernels
 # ON: ~3% faster training, but 60-300s startup (NVIDIA caches well, AMD doesn't)
 # OFF: Fast startup (~4s), slightly slower training
-# Default OFF because MIOpen (AMD) doesn't cache across processes
-cudnn_benchmark = false
+# Default ON because we detect AMD issues and abort cuDNN benching
+cudnn_benchmark = true
 
 
 # =============================================================================
@@ -135,7 +135,7 @@ lr_decay = false            # Enable learning rate decay over training
 lr_decay_factor = 0.1       # Final LR = initial_lr * factor (if lr_decay enabled)
 
 # Validation (periodic eval without exploration)
-validation_interval = 8       # Run every N PPO updates (0 = disabled)
+validation_interval = 0       # Run every N PPO updates (disabled by default for speed)
 validation_episodes = 16      # Episodes per validation run
 validation_mode = "training"  # "training" = same env, "fixed" = controlled density
 validation_food = 100         # Fixed mode: food count

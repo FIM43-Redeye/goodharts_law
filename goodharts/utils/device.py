@@ -430,33 +430,55 @@ def apply_system_optimizations(device: torch.device = None, verbose: bool = True
                     # Fallback or specific error handling if needed, but usually safe
                     print(f"   Note: Failed to set float32_matmul_precision: {e}")
             
-            # 2. cuDNN benchmark mode
+            # 2. cuDNN/MIOpen benchmark mode
             # Runs algorithm selection to find fastest kernels for this hardware/input size.
-            # NVIDIA cuDNN caches results well; AMD MIOpen doesn't cache across processes.
-            # Config default is OFF for fast startup (~4s vs 60-300s), with ~3% throughput cost.
+            #
+            # NVIDIA cuDNN: Caches results across processes. Safe to enable.
+            # AMD MIOpen: Cache is broken - doesn't persist across processes due to a bug
+            #   where InvokerCache (in-memory only) is checked before using find-db.
+            #   See: https://github.com/ROCm/rocm-libraries/issues/3553
+            #   Result: 60-300s startup PER PROCESS with benchmark=True.
+            #   Workaround: Force benchmark=False on AMD (~3% throughput cost, 66x faster startup)
             if torch.backends.cudnn.is_available():
-                # Priority: env var > config > default (False)
-                env_val = os.environ.get('GOODHARTS_CUDNN_BENCHMARK', '').lower()
-                if env_val in ('0', 'false', 'off'):
-                    torch.backends.cudnn.benchmark = False
-                    if verbose:
-                        print("   Performance: cuDNN benchmark disabled (via env)")
-                elif env_val in ('1', 'true', 'on'):
-                    torch.backends.cudnn.benchmark = True
-                    if verbose:
-                        print("   Performance: cuDNN benchmark enabled (via env)")
-                else:
-                    # Read from config
-                    try:
-                        from goodharts.config import get_runtime_config
-                        runtime_cfg = get_runtime_config()
-                        cudnn_benchmark = runtime_cfg.get('cudnn_benchmark', False)
-                    except Exception:
-                        cudnn_benchmark = False  # Safe default
+                # Detect MIOpen (AMD ROCm) vs cuDNN (NVIDIA)
+                is_miopen = hasattr(torch.version, 'hip') and torch.version.hip is not None
 
-                    torch.backends.cudnn.benchmark = cudnn_benchmark
-                    if verbose:
-                        status = "enabled" if cudnn_benchmark else "disabled"
-                        print(f"   Performance: cuDNN benchmark {status}")
+                if is_miopen:
+                    # Force-disable on AMD due to MIOpen cache bug
+                    # User can still override with env var if they want slow startup
+                    env_val = os.environ.get('GOODHARTS_CUDNN_BENCHMARK', '').lower()
+                    if env_val in ('1', 'true', 'on'):
+                        torch.backends.cudnn.benchmark = True
+                        if verbose:
+                            print("   Performance: MIOpen benchmark ENABLED (via env override)")
+                            print("   Warning: This causes 60-300s startup due to MIOpen cache bug")
+                    else:
+                        torch.backends.cudnn.benchmark = False
+                        if verbose:
+                            print("   Performance: MIOpen benchmark disabled (AMD workaround)")
+                else:
+                    # NVIDIA cuDNN - respect user config
+                    env_val = os.environ.get('GOODHARTS_CUDNN_BENCHMARK', '').lower()
+                    if env_val in ('0', 'false', 'off'):
+                        torch.backends.cudnn.benchmark = False
+                        if verbose:
+                            print("   Performance: cuDNN benchmark disabled (via env)")
+                    elif env_val in ('1', 'true', 'on'):
+                        torch.backends.cudnn.benchmark = True
+                        if verbose:
+                            print("   Performance: cuDNN benchmark enabled (via env)")
+                    else:
+                        # Read from config - default True for NVIDIA
+                        try:
+                            from goodharts.config import get_runtime_config
+                            runtime_cfg = get_runtime_config()
+                            cudnn_benchmark = runtime_cfg.get('cudnn_benchmark', True)
+                        except Exception:
+                            cudnn_benchmark = True  # Safe default for NVIDIA
+
+                        torch.backends.cudnn.benchmark = cudnn_benchmark
+                        if verbose:
+                            status = "enabled" if cudnn_benchmark else "disabled"
+                            print(f"   Performance: cuDNN benchmark {status}")
         
         _optimizations_applied = True

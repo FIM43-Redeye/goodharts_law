@@ -3,6 +3,13 @@
 # You can check https://hub.docker.com/r/rocm/pytorch/tags for updates.
 FROM rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.9.1
 
+# IMPORTANT: MIOpen (AMD's cuDNN) has a cache bug that causes 60-300s startup
+# when cudnn.benchmark=True. The find-db cache exists but InvokerCache (in-memory
+# only) isn't found, triggering full re-benchmarking every process start.
+# See: https://github.com/ROCm/rocm-libraries/issues/3553
+# Workaround: goodharts/utils/device.py auto-detects MIOpen and disables benchmark.
+# Cost: ~3% throughput. Benefit: 66x faster startup (4s vs 280s).
+
 # Set the working directory
 WORKDIR /app
 
