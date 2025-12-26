@@ -16,7 +16,10 @@ Usage:
 from .models import ValueHead, Profiler
 from goodharts.modes import RewardComputer
 from .algorithms import compute_gae, ppo_update
-from .trainer import PPOTrainer, PPOConfig
+from .trainer import (
+    PPOTrainer, PPOConfig,
+    request_abort, clear_abort, is_abort_requested, reset_training_state
+)
 
 __all__ = [
     # Models
@@ -30,4 +33,9 @@ __all__ = [
     # Trainer
     'PPOTrainer',
     'PPOConfig',
+    # Abort control
+    'request_abort',
+    'clear_abort',
+    'is_abort_requested',
+    'reset_training_state',
 ]
