@@ -186,13 +186,15 @@ class TorchVecEnv:
         self._max_items_per_grid = max(food_max, poison_max, 1)
     
     def reset(self, env_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Reset environments and return observations."""
+        """Reset environments and return observations.
+
+        When env_ids is None, resets all environments using vectorized ops (ZERO sync).
+        When env_ids is provided, resets only specified envs (used for partial resets).
+        """
         if env_ids is None:
-            # Reset all - this path is only at initialization
-            for grid_id in range(self.n_grids):
-                self._reset_grid(grid_id)
-            for env_id in range(self.n_envs):
-                self._reset_agent(env_id)
+            # Reset all - use fully vectorized path (ZERO GPU sync)
+            self._reset_all_grids_vectorized()
+            self._reset_all_agents_vectorized()
         else:
             # Reset specific envs - called during training when episodes end
             # Single sync to get Python-iterable env IDs
@@ -235,7 +237,83 @@ class TorchVecEnv:
         # Place items (accepts tensor counts)
         self._place_items(grid_id, self.CellType.FOOD.value, food_count)
         self._place_items(grid_id, self.CellType.POISON.value, poison_count)
-    
+
+    def _reset_all_grids_vectorized(self):
+        """Reset all grids in a single batched operation - ZERO GPU sync.
+
+        Clears all grids, generates random item counts, and places items
+        on all grids simultaneously using vectorized operations.
+        """
+        N = self.n_grids
+
+        # Clear all grids at once
+        self.grids.fill_(self.CellType.EMPTY.value)
+
+        # Generate random counts for all grids at once
+        self.grid_food_counts = torch.randint(
+            self.food_range[0], self.food_range[1] + 1,
+            (N,), dtype=torch.int32, device=self.device
+        )
+        self.grid_poison_counts = torch.randint(
+            self.poison_range[0], self.poison_range[1] + 1,
+            (N,), dtype=torch.int32, device=self.device
+        )
+
+        # Place food on all grids
+        self._place_items_all_grids(self.CellType.FOOD.value, self.grid_food_counts)
+
+        # Place poison on all grids
+        self._place_items_all_grids(self.CellType.POISON.value, self.grid_poison_counts)
+
+    def _place_items_all_grids(self, cell_type: int, counts: torch.Tensor):
+        """Place items on all grids simultaneously - ZERO GPU sync.
+
+        Uses batched topk on masked random noise to select random empty cells
+        across all grids in a single operation.
+
+        Args:
+            cell_type: Cell type value to place
+            counts: (N,) tensor of item counts per grid
+        """
+        N = self.n_grids
+        H, W = self.height, self.width
+        max_k = self._max_items_per_grid
+
+        # Generate random noise for all grids: (N, H, W)
+        noise = torch.rand(N, H, W, device=self.device)
+
+        # Mask non-empty cells to -inf so they can't be selected
+        empty_mask = (self.grids == self.CellType.EMPTY.value)
+        masked_noise = torch.where(empty_mask, noise, self._neg_inf)
+
+        # Get top max_k candidates for each grid: (N, max_k)
+        flat_noise = masked_noise.view(N, -1)
+        _, top_indices = torch.topk(flat_noise, k=max_k, largest=True, dim=1)
+
+        # Convert to grid coordinates
+        chosen_y = top_indices // W  # (N, max_k)
+        chosen_x = top_indices % W   # (N, max_k)
+
+        # Create position mask: only first count[i] positions valid for grid i
+        position_idx = torch.arange(max_k, device=self.device).unsqueeze(0)  # (1, max_k)
+        valid_mask = position_idx < counts.unsqueeze(1)  # (N, max_k)
+
+        # Prepare grid indices for advanced indexing
+        grid_ids = torch.arange(N, device=self.device).unsqueeze(1).expand(-1, max_k)
+
+        # Read current values, compute new, write back (masked write pattern)
+        current_vals = self.grids[grid_ids, chosen_y, chosen_x]
+        new_vals = torch.where(valid_mask, float(cell_type), current_vals)
+        self.grids[grid_ids, chosen_y, chosen_x] = new_vals
+
+    def _reset_all_agents_vectorized(self):
+        """Reset all agents using the masked reset path - ZERO GPU sync.
+
+        Calls _reset_agents_masked with an all-True mask to reset every agent.
+        """
+        all_done = torch.ones(self.n_envs, dtype=torch.bool, device=self.device)
+        self._reset_agents_masked(all_done)
+
     def _reset_agent(self, env_id: int):
         """Reset a single agent's state and mark on grid.
 
@@ -638,61 +716,43 @@ class TorchVecEnv:
     
     def _respawn_items_vectorized(self, eaten_mask: torch.Tensor, cell_type: int):
         """
-        Fully vectorized respawn - shape-static-ish (masked) to avoid ghosts.
-        Uses nonzero() for writing but avoids CPU syncs (no shape checks).
+        Fully masked respawn - ZERO GPU sync.
+
+        Uses torch.where everywhere instead of nonzero indexing.
+        Runs operations on ALL envs but only applies changes where mask is True.
+        No .any(), .nonzero(), or data-dependent shapes.
         """
-        # grid_ids: We use self.grid_indices directly (static shape N_envs)
         N = self.n_envs
-        K = 50  # Increased for 99.5%+ success rate even on dense grids
-        
-        # Generate K candidates for ALL envs: (N, K)
+        K = 50  # Candidates per env for 99.5%+ success rate
+
+        # Generate K random candidates for ALL envs: (N, K)
         rand_y = torch.randint(0, self.height, (N, K), device=self.device)
         rand_x = torch.randint(0, self.width, (N, K), device=self.device)
-        
-        # Check candidates
-        grid_read_ids = self.grid_indices.unsqueeze(1)
-        vals = self.grids[grid_read_ids, rand_y, rand_x]
-        
-        # Find valid (empty) spots
+
+        # Check which candidates are empty
+        grid_read_ids = self.grid_indices.unsqueeze(1)  # (N, 1)
+        vals = self.grids[grid_read_ids, rand_y, rand_x]  # (N, K)
         is_empty = (vals == self.CellType.EMPTY.value)  # (N, K) bool
-        
+
         # Select first valid candidate (argmax returns index of first True)
-        first_valid_idx = is_empty.int().argmax(dim=1)  # (N,) indices in [0, K-1]
-        
-        # Check validity (did we find ANY?)
-        # Efficient check: gather the value at the chosen index
-        range_n = torch.arange(N, device=self.device)
-        
+        first_valid_idx = is_empty.int().argmax(dim=1)  # (N,)
+
         # Extract chosen coords
-        chosen_y = rand_y[range_n, first_valid_idx]
-        chosen_x = rand_x[range_n, first_valid_idx]
-        
-        # Verify if the chosen candidate is valid
-        # We need to re-check 'is_empty' at the chosen index
-        # Or implicitly: has_valid = is_empty.any(dim=1)
-        has_valid = is_empty.any(dim=1) # (N,) bool
-        
-        # FINAL WRITE MASK
-        # We write IF:
-        # 1. It was eaten (eaten_mask)
-        # 2. We found a valid spot (has_valid)
-        do_write = eaten_mask & has_valid
-        
-        # Sync-free Write:
-        # Use nonzero() to get indices, but DO NOT READ size on CPU.
-        # Just use the result for advanced indexing.
-        # This keeps execution on GPU.
-        
-        write_indices = do_write.nonzero(as_tuple=True)[0]
-        
-        # Advanced indexing with tensors filter writes to only valid items
-        # grids[grid_ids[idx], y[idx], x[idx]] = val
-        
-        target_grids = self.grid_indices[write_indices]
-        target_y = chosen_y[write_indices]
-        target_x = chosen_x[write_indices]
-        
-        self.grids[target_grids, target_y, target_x] = float(cell_type)
+        range_n = torch.arange(N, device=self.device)
+        chosen_y = rand_y[range_n, first_valid_idx]  # (N,)
+        chosen_x = rand_x[range_n, first_valid_idx]  # (N,)
+
+        # Check if the chosen spot is actually valid (avoids .any() which can sync)
+        chosen_is_valid = is_empty[range_n, first_valid_idx]  # (N,) bool
+
+        # Final write mask: item was eaten AND we found a valid respawn spot
+        do_write = eaten_mask & chosen_is_valid  # (N,) bool
+
+        # MASKED WRITE: read current values, compute new, write back
+        # This writes to ALL positions but only changes where do_write=True
+        current_vals = self.grids[self.grid_indices, chosen_y, chosen_x]
+        new_vals = torch.where(do_write, float(cell_type), current_vals)
+        self.grids[self.grid_indices, chosen_y, chosen_x] = new_vals
     
     def _get_observations(self) -> torch.Tensor:
         """Get batched observations (fully vectorized on GPU).

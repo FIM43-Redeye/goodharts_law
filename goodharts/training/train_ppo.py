@@ -350,13 +350,15 @@ def _run_with_profiling(mode: str, overrides: dict, n_updates: int):
             return True
 
         if update_count == warmup_updates:
-            # Start profiler now
+            # Start profiler now - absolute minimal overhead settings
             print(f"   [Warmup complete - starting profiler]")
             state['profiler'] = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                record_shapes=True,
-                profile_memory=False,  # Reduce overhead
-                with_stack=False,      # Reduce overhead
+                activities=[ProfilerActivity.CUDA],  # GPU only, skip CPU
+                record_shapes=False,    # Skip shape recording
+                profile_memory=False,   # Skip memory tracking
+                with_stack=False,       # Skip Python stack traces
+                with_flops=False,       # Skip FLOP counting
+                with_modules=False,     # Skip module hierarchy
             )
             state['profiler'].__enter__()
             state['started'] = True

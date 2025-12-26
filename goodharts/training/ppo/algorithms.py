@@ -11,9 +11,9 @@ from torch.distributions import Categorical
 
 
 def compute_gae(
-    rewards: list[torch.Tensor],
-    values: list[torch.Tensor],
-    dones: list[torch.Tensor],
+    rewards: torch.Tensor | list[torch.Tensor],
+    values: torch.Tensor | list[torch.Tensor],
+    dones: torch.Tensor | list[torch.Tensor],
     next_value: torch.Tensor,
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
@@ -21,29 +21,32 @@ def compute_gae(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute Generalized Advantage Estimation (GAE).
-    
-    Optimized: Pre-stacks lists into tensors to minimize Python overhead.
-    The recurrence relation still requires sequential processing, but now
-    operates on GPU tensors directly with minimal Python interpreter overhead.
-    
+
+    Accepts either pre-allocated tensors (T, n_envs) or lists of tensors.
+    Using tensors directly avoids torch.stack overhead.
+
     Args:
-        rewards: List of reward tensors, shape [(n_envs,), ...] length T
-        values: List of value tensors, shape [(n_envs,), ...] length T
-        dones: List of done flag tensors, shape [(n_envs,), ...] length T
+        rewards: Tensor (T, n_envs) or list of (n_envs,) tensors
+        values: Tensor (T, n_envs) or list of (n_envs,) tensors
+        dones: Tensor (T, n_envs) or list of (n_envs,) tensors
         next_value: Bootstrap value for final state, shape (n_envs,)
         gamma: Discount factor
         gae_lambda: GAE lambda parameter
         device: Torch device (inferred from rewards if not provided)
-        
+
     Returns:
         advantages: Shape (T, n_envs)
         returns: Shape (T, n_envs)
     """
-    # Stack lists into tensors (moves all data to contiguous GPU memory)
-    # Shape: (T, n_envs) for all
-    rewards_t = torch.stack(rewards)      # (T, n_envs)
-    values_t = torch.stack(values)        # (T, n_envs)
-    dones_t = torch.stack(dones).float()  # (T, n_envs)
+    # Accept either pre-stacked tensors or lists (for backwards compatibility)
+    if isinstance(rewards, list):
+        rewards_t = torch.stack(rewards)      # (T, n_envs)
+        values_t = torch.stack(values)        # (T, n_envs)
+        dones_t = torch.stack(dones).float()  # (T, n_envs)
+    else:
+        rewards_t = rewards
+        values_t = values
+        dones_t = dones.float() if dones.dtype == torch.bool else dones
     
     device = device or rewards_t.device
     T, n_envs = rewards_t.shape
