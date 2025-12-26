@@ -185,6 +185,8 @@ def main():
     utility = parser.add_argument_group('Utility')
     utility.add_argument('-b', '--benchmark', action='store_true',
                          help='Benchmark mode: measure throughput, discard model')
+    utility.add_argument('--profile-trace', type=int, metavar='N',
+                         help='Profile N updates and save trace to ./profile_trace/')
     utility.add_argument('--clean-cache', action='store_true',
                          help='Delete compilation cache before starting')
 
@@ -273,6 +275,14 @@ def main():
         # Default: log when training multiple modes
         log_to_file = len(modes_to_train) > 1
 
+    # Handle --profile-trace separately (requires special profiler setup)
+    if args.profile_trace:
+        if len(modes_to_train) > 1:
+            print("ERROR: --profile-trace only supports single mode. Use --mode <mode>")
+            sys.exit(1)
+        _run_with_profiling(modes_to_train[0], overrides, args.profile_trace)
+        return
+
     # Training execution
     try:
         if args.dashboard:
@@ -284,6 +294,119 @@ def main():
         reset_training_state()
  
  
+def _run_with_profiling(mode: str, overrides: dict, n_updates: int):
+    """
+    Run training with PyTorch profiler to capture GPU trace.
+
+    Runs warmup first, then profiles exactly n_updates and stops cleanly.
+    """
+    import torch
+    from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler
+    import shutil
+
+    # Clear old profile data
+    profile_dir = './profile_trace'
+    if os.path.exists(profile_dir):
+        shutil.rmtree(profile_dir)
+    os.makedirs(profile_dir, exist_ok=True)
+
+    # Configure for profiling: warmup + profiled updates
+    n_envs = overrides.get('n_envs', 192)
+    steps_per_env = 128
+    warmup_updates = 3  # Let JIT compile and stabilize
+    total_updates = warmup_updates + n_updates + 1  # +1 buffer
+    total_timesteps = total_updates * n_envs * steps_per_env
+
+    profile_overrides = {
+        **overrides,
+        'total_timesteps': total_timesteps,
+        'validation_interval': 0,  # Skip validation during profiling
+        'profile_enabled': False,  # Disable internal profiler (we use our own)
+    }
+
+    print(f"\n[Profile] Configuration:")
+    print(f"   Warmup: {warmup_updates} updates (not profiled)")
+    print(f"   Profile: {n_updates} updates")
+    print(f"   Output: {profile_dir}/")
+
+    # Create trainer
+    config = PPOConfig.from_config(mode=mode, **profile_overrides)
+    trainer = PPOTrainer(config, dashboard=None)
+
+    # Profiler state
+    profiler_state = {
+        'profiler': None,
+        'started': False,
+        'updates_profiled': 0,
+    }
+
+    def profiler_callback(update_count: int) -> bool:
+        """Called after each update. Returns False to stop training."""
+        state = profiler_state
+
+        if update_count < warmup_updates:
+            # Still warming up
+            print(f"   [Warmup {update_count}/{warmup_updates}]")
+            return True
+
+        if update_count == warmup_updates:
+            # Start profiler now
+            print(f"   [Warmup complete - starting profiler]")
+            state['profiler'] = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=False,  # Reduce overhead
+                with_stack=False,      # Reduce overhead
+            )
+            state['profiler'].__enter__()
+            state['started'] = True
+            return True
+
+        if state['started']:
+            state['updates_profiled'] += 1
+            print(f"   [Profiling {state['updates_profiled']}/{n_updates}]")
+
+            if state['updates_profiled'] >= n_updates:
+                # Done profiling - stop and save
+                print(f"   [Stopping profiler]")
+                state['profiler'].__exit__(None, None, None)
+
+                # Save trace
+                trace_path = os.path.join(profile_dir, 'trace.json')
+                state['profiler'].export_chrome_trace(trace_path)
+
+                # Print summary
+                print("\n" + "=" * 70)
+                print("KERNEL TIME SUMMARY (sorted by CUDA time)")
+                print("=" * 70)
+                print(state['profiler'].key_averages().table(
+                    sort_by="cuda_time_total", row_limit=30
+                ))
+
+                print(f"\n[Profile] Trace saved to {trace_path}")
+                print("[Profile] View with: Open chrome://tracing and load trace.json")
+                return False  # Stop training
+
+        return True
+
+    # Install callback and run
+    trainer._profiler_callback = profiler_callback
+
+    print("\n[Profile] Starting training...")
+    try:
+        trainer.train()
+    except Exception as e:
+        # Clean up profiler if it's still running
+        if profiler_state['started'] and profiler_state['profiler']:
+            try:
+                profiler_state['profiler'].__exit__(None, None, None)
+            except Exception:
+                pass
+        raise
+
+    print("\n[Profile] Done!")
+
+
 def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool, log_to_file: bool):
     """Run training with live dashboard in separate process."""
     from goodharts.training.train_dashboard import create_dashboard_process

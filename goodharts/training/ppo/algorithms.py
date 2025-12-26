@@ -114,13 +114,13 @@ def ppo_update(
 
     batch_size = states.shape[0]
     minibatch_size = batch_size // n_minibatches
-    
+
     # Track metrics on GPU to avoid sync during loop
     total_policy_loss = torch.tensor(0.0, device=device)
     total_value_loss = torch.tensor(0.0, device=device)
     total_entropy = torch.tensor(0.0, device=device)
     n_updates = 0
-    
+
     for epoch in range(k_epochs):
         # Shuffle indices for this epoch
         indices = torch.argsort(torch.rand(batch_size, device=device))
@@ -143,28 +143,37 @@ def ppo_update(
                 # Using interface method keeps this architecture-agnostic
                 features = policy.get_features(mb_states)
                 logits = policy.logits_from_features(features)
-                values = value_head(features).squeeze()
-                
+
                 dist = Categorical(logits=logits, validate_args=False)
                 new_log_probs = dist.log_prob(mb_actions)
                 entropy = dist.entropy()
-                
+
                 # Ratio and clipped surrogate
                 ratios = torch.exp(new_log_probs - mb_log_probs)
-                
+
                 surr1 = ratios * mb_advantages
                 surr2 = torch.clamp(ratios, 1 - eps_clip, 1 + eps_clip) * mb_advantages
-                
+
                 policy_loss = -torch.min(surr1, surr2).mean()
-                
+
                 # Value loss with clipping
-                v_clip = mb_old_values + torch.clamp(values - mb_old_values, -eps_clip, eps_clip)
-                v_loss1 = F.mse_loss(values, mb_returns)
-                v_loss2 = F.mse_loss(v_clip, mb_returns)
+                # Uniform interface: works for both ValueHead and PopArtValueHead
+                # PopArt normalizes values/targets; simple head passes through unchanged
+                values = value_head.get_training_value(features).squeeze()
+                target_returns, target_old_values = value_head.prepare_targets(
+                    mb_returns, mb_old_values
+                )
+
+                v_clip = target_old_values + torch.clamp(
+                    values - target_old_values, -eps_clip, eps_clip
+                )
+                v_loss1 = F.mse_loss(values, target_returns)
+                v_loss2 = F.mse_loss(v_clip, target_returns)
+
                 value_loss = torch.max(v_loss1, v_loss2)
-                    
+
                 entropy_bonus = entropy.mean()
-                
+
                 loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus
             
             # Backward pass

@@ -113,8 +113,8 @@ gae_lambda = 0.95           # GAE lambda (bias-variance tradeoff)
 eps_clip = 0.2              # PPO clipping parameter
 k_epochs = 4                # PPO epochs per update
 steps_per_env = 128         # Horizon length for PPO (critical for GAE)
-n_envs = 64                 # Number of parallel environments
-n_minibatches = 4           # Minibatches per epoch (fewer = faster but more VRAM)
+n_envs = 192                # Parallel envs (192 = less GPU burstiness than 64, fits 8GB VRAM)
+n_minibatches = 1           # 1 = full batch (max VRAM utilization, best for single GPU)
 value_coef = 0.5            # Value loss coefficient
 brain_type = "base_cnn"     # Neural network architecture
 
@@ -127,7 +127,7 @@ enable_shaping = true       # Enable/disable shaping rewards
 
 # Performance
 compile_models = true       # Enable torch.compile (JIT)
-use_amp = true              # Enable Automatic Mixed Precision (float16)
+use_amp = true              # Mixed precision (fp16) for 2x memory bandwidth
 
 # Long training run options
 checkpoint_interval = 0     # Save checkpoint every N updates (0 = disabled)
