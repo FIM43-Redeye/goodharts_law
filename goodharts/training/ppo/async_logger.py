@@ -21,16 +21,16 @@ class LogPayload:
     entropy: float
     explained_var: float
     action_probs: list  # Already computed as list[float]
-    
+
     # Metadata
     update_count: int
     total_steps: int
     best_reward: float
     mode: str
-    
+
     # Episode stats (already on CPU)
     episode_stats: Optional[dict]  # {'reward': float, 'food': int, 'poison': int}
-    
+
     # Profiler summary (string)
     profiler_summary: str
 
@@ -41,6 +41,15 @@ class LogPayload:
 
     # Validation metrics (optional, only present on validation runs)
     validation_metrics: Optional[dict] = None
+
+    # Episode aggregates (computed on GPU, only 5 floats transferred)
+    # Replaces per-episode arrays that caused serialization overhead
+    episodes_count: int = 0
+    reward_sum: float = 0.0
+    reward_min: float = 0.0
+    reward_max: float = 0.0
+    food_sum: int = 0
+    poison_sum: int = 0
 
 
 class AsyncLogger:
@@ -104,8 +113,10 @@ class AsyncLogger:
         if p.profiler_summary and p.profiler_summary != "No data":
             print(f"   [Profile] {p.profiler_summary}")
         
-        # File logging
+        # File logging - aggregates computed on GPU, passed directly (5 floats)
         if self.trainer_logger:
+            # Compute means from sums (avoid div-by-zero)
+            n = p.episodes_count if p.episodes_count > 0 else 1
             self.trainer_logger.log_update(
                 update_num=p.update_count,
                 total_steps=p.total_steps,
@@ -113,7 +124,13 @@ class AsyncLogger:
                 value_loss=p.value_loss,
                 entropy=p.entropy,
                 explained_variance=p.explained_var,
-                action_probs=p.action_probs
+                action_probs=p.action_probs,
+                episodes_count=p.episodes_count,
+                reward_mean=p.reward_sum / n,
+                reward_min=p.reward_min if p.episodes_count > 0 else 0.0,
+                reward_max=p.reward_max if p.episodes_count > 0 else 0.0,
+                food_mean=p.food_sum / n,
+                poison_mean=p.poison_sum / n,
             )
         
         # TensorBoard logging
