@@ -20,9 +20,10 @@ import argparse
 import signal
 import sys
 import threading
+from pathlib import Path
 
 from goodharts.modes import get_all_mode_names
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 from goodharts.config import get_training_config
 from goodharts.behaviors.brains import get_brain_names
 from goodharts.training.ppo import PPOTrainer, PPOConfig
@@ -116,7 +117,7 @@ def train_ppo(
 
 def main():
     """Main CLI entry point."""
-    config = get_config()
+    config = get_simulation_config()
     train_cfg = get_training_config()
     all_modes = get_all_mode_names(config)
     brain_names = get_brain_names()
@@ -180,6 +181,8 @@ def main():
                             help='Random seed for reproducibility')
     experiment.add_argument('--deterministic', action='store_true',
                             help='Full determinism (slower, for debugging)')
+    experiment.add_argument('--analyze', action='store_true',
+                            help='Run evaluation after training and generate comparison stats')
 
     # Utility
     utility = parser.add_argument_group('Utility')
@@ -293,6 +296,10 @@ def main():
             _run_with_dashboard(modes_to_train, overrides, args.sequential, log_to_file)
         else:
             _run_without_dashboard(modes_to_train, overrides, args.sequential, log_to_file)
+
+        # Post-training analysis if requested
+        if args.analyze and not is_abort_requested():
+            _run_post_training_analysis(modes_to_train)
     finally:
         # Always reset state on exit (clean or aborted)
         reset_training_state()
@@ -551,6 +558,47 @@ def _run_without_dashboard(modes_to_train: list, overrides: dict, sequential: bo
         # KeyboardInterrupt may still happen if signal handler hasn't run yet
         request_abort()
         print("\nTraining interrupted")
+
+
+def _run_post_training_analysis(modes_trained: list, n_episodes: int = 100):
+    """Run evaluation and comparison on trained models."""
+    print("\n" + "="*60)
+    print("POST-TRAINING ANALYSIS")
+    print("="*60)
+
+    try:
+        from goodharts.analysis.evaluate import evaluate_model
+        from goodharts.analysis.compare import compare_modes
+
+        all_results = {}
+        for mode in modes_trained:
+            model_path = f'models/ppo_{mode}.pth'
+            if Path(model_path).exists():
+                print(f"\n[Evaluate] Running {mode} ({n_episodes} episodes)...")
+                results = evaluate_model(mode, n_episodes=n_episodes, verbose=False)
+                all_results[mode] = results
+
+                # Quick summary
+                avg_food = sum(r.food_eaten for r in results) / len(results)
+                avg_poison = sum(r.poison_eaten for r in results) / len(results)
+                avg_efficiency = sum(r.efficiency for r in results) / len(results)
+                print(f"         Food: {avg_food:.1f}, Poison: {avg_poison:.1f}, Efficiency: {avg_efficiency:.2%}")
+            else:
+                print(f"\n[Evaluate] Skipping {mode} - model not found")
+
+        if len(all_results) >= 2:
+            print("\n[Compare] Generating comparison statistics...")
+            comparison = compare_modes(all_results)
+            print(f"         Goodhart Failure Index: {comparison.get('goodhart_failure_index', 'N/A')}")
+
+        print("\n" + "="*60)
+        print("ANALYSIS COMPLETE")
+        print("="*60)
+
+    except Exception as e:
+        print(f"\n[Analysis] Error during post-training analysis: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == '__main__':

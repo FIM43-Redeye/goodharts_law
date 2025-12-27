@@ -12,7 +12,7 @@ import torch.nn as nn
 
 from goodharts.behaviors.brains.base_cnn import BaseCNN
 from goodharts.behaviors.action_space import num_actions
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 from goodharts.modes import ObservationSpec
 
 
@@ -23,7 +23,7 @@ def device():
 
 @pytest.fixture
 def config():
-    return get_config()
+    return get_simulation_config()
 
 
 class TestCNNArchitecture:

@@ -12,12 +12,12 @@ import numpy as np
 def main():
     from goodharts.environments.torch_env import create_torch_vec_env
     from goodharts.modes import ObservationSpec
-    from goodharts.configs.default_config import get_config
+    from goodharts.configs.default_config import get_simulation_config
 
     device = torch.device('cuda')
     print(f"Device: {torch.cuda.get_device_name()}")
 
-    config = get_config()
+    config = get_simulation_config()
     obs_spec = ObservationSpec.for_mode('ground_truth', config)
 
     # Use many envs for parallel sampling

@@ -376,7 +376,7 @@ def analyze_model_attention(
         num_samples: Number of views to visualize
         show: If True, display plots interactively
     """
-    from goodharts.configs.default_config import get_config
+    from goodharts.configs.default_config import get_simulation_config
     from goodharts.environments import create_vec_env
     from goodharts.modes import ObservationSpec
 
@@ -386,7 +386,7 @@ def analyze_model_attention(
         print(f"Auto-detected model: {model_path}")
 
     if config is None:
-        config = get_config()
+        config = get_simulation_config()
 
     device = get_device()
 

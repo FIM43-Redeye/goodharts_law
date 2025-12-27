@@ -8,13 +8,13 @@ import torch
 
 from goodharts.environments.torch_env import create_torch_vec_env, TorchVecEnv
 from goodharts.modes import ObservationSpec
-from goodharts.configs.default_config import get_config, CellType
+from goodharts.configs.default_config import get_simulation_config, CellType
 from goodharts.behaviors.action_space import build_action_space, index_to_action
 
 
 @pytest.fixture
 def config():
-    cfg = get_config()
+    cfg = get_simulation_config()
     cfg['GRID_WIDTH'] = 20
     cfg['GRID_HEIGHT'] = 20
     cfg['GRID_FOOD_INIT'] = 20
@@ -25,7 +25,7 @@ def config():
 
 @pytest.fixture
 def looping_config():
-    cfg = get_config()
+    cfg = get_simulation_config()
     cfg['GRID_WIDTH'] = 20
     cfg['GRID_HEIGHT'] = 20
     cfg['GRID_FOOD_INIT'] = 20

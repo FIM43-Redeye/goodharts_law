@@ -12,7 +12,7 @@ import os
 
 from goodharts.behaviors.brains.base_cnn import BaseCNN
 from goodharts.modes import ObservationSpec
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 
 
 @pytest.fixture
@@ -22,7 +22,7 @@ def device():
 
 @pytest.fixture
 def config():
-    return get_config()
+    return get_simulation_config()
 
 
 @pytest.fixture

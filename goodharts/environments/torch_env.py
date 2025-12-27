@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from typing import Tuple, Optional
 
 from goodharts.modes import ObservationSpec
-from goodharts.configs.default_config import CellType, get_config
+from goodharts.configs.default_config import CellType, get_simulation_config
 from goodharts.config import get_training_config
 from goodharts.utils.device import get_device
 
@@ -73,7 +73,7 @@ class TorchVecEnv:
 
         # Get config - all values required from TOML
         if config is None:
-            config = get_config()
+            config = get_simulation_config()
         self.config = config
         train_cfg = get_training_config()
 
@@ -314,6 +314,62 @@ class TorchVecEnv:
         all_done = torch.ones(self.n_envs, dtype=torch.bool, device=self.device)
         self._reset_agents_masked(all_done)
 
+    def _random_empty_positions(
+        self,
+        grids: torch.Tensor,
+        k: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Select k random empty positions from each grid using noise-based selection.
+
+        This is the core GPU-native pattern for random position selection without
+        CPU-GPU synchronization. Uses argmax/topk on masked random noise.
+
+        Args:
+            grids: Grid tensor, shape (H, W) for single grid or (N, H, W) for batch
+            k: Number of positions to select per grid
+
+        Returns:
+            (y, x): Position tensors
+                - Single grid, k=1: scalar tensors
+                - Single grid, k>1: shape (k,)
+                - Batch, k=1: shape (N,)
+                - Batch, k>1: shape (N, k)
+        """
+        single_grid = grids.dim() == 2
+        if single_grid:
+            grids = grids.unsqueeze(0)
+
+        N, H, W = grids.shape
+
+        # Generate random noise for all cells
+        noise = torch.rand(N, H, W, device=self.device)
+
+        # Mask non-empty cells to -inf so they can't be chosen
+        empty_mask = (grids == self.CellType.EMPTY.value)
+        masked_noise = torch.where(empty_mask, noise, self._neg_inf)
+
+        # Flatten spatial dimensions for selection
+        flat_noise = masked_noise.view(N, -1)
+
+        if k == 1:
+            # Single position per grid: use argmax
+            flat_idx = flat_noise.argmax(dim=1)
+            y = (flat_idx // W).int()
+            x = (flat_idx % W).int()
+        else:
+            # Multiple positions per grid: use topk
+            _, top_indices = torch.topk(flat_noise, k=k, largest=True, dim=1)
+            y = (top_indices // W).int()
+            x = (top_indices % W).int()
+
+        # Squeeze back if single grid
+        if single_grid:
+            y = y.squeeze(0)
+            x = x.squeeze(0)
+
+        return y, x
+
     def _reset_agent(self, env_id: int):
         """Reset a single agent's state and mark on grid.
 
@@ -335,15 +391,8 @@ class TorchVecEnv:
             old_cell_value
         )
 
-        # Noise-based random selection (avoids .item() on randint result)
-        noise = torch.rand(self.height, self.width, device=self.device)
-        empty_mask = (self.grids[grid_id] == self.CellType.EMPTY.value)
-        masked_noise = torch.where(empty_mask, noise, self._neg_inf)
-
-        # Argmax finds the random empty cell
-        flat_idx = masked_noise.view(-1).argmax()
-        new_y = (flat_idx // self.width).int()
-        new_x = (flat_idx % self.width).int()
+        # Select random empty position
+        new_y, new_x = self._random_empty_positions(self.grids[grid_id])
 
         # Update position and mark on grid
         self.agent_y[env_id] = new_y
@@ -407,20 +456,13 @@ class TorchVecEnv:
         Args:
             env_id: Environment index (int or 0-d tensor)
 
-        Uses argmax on masked noise to avoid CPU-GPU sync. Still called
+        Uses _random_empty_positions to avoid CPU-GPU sync. Still called
         sequentially for shared_grid mode to prevent collisions.
         """
-        grid_id = self.grid_indices[env_id]  # Keep as tensor, no .item()
+        grid_id = self.grid_indices[env_id]
 
-        # Noise-based random selection (avoids .item() on randint result)
-        noise = torch.rand(self.height, self.width, device=self.device)
-        empty_mask = (self.grids[grid_id] == self.CellType.EMPTY.value)
-        masked_noise = torch.where(empty_mask, noise, self._neg_inf)
-
-        # Argmax finds the random empty cell
-        flat_idx = masked_noise.view(-1).argmax()
-        new_y = (flat_idx // self.width).int()
-        new_x = (flat_idx % self.width).int()
+        # Select random empty position
+        new_y, new_x = self._random_empty_positions(self.grids[grid_id])
 
         # Update position and mark on grid
         self.agent_y[env_id] = new_y
@@ -431,7 +473,7 @@ class TorchVecEnv:
     def _spawn_agents_vectorized(self, env_ids: torch.Tensor):
         """Fully vectorized spawn using noise-based random selection.
 
-        Uses argmax on masked noise to select random empty cells without
+        Uses _random_empty_positions to select random empty cells without
         any CPU-GPU synchronization. Each agent has its own grid, so
         spawns are independent and can be fully parallelized.
         """
@@ -441,23 +483,8 @@ class TorchVecEnv:
 
         grid_ids = self.grid_indices[env_ids]
 
-        # Generate random noise for all cells across all grids
-        noise = torch.rand(n_reset, self.height, self.width, device=self.device)
-
-        # Get empty masks for all grids at once
-        grids = self.grids[grid_ids]  # (n_reset, height, width)
-        empty_mask = (grids == self.CellType.EMPTY.value)
-
-        # Mask non-empty cells to -inf so they can't be chosen
-        masked_noise = torch.where(empty_mask, noise, self._neg_inf)
-
-        # Find argmax per grid (random empty cell due to uniform noise)
-        flat_noise = masked_noise.view(n_reset, -1)
-        flat_idx = flat_noise.argmax(dim=1)
-
-        # Convert flat index to (y, x) coordinates
-        new_y = (flat_idx // self.width).int()
-        new_x = (flat_idx % self.width).int()
+        # Select random empty positions for all agents
+        new_y, new_x = self._random_empty_positions(self.grids[grid_ids])
 
         # Update agent positions (vectorized)
         self.agent_y[env_ids] = new_y
@@ -531,21 +558,7 @@ class TorchVecEnv:
         )
 
         # Spawn new positions for ALL agents (cheap), only apply where done
-        # Generate random noise for all agents' grids
-        noise = torch.rand(self.n_envs, self.height, self.width, device=self.device)
-
-        # Get empty masks for all grids
-        grids = self.grids[grid_ids]  # (n_envs, height, width)
-        empty_mask = (grids == self.CellType.EMPTY.value)
-
-        # Mask non-empty cells
-        masked_noise = torch.where(empty_mask, noise, self._neg_inf)
-
-        # Find random empty cell for each agent
-        flat_noise = masked_noise.view(self.n_envs, -1)
-        flat_idx = flat_noise.argmax(dim=1)
-        new_y = (flat_idx // self.width).int()
-        new_x = (flat_idx % self.width).int()
+        new_y, new_x = self._random_empty_positions(self.grids[grid_ids])
 
         # Only update positions where done
         self.agent_y = torch.where(done_mask, new_y, self.agent_y)
@@ -572,7 +585,7 @@ class TorchVecEnv:
         """Place items at random empty positions using noise-based selection.
 
         Fully GPU-native: no .item(), .nonzero(), or .shape[] calls.
-        Uses topk on masked random noise to select random empty cells.
+        Uses _random_empty_positions with topk to select random empty cells.
 
         Args:
             grid_id: Grid index
@@ -582,20 +595,8 @@ class TorchVecEnv:
         # Determine max items we might place (for fixed-size topk)
         max_k = self._max_items_per_grid
 
-        # Generate random noise for all cells
-        noise = torch.rand(self.height, self.width, device=self.device)
-
-        # Mask non-empty cells to -inf so they can't be selected
-        empty_mask = (self.grids[grid_id] == self.CellType.EMPTY.value)
-        masked_noise = torch.where(empty_mask, noise, self._neg_inf)
-
-        # Get top max_k candidates (fixed k avoids sync)
-        flat_noise = masked_noise.view(-1)
-        _, top_indices = torch.topk(flat_noise, k=max_k, largest=True)
-
-        # Convert to grid coordinates
-        chosen_y = top_indices // self.width
-        chosen_x = top_indices % self.width
+        # Select random empty positions
+        chosen_y, chosen_x = self._random_empty_positions(self.grids[grid_id], k=max_k)
 
         # Create position mask: only first `count` positions are valid
         # This works with tensor count without sync (element-wise comparison)
@@ -608,12 +609,13 @@ class TorchVecEnv:
         # Use scatter to place items: write cell_type where valid, EMPTY where not
         # Since we're targeting empty cells, writing EMPTY is a no-op
         flat_grid = self.grids[grid_id].view(-1)
+        flat_indices = chosen_y * self.width + chosen_x
         scatter_values = torch.where(
             valid_mask,
             torch.tensor(cell_type, device=self.device, dtype=flat_grid.dtype),
             torch.tensor(self.CellType.EMPTY.value, device=self.device, dtype=flat_grid.dtype)
         ).expand(max_k)
-        flat_grid.scatter_(0, top_indices, scatter_values)
+        flat_grid.scatter_(0, flat_indices, scatter_values)
     
     def step(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Execute batched actions with proper grid updates."""

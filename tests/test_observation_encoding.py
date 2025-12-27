@@ -8,12 +8,12 @@ import torch
 
 from goodharts.environments.torch_env import create_torch_vec_env
 from goodharts.modes import ObservationSpec
-from goodharts.configs.default_config import get_config, CellType
+from goodharts.configs.default_config import get_simulation_config, CellType
 
 
 @pytest.fixture
 def config():
-    cfg = get_config()
+    cfg = get_simulation_config()
     cfg['GRID_WIDTH'] = 20
     cfg['GRID_HEIGHT'] = 20
     cfg['GRID_FOOD_INIT'] = 30

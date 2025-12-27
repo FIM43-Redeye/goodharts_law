@@ -2,7 +2,7 @@
 import torch
 import torch.nn.functional as F
 from goodharts.environments.torch_env import create_torch_vec_env
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 from goodharts.config import get_training_config
 from goodharts.modes import ObservationSpec
 
@@ -11,7 +11,7 @@ def debug_drive():
     print(f"Using device: {device}")
     
     # Setup
-    sim_config = get_config()
+    sim_config = get_simulation_config()
     obs_spec = ObservationSpec.for_mode('ground_truth', sim_config)
     env = create_torch_vec_env(n_envs=1, obs_spec=obs_spec, device=device)
     

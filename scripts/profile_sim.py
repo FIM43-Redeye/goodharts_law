@@ -1,7 +1,7 @@
 import cProfile
 import pstats
 from goodharts.simulation import Simulation
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 from goodharts.utils.logging_config import setup_logging
 import logging
 
@@ -9,7 +9,7 @@ import logging
 setup_logging(level=logging.WARNING)
 
 def run_simulation_steps(steps=200):
-    config = get_config()
+    config = get_simulation_config()
     # Increase load for profiling
     config['AGENTS_SETUP'] = [
         {'behavior_class': 'OmniscientSeeker', 'count': 50},

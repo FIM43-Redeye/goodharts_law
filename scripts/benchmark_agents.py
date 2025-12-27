@@ -11,7 +11,7 @@ from pathlib import Path
 from torch.distributions import Categorical
 import torch.nn.functional as F
 
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 from goodharts.behaviors.brains import create_brain
 from goodharts.environments.torch_env import create_torch_vec_env
 from goodharts.utils.device import get_device
@@ -39,7 +39,7 @@ def benchmark(
     print(f"   Batch Size: {n_envs}")
     
     # Load config and spec
-    config = get_config()
+    config = get_simulation_config()
     try:
         spec = config['get_observation_spec'](mode)
     except Exception as e:

@@ -18,7 +18,7 @@ from torch.profiler import record_function
 from dataclasses import dataclass
 from typing import Optional
 
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 from goodharts.config import get_training_config
 from goodharts.utils.device import get_device, apply_system_optimizations, is_tpu, sync_device
 from goodharts.utils.seed import set_seed
@@ -1007,7 +1007,7 @@ class PPOTrainer:
         
         # Load configs
         _vprint("Loading configs...", v)
-        sim_config = get_config()
+        sim_config = get_simulation_config()
         train_cfg = get_training_config()
         
         # Observation spec
@@ -1903,6 +1903,31 @@ class PPOTrainer:
 
             if self.logger:
                 self.logger.finalize(best_efficiency=best_reward, final_model_path=cfg.output_path)
+
+                # Wire analysis infrastructure: generate research-ready output
+                try:
+                    from goodharts.training.train_log import analyze_training_log
+                    from goodharts.analysis.receiver import AnalysisReceiver
+
+                    analysis = analyze_training_log(self.logger.summary_path)
+                    receiver = AnalysisReceiver(output_dir=cfg.log_dir)
+                    receiver.receive(
+                        mode=cfg.mode,
+                        reward_stats={
+                            'best': best_reward,
+                            'final_mean': analysis['diagnostics'].get('avg_final_reward', 0.0),
+                        },
+                        episode_stats={
+                            'food_mean': analysis['diagnostics'].get('avg_final_food', 0.0),
+                            'poison_mean': analysis['diagnostics'].get('avg_final_poison', 0.0),
+                        },
+                        diagnostics=analysis['diagnostics'],
+                        issues=analysis['issues'],
+                        recommendations=analysis['recommendations'],
+                    )
+                except Exception as e:
+                    # Analysis is optional - don't fail training if it errors
+                    print(f"[Analysis] Warning: Could not generate analysis: {e}")
 
         # Close TensorBoard writer to flush all data
         if self.tb_writer:

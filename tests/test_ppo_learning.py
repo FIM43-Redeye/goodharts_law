@@ -9,7 +9,7 @@ from pathlib import Path
 from goodharts.training.ppo.trainer import PPOTrainer, PPOConfig
 from goodharts.behaviors.brains import create_brain
 from goodharts.environments.torch_env import create_torch_vec_env
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 
 
 class TestPPOLearning(unittest.TestCase):
@@ -172,7 +172,7 @@ class TestTorchEnv(unittest.TestCase):
             self.skipTest("Skipping TorchEnv tests: No CUDA device found")
         self.device = torch.device('cuda')
         self.n_envs = 4
-        self.config = get_config()
+        self.config = get_simulation_config()
         # Mock spec
         from goodharts.modes import ObservationSpec
         self.spec = ObservationSpec.for_mode('ground_truth', self.config)

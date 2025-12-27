@@ -22,6 +22,8 @@ from typing import Any
 import queue
 import time
 
+from goodharts.behaviors.action_space import get_action_labels, DISCRETE_8, create_action_space
+
 
 # Dashboard constants
 DASHBOARD_MAX_POINTS = 1024       # Maximum data points to display in graphs
@@ -329,7 +331,17 @@ class TrainingDashboard:
         ax.set_ylim(0, 0.6) # reasonable max prob
         ax.axhline(y=1.0/self.n_actions, color='gray', linestyle='--', alpha=0.3)
         
-        action_labels = ['↑', '↓', '←', '→', '↖', '↗', '↙', '↘'][:self.n_actions]
+        # Generate proper action labels from action space
+        if self.n_actions == 8:
+            action_labels = get_action_labels(DISCRETE_8)
+        else:
+            # For non-standard action counts, create temporary action space
+            action_space = create_action_space('discrete_grid', max_move_distance=1)
+            if action_space.n_outputs == self.n_actions:
+                action_labels = get_action_labels(action_space)
+            else:
+                action_labels = [str(i) for i in range(self.n_actions)]
+
         x = np.arange(self.n_actions)
         bars = ax.bar(x, np.zeros(self.n_actions), color='#00d9ff', alpha=0.7)
         ax.set_xticks(x)

@@ -8,7 +8,7 @@ import numpy as np
 import time
 from tabulate import tabulate
 
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 from goodharts.simulation import Simulation
 from goodharts.behaviors import (
     OmniscientSeeker, 
@@ -49,7 +49,7 @@ def run_survival_test(behavior_setup_func, behavior_name: str,
     start_time = time.time()
     
     for run in range(num_runs):
-        config = get_config()
+        config = get_simulation_config()
         
         # Override steps_per_episode to prevent auto-resets in VecEnv
         # VecEnv reads this from get_training_config() if not passed, BUT
@@ -142,7 +142,7 @@ def run_starvation_validity_test(runs: int = 2):
     steps = 1000 # Should be enough to starve given start energy 50 and decay 0.01
     
     for run in range(runs):
-        config = get_config()
+        config = get_simulation_config()
         config['GRID_FOOD_INIT'] = 0 # NO FOOD
         config['GRID_POISON_INIT'] = 0 # No poison to confuse things is safer, or keep it.
         config['ENERGY_START'] = 5.0 # Low start energy

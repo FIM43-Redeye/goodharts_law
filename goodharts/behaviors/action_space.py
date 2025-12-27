@@ -555,6 +555,75 @@ ACTIONS_8 = list(DISCRETE_8.actions)
 ACTION_LABELS_8 = ['↖', '←', '↙', '↑', '↓', '↗', '→', '↘']
 
 
+def get_direction_arrow(dx: int, dy: int) -> str:
+    """
+    Get arrow character for a direction.
+
+    Uses a lookup table for unit directions, falls back to
+    a composite representation for larger magnitudes.
+
+    Args:
+        dx, dy: Movement delta
+
+    Returns:
+        Arrow string like '→' or '2→' for magnitude 2
+    """
+    # Unit direction arrows (dy is inverted: -1 = up visually)
+    ARROWS = {
+        (-1, -1): '↖', (-1, 0): '←', (-1, 1): '↙',
+        (0, -1): '↑',               (0, 1): '↓',
+        (1, -1): '↗',  (1, 0): '→', (1, 1): '↘',
+        (0, 0): '·',
+    }
+
+    # For unit vectors, just return the arrow
+    if (dx, dy) in ARROWS:
+        return ARROWS[(dx, dy)]
+
+    # For larger magnitudes, normalize and prefix with magnitude
+    magnitude = max(abs(dx), abs(dy))
+    if magnitude == 0:
+        return '·'
+
+    unit_dx = dx // magnitude if dx != 0 else 0
+    unit_dy = dy // magnitude if dy != 0 else 0
+
+    arrow = ARROWS.get((unit_dx, unit_dy), '?')
+    return f"{magnitude}{arrow}"
+
+
+def get_action_labels(action_space: ActionSpace) -> list[str]:
+    """
+    Generate human-readable labels for all actions in an action space.
+
+    Works with any ActionSpace type:
+    - DiscreteGrid: labels each (dx, dy) action
+    - Factored: labels 8 directions + magnitude levels
+    - Continuous: returns ['dx', 'dy']
+
+    Args:
+        action_space: ActionSpace instance
+
+    Returns:
+        List of label strings, one per output
+    """
+    if isinstance(action_space, DiscreteGridActionSpace):
+        return [get_direction_arrow(dx, dy) for dx, dy in action_space.actions]
+
+    elif isinstance(action_space, FactoredActionSpace):
+        # 8 directions + M magnitudes
+        dir_labels = [get_direction_arrow(dx, dy) for dx, dy in FactoredActionSpace.DIRECTIONS]
+        mag_labels = [f"x{i+1}" for i in range(action_space.max_move_distance)]
+        return dir_labels + mag_labels
+
+    elif isinstance(action_space, ContinuousActionSpace):
+        return ['dx', 'dy']
+
+    else:
+        # Fallback: numeric indices
+        return [str(i) for i in range(action_space.n_outputs)]
+
+
 def index_to_action(idx: int, max_move_distance: int = 1) -> tuple[int, int]:
     """Legacy wrapper for DiscreteGridActionSpace.index_to_action."""
     space = DiscreteGridActionSpace(max_move_distance)

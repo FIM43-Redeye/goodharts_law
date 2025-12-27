@@ -1,14 +1,14 @@
 """Tests for CNN shape compatibility with various input sizes."""
 import torch
 
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 from goodharts.behaviors.brains.base_cnn import BaseCNN
 from goodharts.behaviors.action_space import num_actions
 
 
 def test_shapes():
     """Test that BaseCNN works with various input shapes."""
-    config = get_config()
+    config = get_simulation_config()
     obs_spec = config['get_observation_spec']('ground_truth')
     
     # Get dynamic values from config

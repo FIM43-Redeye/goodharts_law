@@ -5,8 +5,8 @@ import torch
 
 @pytest.fixture
 def config():
-    from goodharts.configs.default_config import get_config
-    cfg = get_config()
+    from goodharts.configs.default_config import get_simulation_config
+    cfg = get_simulation_config()
     # Smaller world for faster tests
     cfg['GRID_WIDTH'] = 20
     cfg['GRID_HEIGHT'] = 20

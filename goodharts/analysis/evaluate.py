@@ -16,7 +16,7 @@ from typing import Optional
 
 import torch
 
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 from goodharts.modes import get_all_mode_names, ObservationSpec
 from goodharts.environments.torch_env import create_torch_vec_env
 from goodharts.behaviors.brains import create_brain
@@ -56,7 +56,7 @@ def evaluate_model(
     Returns:
         List of EpisodeResult for each episode
     """
-    config = get_config()
+    config = get_simulation_config()
     device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Load model
@@ -179,7 +179,7 @@ def main():
                         help='Output CSV path')
     args = parser.parse_args()
     
-    config = get_config()
+    config = get_simulation_config()
     all_modes = get_all_mode_names(config)
     
     modes = all_modes if args.mode == 'all' else [args.mode]
