@@ -32,6 +32,62 @@ from .algorithms import compute_gae, ppo_update
 from .async_logger import AsyncLogger, LogPayload
 
 
+@dataclass
+class PendingMetrics:
+    """
+    Context for async metrics transfer.
+
+    GPU starts transfer, continues to next update. CPU processes this later.
+    By the time we need it (next update end), transfer finished long ago.
+
+    Episode data (n_episodes, reward_sum, etc.) is in the transferred tensor,
+    extracted in _process_pending_metrics after transfer completes.
+    """
+    n_metrics: int  # Length of metrics in pinned buffer
+    update_count: int
+    total_steps: int
+    sps_instant: float
+    sps_rolling: float
+    sps_global: float
+    profiler_summary: str
+    validation_metrics: Optional[dict]
+
+
+# =============================================================================
+# METRICS SCHEMA - Single source of truth for GPU->CPU metrics transfer
+# =============================================================================
+# Order matters! Pack on GPU in this order, unpack on CPU in same order.
+# To add a metric: add here, add to pack list, it unpacks automatically.
+
+METRICS_SCHEMA = [
+    # Episode aggregates (computed on GPU from finished episodes)
+    ('n_episodes', int),
+    ('reward_sum', float),
+    ('reward_min', float),
+    ('reward_max', float),
+    ('food_sum', int),
+    ('poison_sum', int),
+    # PPO training metrics
+    ('policy_loss', float),
+    ('value_loss', float),
+    ('entropy', float),
+    ('explained_var', float),
+    # Action probs follow (variable length, not in schema)
+]
+
+N_SCALAR_METRICS = len(METRICS_SCHEMA)
+
+
+def unpack_metrics(cpu_array) -> dict:
+    """Unpack transferred metrics according to schema."""
+    result = {}
+    for i, (name, dtype) in enumerate(METRICS_SCHEMA):
+        result[name] = dtype(cpu_array[i])
+    # Action probs are the tail
+    result['action_probs'] = cpu_array[N_SCALAR_METRICS:].tolist()
+    return result
+
+
 # Note: TORCHINDUCTOR_CACHE_DIR is set in train_ppo.py before torch is imported
 # This ensures the cache persists across runs
 
@@ -94,6 +150,7 @@ class PPOConfig:
     """
     mode: str = 'ground_truth'
     brain_type: str = 'base_cnn'
+    value_head_type: str = 'popart'  # 'simple' or 'popart'
     action_space_type: str = 'discrete_grid'
     max_move_distance: int = 1
     n_envs: int = 192  # Larger batches = less GPU burstiness
@@ -125,7 +182,7 @@ class PPOConfig:
     deterministic: bool = False  # Full determinism (slower)
 
     # Validation episodes (periodic eval without exploration)
-    validation_interval: int = 8     # Every N updates (0 = disabled)
+    validation_interval: int = 0     # Every N updates (0 = disabled)
     validation_episodes: int = 16     # Episodes per validation
     validation_mode: str = "training" # "training" or "fixed"
     validation_food: int = 100        # Fixed mode: food count
@@ -152,6 +209,7 @@ class PPOConfig:
         config_values = {
             'mode': mode,
             'brain_type': train_cfg.get('brain_type', 'base_cnn'),
+            'value_head_type': train_cfg.get('value_head_type', 'popart'),
             'action_space_type': train_cfg.get('action_space_type', 'discrete_grid'),
             'max_move_distance': train_cfg.get('max_move_distance', 1),
             'n_envs': train_cfg.get('n_envs', 64),
@@ -167,7 +225,7 @@ class PPOConfig:
             'use_amp': train_cfg.get('use_amp', False),
             'compile_models': train_cfg.get('compile_models', True),
             # Validation
-            'validation_interval': train_cfg.get('validation_interval', 8),
+            'validation_interval': train_cfg.get('validation_interval', 0),
             'validation_episodes': train_cfg.get('validation_episodes', 16),
             'validation_mode': train_cfg.get('validation_mode', 'training'),
             'validation_food': train_cfg.get('validation_food', 100),
@@ -528,7 +586,14 @@ class PPOTrainer:
         # Networks
         _vprint("Creating networks...", v)
         self.policy = create_brain(cfg.brain_type, self.spec, output_size=n_actions).to(self.device)
-        self.value_head = PopArtValueHead(input_size=self.policy.hidden_size).to(self.device)
+
+        # Value head - configurable between simple and PopArt
+        if cfg.value_head_type == 'popart':
+            self.value_head = PopArtValueHead(input_size=self.policy.hidden_size).to(self.device)
+        elif cfg.value_head_type == 'simple':
+            self.value_head = ValueHead(input_size=self.policy.hidden_size).to(self.device)
+        else:
+            raise ValueError(f"Unknown value_head_type: {cfg.value_head_type}. Use 'simple' or 'popart'.")
         # Store architecture info before potential torch.compile (for serialization)
         self._policy_arch_info = self.policy.get_architecture_info()
         _vprint("Networks created and moved to device", v)
@@ -684,7 +749,15 @@ class PPOTrainer:
         self._finished_dones_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
         self._finished_rewards_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
 
+        # Async metrics pipeline: GPU transfers to pinned memory while continuing work
+        # We process PREVIOUS update's metrics while GPU runs NEXT update
+        # 18 = 6 episode aggregates + 4 PPO metrics + 8 action probs (max)
+        self._metrics_pinned = torch.zeros(32, dtype=torch.float32, pin_memory=True)
+        self._metrics_event = None  # CUDA event for pending transfer
+        self._pending_log_data = None  # Metadata for pending metrics
+
         print(f"   Brain: {cfg.brain_type} (hidden={self.policy.hidden_size})")
+        print(f"   Value head: {cfg.value_head_type}")
         print(f"   AMP: {'Enabled' if cfg.use_amp else 'Disabled'}")
     
     def _training_loop(self):
@@ -760,14 +833,6 @@ class PPOTrainer:
             states = self.vec_env.reset()
             self.reward_computer.initialize(states)
             episode_rewards.zero_()
-
-        # Episode aggregation (per-update) - computed on GPU, only aggregates transferred
-        update_episodes_count = 0
-        update_reward_sum = 0.0
-        update_reward_min = float('inf')
-        update_reward_max = float('-inf')
-        update_food_sum = 0
-        update_poison_sum = 0
 
         step_in_update = 0
         self.start_time = time.perf_counter()
@@ -980,118 +1045,51 @@ class PPOTrainer:
                 elapsed = now - self.start_time
                 sps_global = self.total_steps / elapsed if elapsed > 0 else 0
 
-                # SINGLE SYNC POINT: Pack ALL metrics into one tensor, transfer once
-                # This keeps all CUDA ops on main thread; background thread only does I/O
-                #
-                # Metrics registry: define once, pack on GPU, unpack on CPU
-                # To add a metric: add key to list, add value to list (same index)
-                n_actions = last_logits.shape[1]
-                action_probs_gpu = F.softmax(last_logits, dim=1)[0]  # (n_actions,)
+                # ASYNC METRICS PIPELINE: Process PREVIOUS update, start CURRENT transfer
+                # GPU never waits for CPU. Transfer happens while next update runs.
 
-                metrics_keys = [
-                    # Episode aggregates (6 values)
-                    'n_episodes', 'reward_sum', 'reward_min', 'reward_max',
-                    'food_sum', 'poison_sum',
-                    # PPO metrics (4 values)
-                    'policy_loss', 'value_loss', 'entropy', 'explained_var',
-                    # Action probs will be unpacked separately (n_actions values)
-                ]
-                metrics_values = torch.cat([
-                    episode_agg_tensor,           # 6 values (already stacked)
-                    policy_loss.unsqueeze(0),     # 1 value
-                    value_loss.unsqueeze(0),      # 1 value
-                    entropy.unsqueeze(0),         # 1 value
-                    explained_var.unsqueeze(0),   # 1 value
-                    action_probs_gpu,             # n_actions values
-                ])
+                # 1. Process previous update's metrics (if any)
+                #    By now, transfer started 800ms ago - it's definitely done
+                self._process_pending_metrics()
 
-                # ONE transfer - all metrics in single tensor (sync point)
-                cpu_metrics = metrics_values.cpu().numpy()
-
-                # Unpack using registry (action_probs are the tail)
-                n_scalar_metrics = len(metrics_keys)
-                metrics = {k: cpu_metrics[i] for i, k in enumerate(metrics_keys)}
-                action_probs = cpu_metrics[n_scalar_metrics:].tolist()
-
-                # Extract for readability
-                policy_loss_f = float(metrics['policy_loss'])
-                value_loss_f = float(metrics['value_loss'])
-                entropy_f = float(metrics['entropy'])
-                explained_var_f = float(metrics['explained_var'])
-                agg = metrics  # Episode aggregates use same dict
-
-                n_episodes = int(agg['n_episodes'])
-                if n_episodes > 0:
-                    update_episodes_count += n_episodes
-                    update_reward_sum += float(agg['reward_sum'])
-                    # Handle inf values for min/max when there were episodes
-                    if agg['reward_min'] != float('inf'):
-                        update_reward_min = min(update_reward_min, float(agg['reward_min']))
-                    if agg['reward_max'] != float('-inf'):
-                        update_reward_max = max(update_reward_max, float(agg['reward_max']))
-                    update_food_sum += int(agg['food_sum'])
-                    update_poison_sum += int(agg['poison_sum'])
-
-                    if agg['reward_max'] > self.best_reward:
-                        self.best_reward = float(agg['reward_max'])
-
-                    self.episode_count += n_episodes
-
-                # Prepare episode stats (after sync so we have the data)
-                ep_stats = None
-                if update_episodes_count > 0:
-                    ep_stats = {
-                        'reward': update_reward_sum / update_episodes_count,
-                        'food': update_food_sum / update_episodes_count,
-                        'poison': update_poison_sum / update_episodes_count
-                    }
-
-                # Run validation episodes periodically
+                # 2. Run validation (must happen before we capture profiler summary)
                 val_metrics = None
                 if cfg.validation_interval > 0 and self.update_count % cfg.validation_interval == 0:
                     val_metrics = self._run_validation_episodes()
-                    # Validation with training env resets environment state.
-                    # Re-sync training loop state to avoid stale observations.
                     if cfg.validation_mode == "training":
                         states = self.vec_env.reset()
                         self.reward_computer.initialize(states)
                         episode_rewards.zero_()
-                
-                # ASYNC LOGGING - queue CPU data only, no GPU access in background
-                log_payload = LogPayload(
-                    policy_loss=policy_loss_f,
-                    value_loss=value_loss_f,
-                    entropy=entropy_f,
-                    explained_var=explained_var_f,
-                    action_probs=action_probs,
+
+                # 3. Pack metrics according to METRICS_SCHEMA (see module top)
+                #    Order MUST match schema for unpack_metrics to work correctly
+                action_probs_gpu = F.softmax(last_logits, dim=1)[0]
+
+                metrics_values = torch.cat([
+                    # METRICS_SCHEMA order: episode aggregates first, then PPO metrics
+                    episode_agg_tensor,           # n_episodes, reward_sum/min/max, food/poison
+                    policy_loss.unsqueeze(0),
+                    value_loss.unsqueeze(0),
+                    entropy.unsqueeze(0),
+                    explained_var.unsqueeze(0),
+                    action_probs_gpu,             # Variable length tail (not in schema)
+                ])
+
+                # 4. Start async transfer - GPU continues immediately to next update
+                #    profiler.summary() processes CUDA events (one sync) and returns timing
+                self._start_metrics_transfer(
+                    metrics_values=metrics_values,
                     update_count=self.update_count,
                     total_steps=self.total_steps,
-                    best_reward=self.best_reward,
-                    mode=cfg.mode,
-                    episode_stats=ep_stats,
-                    profiler_summary=self.profiler.summary(),
                     sps_instant=sps_instant,
                     sps_rolling=sps_rolling,
                     sps_global=sps_global,
+                    profiler_summary=self.profiler.summary(),
                     validation_metrics=val_metrics,
-                    # Episode aggregates (computed on GPU, 5 floats only)
-                    episodes_count=update_episodes_count,
-                    reward_sum=update_reward_sum,
-                    reward_min=update_reward_min if update_episodes_count > 0 else 0.0,
-                    reward_max=update_reward_max if update_episodes_count > 0 else 0.0,
-                    food_sum=update_food_sum,
-                    poison_sum=update_poison_sum,
                 )
-                self.async_logger.log_update(log_payload)
+
+                # 5. Reset profiler for next update (AFTER summary captured)
                 self.profiler.reset()
-                
-                # Reset episode aggregators
-                update_episodes_count = 0
-                update_reward_sum = 0.0
-                update_reward_min = float('inf')
-                update_reward_max = float('-inf')
-                update_food_sum = 0
-                update_poison_sum = 0
 
                 # Update timing reference AFTER all update work (including validation)
                 # This ensures validation time is charged to the update that runs it,
@@ -1126,7 +1124,111 @@ class PPOTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
         }, checkpoint_path)
         print(f"   Checkpoint saved: {checkpoint_path}")
-    
+
+    def _process_pending_metrics(self):
+        """
+        Process metrics from PREVIOUS update (if any).
+
+        Called at the start of each update cycle. By now, the async transfer
+        that started at the end of the previous update has long since completed
+        (transfer takes ~8ms, update takes ~800ms).
+        """
+        if self._metrics_event is None:
+            return  # No pending metrics (first update)
+
+        # Sync transfer (should be instant - finished 800ms ago)
+        self._metrics_event.synchronize()
+
+        # Unpack using schema (single source of truth)
+        pending = self._pending_log_data
+        cpu_array = self._metrics_pinned[:pending.n_metrics].numpy()
+        m = unpack_metrics(cpu_array)
+
+        # Update running totals (one update behind, nobody notices)
+        if m['n_episodes'] > 0:
+            if m['reward_max'] > self.best_reward:
+                self.best_reward = m['reward_max']
+            self.episode_count += m['n_episodes']
+
+        # Prepare episode stats
+        ep_stats = None
+        if m['n_episodes'] > 0:
+            ep_stats = {
+                'reward': m['reward_sum'] / m['n_episodes'],
+                'food': m['food_sum'] / m['n_episodes'],
+                'poison': m['poison_sum'] / m['n_episodes'],
+            }
+
+        # Queue to async logger
+        log_payload = LogPayload(
+            policy_loss=m['policy_loss'],
+            value_loss=m['value_loss'],
+            entropy=m['entropy'],
+            explained_var=m['explained_var'],
+            action_probs=m['action_probs'],
+            update_count=pending.update_count,
+            total_steps=pending.total_steps,
+            best_reward=self.best_reward,
+            mode=self.config.mode,
+            episode_stats=ep_stats,
+            profiler_summary=pending.profiler_summary,
+            sps_instant=pending.sps_instant,
+            sps_rolling=pending.sps_rolling,
+            sps_global=pending.sps_global,
+            validation_metrics=pending.validation_metrics,
+            episodes_count=m['n_episodes'],
+            reward_sum=m['reward_sum'],
+            reward_min=m['reward_min'] if m['n_episodes'] > 0 else 0.0,
+            reward_max=m['reward_max'] if m['n_episodes'] > 0 else 0.0,
+            food_sum=m['food_sum'],
+            poison_sum=m['poison_sum'],
+        )
+        self.async_logger.log_update(log_payload)
+
+        # Clear pending state
+        self._metrics_event = None
+        self._pending_log_data = None
+
+    def _start_metrics_transfer(
+        self,
+        metrics_values: torch.Tensor,
+        update_count: int,
+        total_steps: int,
+        sps_instant: float,
+        sps_rolling: float,
+        sps_global: float,
+        profiler_summary: str,
+        validation_metrics: Optional[dict],
+    ):
+        """
+        Start async transfer of metrics to CPU.
+
+        GPU continues immediately to next update. Transfer completes in background.
+        Processing happens at start of NEXT update (or at training end).
+
+        Metrics must be packed according to METRICS_SCHEMA order.
+        """
+        n_metrics = len(metrics_values)
+
+        # Copy to pinned buffer (non-blocking DMA transfer)
+        self._metrics_pinned[:n_metrics].copy_(metrics_values, non_blocking=True)
+
+        # Record event so we know when transfer completes
+        self._metrics_event = torch.cuda.Event()
+        self._metrics_event.record()
+
+        # Store context for later processing
+        self._pending_log_data = PendingMetrics(
+            n_metrics=n_metrics,
+            update_count=update_count,
+            total_steps=total_steps,
+            sps_instant=sps_instant,
+            sps_rolling=sps_rolling,
+            sps_global=sps_global,
+            profiler_summary=profiler_summary,
+            validation_metrics=validation_metrics,
+        )
+
     def _run_validation_episodes(self) -> dict:
         """
         Run deterministic validation episodes.
@@ -1213,6 +1315,9 @@ class PPOTrainer:
     def _finalize(self) -> dict:
         """Save final model and return summary."""
         cfg = self.config
+
+        # Flush any pending async metrics from last update
+        self._process_pending_metrics()
 
         # Calculate throughput (handle case where start_time wasn't set)
         elapsed = 0.0

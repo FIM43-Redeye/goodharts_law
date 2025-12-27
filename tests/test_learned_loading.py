@@ -22,10 +22,12 @@ def test_simulation_loads_learned_preset():
     config['AGENTS_SETUP'] = [
         {'behavior_class': 'ground_truth', 'count': 1}
     ]
-    # Reduce size
+    # Reduce size (must also reduce food/poison to fit in 10x10=100 cells)
     config['GRID_WIDTH'] = 10
     config['GRID_HEIGHT'] = 10
-    
+    config['GRID_FOOD_INIT'] = 10
+    config['GRID_POISON_INIT'] = 5
+
     sim = Simulation(config)
     assert len(sim.agents) == 1
     # Check that it loaded a LearnedBehavior
@@ -38,9 +40,12 @@ def test_simulation_loads_hardcoded():
     config['AGENTS_SETUP'] = [
         {'behavior_class': 'OmniscientSeeker', 'count': 1}
     ]
+    # Reduce size (must also reduce food/poison to fit in 10x10=100 cells)
     config['GRID_WIDTH'] = 10
     config['GRID_HEIGHT'] = 10
-    
+    config['GRID_FOOD_INIT'] = 10
+    config['GRID_POISON_INIT'] = 5
+
     sim = Simulation(config)
     assert len(sim.agents) == 1
     # Check type

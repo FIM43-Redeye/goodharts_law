@@ -149,8 +149,12 @@ class PopArtValueHead(nn.Module):
 
 class Profiler:
     """
-    Simple accumulated timer for profiling training loop components.
-    
+    GPU-friendly profiler using CUDA events for zero-sync timing.
+
+    Unlike naive profilers that call torch.cuda.synchronize() on every tick,
+    this records CUDA events (non-blocking) and only syncs when summary() is
+    called. This eliminates sync overhead from the hot training loop.
+
     Usage:
         profiler = Profiler(device)
         profiler.start()
@@ -158,48 +162,99 @@ class Profiler:
         profiler.tick("step_1")
         ... more work ...
         profiler.tick("step_2")
-        print(profiler.summary())
+        print(profiler.summary())  # Only sync happens here
+
+    For CPU-only runs, falls back to time.perf_counter().
     """
-    
+
     def __init__(self, device: torch.device = None, enabled: bool = True):
-        self.times: dict[str, float] = {}
-        self.counts: dict[str, int] = {}
-        self.last_t: float = 0
         self.enabled = enabled
         if device is None:
             device = get_device()
-        # Only synchronize if we are actually using a CUDA device
-        self.sync_cuda = (device.type == 'cuda')
+        self.use_cuda = (device.type == 'cuda')
+
+        # Accumulated times (filled on summary() from events)
+        self.times: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+
+        # CUDA event pairs: list of (name, start_event, end_event)
+        # We defer time computation until summary() to avoid sync
+        self._pending_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        self._last_event: torch.cuda.Event | None = None
+
+        # CPU fallback
+        self._last_cpu_t: float = 0.0
 
     def start(self):
-        """Start the timer (no sync - saves sync for tick())."""
-        # NOTE: No sync here! This is called every step, but we only need
-        # accurate timing at tick() boundaries. Syncing here causes massive
-        # overhead (261 syncs for 50k steps vs 5 syncs per update).
-        self.last_t = time.perf_counter()
+        """Mark the start of a timed region (non-blocking)."""
+        if not self.enabled:
+            return
+        if self.use_cuda:
+            self._last_event = torch.cuda.Event(enable_timing=True)
+            self._last_event.record()
+        else:
+            self._last_cpu_t = time.perf_counter()
 
     def tick(self, name: str):
-        """Record elapsed time since last tick under the given name."""
+        """Record elapsed time since last tick/start under the given name (non-blocking)."""
         if not self.enabled:
-            return  # No-op for production runs
-        if self.sync_cuda:
-            torch.cuda.synchronize()
-        now = time.perf_counter()
-        dt = now - self.last_t
-        self.times[name] = self.times.get(name, 0.0) + dt
-        self.counts[name] = self.counts.get(name, 0) + 1
-        self.last_t = now
-    
+            return
+
+        if self.use_cuda:
+            # Record end event for this section
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+
+            # Store the event pair for later processing
+            if self._last_event is not None:
+                self._pending_events.append((name, self._last_event, end_event))
+
+            # This end becomes next section's start
+            self._last_event = end_event
+        else:
+            # CPU path: immediate timing
+            now = time.perf_counter()
+            dt = now - self._last_cpu_t
+            self.times[name] = self.times.get(name, 0.0) + dt
+            self.counts[name] = self.counts.get(name, 0) + 1
+            self._last_cpu_t = now
+
     def reset(self):
-        """Clear all recorded times."""
+        """Clear all recorded times and pending events."""
         self.times = {}
         self.counts = {}
+        self._pending_events = []
+        self._last_event = None
 
     def summary(self) -> str:
-        """Return a formatted summary of profiled times."""
+        """
+        Compute and return a formatted summary of profiled times.
+
+        For CUDA: syncs once to resolve all pending event pairs, then computes
+        elapsed times. This is the ONLY sync point in the profiler.
+        """
+        if not self.enabled:
+            return "Profiling disabled"
+
+        # Process pending CUDA events (one sync for all)
+        if self.use_cuda and self._pending_events:
+            # Single sync to ensure all events are recorded
+            torch.cuda.synchronize()
+
+            # Compute elapsed times from event pairs
+            for name, start_evt, end_evt in self._pending_events:
+                # elapsed_time_ms returns milliseconds
+                dt = start_evt.elapsed_time(end_evt) / 1000.0  # Convert to seconds
+                self.times[name] = self.times.get(name, 0.0) + dt
+                self.counts[name] = self.counts.get(name, 0) + 1
+
+            # Clear processed events
+            self._pending_events = []
+
         total = sum(self.times.values())
         if total == 0:
             return "No data"
+
         parts = []
         # Sort by duration (descending)
         for k, v in sorted(self.times.items(), key=lambda x: x[1], reverse=True):
