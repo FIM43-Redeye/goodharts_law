@@ -7,6 +7,7 @@ Can be extended for multi-agent scenarios.
 import os
 import time
 import threading
+import queue
 import numpy as np
 import torch
 import torch.optim as optim
@@ -32,6 +33,153 @@ from .algorithms import compute_gae, ppo_update
 from .async_logger import AsyncLogger, LogPayload
 
 
+class GPUMonitor:
+    """
+    Background thread that logs GPU utilization at fixed intervals.
+
+    Uses sysfs (AMD, ~0.02ms) or nvidia-smi (NVIDIA) to sample GPU use %.
+    Starts after warmup, stops when training ends. Output is CSV with
+    millisecond timestamps for correlation with training events.
+    """
+
+    def __init__(self, interval_ms: int = 50, output_path: str = "gpu_utilization.csv"):
+        self.interval_ms = interval_ms
+        self.output_path = output_path
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._start_time_ms: int = 0
+        self._sysfs_path: Optional[str] = None  # Fast path for AMD
+        self._nvidia_cmd: Optional[list] = None  # Fallback for NVIDIA
+
+    def _detect_amd_card(self) -> Optional[str]:
+        """
+        Find the active AMD GPU's sysfs path by testing utilization.
+
+        Returns path like '/sys/class/drm/card1/device/gpu_busy_percent'
+        or None if not found.
+        """
+        import glob
+
+        candidates = glob.glob('/sys/class/drm/card*/device/gpu_busy_percent')
+        if not candidates:
+            return None
+
+        # If only one card, use it
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Multiple cards: find the one PyTorch is using by running a quick workload
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return None
+
+            # Baseline read
+            baseline = {}
+            for path in candidates:
+                with open(path) as f:
+                    baseline[path] = int(f.read().strip())
+
+            # Quick GPU work
+            x = torch.randn(1024, 1024, device='cuda')
+            for _ in range(20):
+                x = x @ x
+            torch.cuda.synchronize()
+
+            # Find which card spiked
+            for path in candidates:
+                with open(path) as f:
+                    now = int(f.read().strip())
+                if now > baseline[path] + 20:  # Significant increase
+                    return path
+
+            # Fallback: return first card with vendor 0x1002 (AMD)
+            for path in candidates:
+                vendor_path = os.path.join(os.path.dirname(path), 'vendor')
+                if os.path.exists(vendor_path):
+                    with open(vendor_path) as f:
+                        if '0x1002' in f.read():
+                            return path
+        except Exception:
+            pass
+
+        return candidates[0]  # Last resort
+
+    def start(self):
+        """Start the monitoring thread."""
+        import subprocess
+
+        # Try AMD sysfs first (fast: ~0.02ms per read)
+        self._sysfs_path = self._detect_amd_card()
+        if self._sysfs_path:
+            card = self._sysfs_path.split('/')[4]  # Extract 'card1' from path
+            print(f"   [GPUMonitor] Using sysfs ({card}) - {self.interval_ms}ms intervals")
+        else:
+            # Fallback to nvidia-smi (slower: ~5ms per read)
+            try:
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=2
+                )
+                if result.returncode == 0:
+                    self._nvidia_cmd = ["nvidia-smi", "--query-gpu=utilization.gpu",
+                                        "--format=csv,noheader,nounits"]
+                    print(f"   [GPUMonitor] Using nvidia-smi - {self.interval_ms}ms intervals")
+                else:
+                    print(f"   [GPUMonitor] No supported GPU monitoring found")
+                    return
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                print(f"   [GPUMonitor] No supported GPU monitoring found")
+                return
+
+        # Write CSV header
+        with open(self.output_path, 'w') as f:
+            f.write("timestamp_ms,gpu_use_pct\n")
+
+        self._start_time_ms = int(time.time() * 1000)
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._worker, daemon=True, name="GPUMonitor")
+        self._thread.start()
+
+    def stop(self):
+        """Stop the monitoring thread and wait for it to finish."""
+        if self._thread is None:
+            return
+        self._stop_event.set()
+        self._thread.join(timeout=2.0)
+        self._thread = None
+        print(f"   [GPUMonitor] Stopped")
+
+    def _worker(self):
+        """Background thread: samples GPU utilization."""
+        import subprocess
+
+        interval_s = self.interval_ms / 1000.0
+
+        with open(self.output_path, 'a') as f:
+            while not self._stop_event.is_set():
+                try:
+                    if self._sysfs_path:
+                        # Fast path: direct sysfs read (~0.02ms)
+                        with open(self._sysfs_path) as gpu_file:
+                            use_pct = int(gpu_file.read().strip())
+                    else:
+                        # NVIDIA fallback
+                        result = subprocess.run(
+                            self._nvidia_cmd, capture_output=True, text=True, timeout=1
+                        )
+                        use_pct = int(result.stdout.strip().split('\n')[0])
+
+                    elapsed_ms = int(time.time() * 1000) - self._start_time_ms
+                    f.write(f"{elapsed_ms},{use_pct}\n")
+                    f.flush()
+                except Exception:
+                    pass  # Skip failed samples
+
+                self._stop_event.wait(interval_s)
+
+
 @dataclass
 class PendingMetrics:
     """
@@ -51,6 +199,281 @@ class PendingMetrics:
     sps_global: float
     profiler_summary: str
     validation_metrics: Optional[dict]
+
+
+@dataclass
+class BookkeepingWork:
+    """
+    Work item for background bookkeeping thread.
+
+    Contains everything needed to process metrics without touching GPU.
+    All timing data is captured at submission time on main thread.
+    """
+    buffer_idx: int           # Which pinned buffer to read from (0 or 1)
+    n_metrics: int            # How many elements to read
+    update_count: int
+    total_steps: int
+    best_reward: float        # Current best (for updating)
+    mode: str
+    profiler_events: list     # CUDA event pairs for async profiler summary
+    profiler_enabled: bool    # Whether profiling is enabled
+    validation_metrics: Optional[dict]
+    # Timing data for SPS calculation (captured on main thread)
+    submit_time: float        # time.perf_counter() at submission
+    update_start_time: float  # When this update started
+    prev_update_steps: int    # Steps at end of previous update
+    training_start_time: float  # When training started (for global SPS)
+
+
+class BackgroundBookkeeper:
+    """
+    Processes metrics in background thread while main thread continues GPU work.
+
+    Uses double-buffered pinned memory to eliminate data races:
+    - Main thread writes to buffer A, signals "A ready"
+    - Background thread reads from A while main writes to B
+    - No locks needed - each buffer has exactly one owner at a time
+
+    This eliminates the ~10-20ms GPU idle time that occurred when the main
+    thread did bookkeeping between PPO updates.
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        async_logger,  # AsyncLogger instance
+        device: torch.device,
+    ):
+        self.async_logger = async_logger
+        self.device = device
+
+        # Double-buffered pinned memory
+        self.buffers = [
+            torch.empty(buffer_size, dtype=torch.float32, pin_memory=True),
+            torch.empty(buffer_size, dtype=torch.float32, pin_memory=True),
+        ]
+        self.events = [
+            torch.cuda.Event(),
+            torch.cuda.Event(),
+        ]
+        self.current_buffer = 0  # Which buffer main thread writes to
+
+        # Communication with background thread
+        self._work_queue: queue.Queue[Optional[BookkeepingWork]] = queue.Queue()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        # Buffer ownership: set = available to write, cleared = being read
+        # Main thread waits on buffer before writing, background sets after reading
+        # This prevents the race condition where main overwrites buffer being read
+        self.buffer_available = [threading.Event(), threading.Event()]
+        self.buffer_available[0].set()  # Buffer 0 initially free
+        self.buffer_available[1].set()  # Buffer 1 initially free
+
+        # Shared state (updated by background, read by main for display)
+        # These are updated atomically (single assignment) so no lock needed
+        self.best_reward = float('-inf')
+        self.episode_count = 0
+
+        # SPS tracking (background thread maintains rolling window)
+        self._sps_window: list[tuple[int, float]] = []  # (steps, time) pairs
+
+    @property
+    def pinned_buffer(self) -> torch.Tensor:
+        """Current buffer for main thread to write to."""
+        return self.buffers[self.current_buffer]
+
+    @property
+    def current_event(self) -> torch.cuda.Event:
+        """Current event for main thread to record."""
+        return self.events[self.current_buffer]
+
+    def start(self):
+        """Start background processing thread."""
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._worker, daemon=True, name="BackgroundBookkeeper"
+        )
+        self._thread.start()
+
+    def stop(self):
+        """Stop background thread, process remaining work."""
+        if self._thread is None:
+            return
+        self._work_queue.put(None)  # Sentinel
+        # Release any potentially blocked submit() to prevent deadlock
+        self.buffer_available[0].set()
+        self.buffer_available[1].set()
+        self._stop_event.set()
+        self._thread.join(timeout=2.0)
+        self._thread = None
+
+    def submit(
+        self,
+        gpu_tensor: torch.Tensor,
+        update_count: int,
+        total_steps: int,
+        best_reward: float,
+        mode: str,
+        profiler_events: list,
+        profiler_enabled: bool,
+        validation_metrics: Optional[dict],
+        update_start_time: float,
+        prev_update_steps: int,
+        training_start_time: float,
+    ):
+        """
+        Copy metrics to pinned buffer and signal background thread.
+
+        Returns IMMEDIATELY - does not block. GPU can continue working.
+        Profiler events are passed as a list to avoid sync on main thread.
+        """
+        buf_idx = self.current_buffer
+        n = len(gpu_tensor)
+
+        # Wait if background thread is still reading this buffer
+        # (Should be instant - background finishes in ~5ms, next submit ~800ms later)
+        # Only blocks in the rare case where background falls behind
+        self.buffer_available[buf_idx].wait()
+        self.buffer_available[buf_idx].clear()  # Mark as in-use
+
+        # Copy to pinned buffer (non-blocking DMA)
+        self.buffers[buf_idx][:n].copy_(gpu_tensor, non_blocking=True)
+
+        # Record event so background thread knows when copy is done
+        self.events[buf_idx].record()
+
+        # Capture timing NOW (on main thread, accurate)
+        submit_time = time.perf_counter()
+
+        # Queue work for background thread
+        work = BookkeepingWork(
+            buffer_idx=buf_idx,
+            n_metrics=n,
+            update_count=update_count,
+            total_steps=total_steps,
+            best_reward=best_reward,
+            mode=mode,
+            profiler_events=profiler_events,
+            profiler_enabled=profiler_enabled,
+            validation_metrics=validation_metrics,
+            submit_time=submit_time,
+            update_start_time=update_start_time,
+            prev_update_steps=prev_update_steps,
+            training_start_time=training_start_time,
+        )
+        self._work_queue.put(work)
+
+        # Swap to other buffer for next submission
+        self.current_buffer = 1 - self.current_buffer
+
+    def _worker(self):
+        """Background thread: processes metrics, computes SPS, creates LogPayload."""
+        while True:
+            try:
+                work = self._work_queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._stop_event.is_set():
+                    break
+                continue
+
+            if work is None:  # Sentinel - stop
+                break
+
+            self._process_work(work)
+
+    def _process_work(self, work: BookkeepingWork):
+        """Process one update's metrics (runs in background thread)."""
+        try:
+            # Wait for GPU->CPU copy to complete (should be instant)
+            self.events[work.buffer_idx].synchronize()
+
+            # Read from pinned buffer (safe now that copy is done)
+            cpu_array = self.buffers[work.buffer_idx][:work.n_metrics].numpy()
+            m = unpack_metrics(cpu_array)
+
+            # Compute profiler summary from events (sync already done above)
+            # Since DMA event was recorded AFTER profiler ticks, all profiler
+            # events are guaranteed complete by now - no additional sync needed
+            if work.profiler_enabled and work.profiler_events:
+                times = {}
+                for name, start_evt, end_evt in work.profiler_events:
+                    dt = start_evt.elapsed_time(end_evt) / 1000.0  # ms -> seconds
+                    times[name] = times.get(name, 0.0) + dt
+                total = sum(times.values())
+                if total > 0:
+                    parts = []
+                    for k, v in sorted(times.items(), key=lambda x: x[1], reverse=True):
+                        pct = v / total * 100
+                        parts.append(f"{k}: {v:.2f}s ({pct:.0f}%)")
+                    profiler_summary = " | ".join(parts)
+                else:
+                    profiler_summary = "No data"
+            else:
+                profiler_summary = "Profiling disabled"
+
+            # Update running totals
+            if m['n_episodes'] > 0:
+                if m['reward_max'] > self.best_reward:
+                    self.best_reward = m['reward_max']
+                self.episode_count += m['n_episodes']
+
+            # Compute SPS metrics
+            update_steps = work.total_steps - work.prev_update_steps
+            update_time = work.submit_time - work.update_start_time
+
+            sps_instant = update_steps / update_time if update_time > 0 else 0
+
+            # Rolling window (last 4 updates)
+            self._sps_window.append((update_steps, update_time))
+            if len(self._sps_window) > 4:
+                self._sps_window.pop(0)
+
+            window_steps = sum(s for s, t in self._sps_window)
+            window_time = sum(t for s, t in self._sps_window)
+            sps_rolling = window_steps / window_time if window_time > 0 else 0
+
+            # Global SPS
+            total_elapsed = work.submit_time - work.training_start_time
+            sps_global = work.total_steps / total_elapsed if total_elapsed > 0 else 0
+
+            # Prepare episode stats
+            ep_stats = None
+            if m['n_episodes'] > 0:
+                ep_stats = {
+                    'reward': m['reward_sum'] / m['n_episodes'],
+                    'food': m['food_sum'] / m['n_episodes'],
+                    'poison': m['poison_sum'] / m['n_episodes'],
+                }
+
+            # Create LogPayload and queue to async logger
+            log_payload = LogPayload(
+                policy_loss=m['policy_loss'],
+                value_loss=m['value_loss'],
+                entropy=m['entropy'],
+                explained_var=m['explained_var'],
+                action_probs=m['action_probs'],
+                update_count=work.update_count,
+                total_steps=work.total_steps,
+                best_reward=work.best_reward,  # Use value at submission time
+                mode=work.mode,
+                episode_stats=ep_stats,
+                profiler_summary=profiler_summary,
+                sps_instant=sps_instant,
+                sps_rolling=sps_rolling,
+                sps_global=sps_global,
+                validation_metrics=work.validation_metrics,
+                episodes_count=m['n_episodes'],
+                reward_sum=m['reward_sum'],
+                reward_min=m['reward_min'] if m['n_episodes'] > 0 else 0.0,
+                reward_max=m['reward_max'] if m['n_episodes'] > 0 else 0.0,
+                food_sum=m['food_sum'],
+                poison_sum=m['poison_sum'],
+            )
+            self.async_logger.log_update(log_payload)
+        finally:
+            # Always release buffer for main thread, even on error
+            self.buffer_available[work.buffer_idx].set()
 
 
 # =============================================================================
@@ -176,6 +599,7 @@ class PPOConfig:
     clean_cache: bool = False
     profile_enabled: bool = True  # Disable with --no-profile for production
     benchmark_mode: bool = False  # Skip saving, just measure throughput
+    gpu_log_interval_ms: int = 0  # GPU utilization logging interval (0 = disabled)
 
     # Reproducibility
     seed: Optional[int] = None  # None = random seed (logged for reproducibility)
@@ -290,6 +714,9 @@ class PPOTrainer:
 
         # External profiler callback (called after each update, returns False to stop)
         self._profiler_callback = None
+
+        # GPU monitor (started after warmup if enabled)
+        self.gpu_monitor = None
 
         # Training state
         self.total_steps = 0
@@ -490,7 +917,23 @@ class PPOTrainer:
         Call this after training completes or on abort to ensure
         GPU memory, threads, and file handles are properly released.
         """
-        # Shutdown async logger first (flushes any pending logs)
+        # Stop GPU monitor first
+        if self.gpu_monitor is not None:
+            try:
+                self.gpu_monitor.stop()
+            except Exception:
+                pass
+            self.gpu_monitor = None
+
+        # Stop bookkeeper before async_logger (bookkeeper submits to async_logger)
+        if hasattr(self, 'bookkeeper') and self.bookkeeper is not None:
+            try:
+                self.bookkeeper.stop()
+            except Exception:
+                pass
+            self.bookkeeper = None
+
+        # Shutdown async logger (flushes any pending logs)
         if self.async_logger:
             try:
                 self.async_logger.shutdown(timeout=2.0)
@@ -715,6 +1158,16 @@ class PPOTrainer:
             mode=cfg.mode
         )
         self.async_logger.start()
+
+        # Background bookkeeper - processes metrics in parallel with GPU work
+        # Uses double-buffered pinned memory for zero-copy submission
+        buffer_size = N_SCALAR_METRICS + 16  # Schema metrics + action probs
+        self.bookkeeper = BackgroundBookkeeper(
+            buffer_size=buffer_size,
+            async_logger=self.async_logger,
+            device=self.device,
+        )
+        self.bookkeeper.start()
         
         # Curriculum settings - inform VecEnv of ranges (each env randomizes on reset)
         self.min_food = train_cfg.get('min_food', 50)
@@ -834,6 +1287,14 @@ class PPOTrainer:
             self.reward_computer.initialize(states)
             episode_rewards.zero_()
 
+        # Start GPU monitor after warmup (if enabled)
+        if cfg.gpu_log_interval_ms > 0:
+            self.gpu_monitor = GPUMonitor(
+                interval_ms=cfg.gpu_log_interval_ms,
+                output_path="gpu_utilization.csv"
+            )
+            self.gpu_monitor.start()
+
         step_in_update = 0
         self.start_time = time.perf_counter()
 
@@ -841,6 +1302,10 @@ class PPOTrainer:
         sps_window = []  # (steps, time) pairs for last 4 updates
         last_update_time = self.start_time
         last_update_steps = 0
+
+        # Inference prefetch: True if inference was issued after PPO update
+        # GPU runs inference while CPU does bookkeeping (overlap)
+        inference_pending = False
 
         while self.total_steps < cfg.total_timesteps:
             self.profiler.start()
@@ -860,28 +1325,34 @@ class PPOTrainer:
             
             # Collect experience
             with torch.no_grad():
-                if v:
-                    _vprint(f"Step {self.total_steps}: running inference...", v)
+                if inference_pending:
+                    # Inference was issued after previous PPO update (overlapped with bookkeeping)
+                    # Results are already in logits, features, values, actions, log_probs
+                    inference_pending = False
+                else:
+                    # Normal inference path
+                    if v:
+                        _vprint(f"Step {self.total_steps}: running inference...", v)
 
-                # Use compiled functions if available (fuses many small kernels)
-                with record_function("INFERENCE"):
-                    if self._compiled_inference is not None:
-                        logits, features, values = self._compiled_inference(states)
-                        actions, log_probs = self._compiled_sample(logits)
-                    else:
-                        # Fallback to eager mode
-                        states_t = states.float()
-                        with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                            logits, features = self.policy.forward_with_features(states_t)
-                            values = self.value_head(features).squeeze(-1)
-                            dist = Categorical(logits=logits, validate_args=False)
-                            actions = dist.sample()
-                            log_probs = dist.log_prob(actions)
+                    # Use compiled functions if available (fuses many small kernels)
+                    with record_function("INFERENCE"):
+                        if self._compiled_inference is not None:
+                            logits, features, values = self._compiled_inference(states)
+                            actions, log_probs = self._compiled_sample(logits)
+                        else:
+                            # Fallback to eager mode
+                            states_t = states.float()
+                            with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                                logits, features = self.policy.forward_with_features(states_t)
+                                values = self.value_head(features).squeeze(-1)
+                                dist = Categorical(logits=logits, validate_args=False)
+                                actions = dist.sample()
+                                log_probs = dist.log_prob(actions)
 
-                # Store last logits for action_probs logging (computed once per update)
-                last_logits = logits
+                    # Store last logits for action_probs logging (computed once per update)
+                    last_logits = logits
 
-            self.profiler.tick("Inference")
+                    self.profiler.tick("Inference")
 
             # Environment step
             # GPU-native path: everything stays on GPU
@@ -1006,12 +1477,13 @@ class PPOTrainer:
                 )
                 # Clear progress line
                 print(" " * 40, end='\r')
-                
-                # Sync device - critical for TPU to force XLA execution
-                # For CUDA: ~0.08ms overhead, but needed for accurate profiler timing
-                sync_device(self.device)
+
+                # Sync device only for TPU (forces XLA execution)
+                # CUDA profiling is now async - sync happens in background thread
+                if is_tpu(self.device):
+                    sync_device(self.device)
                 self.profiler.tick("PPO Update")
-                
+
                 self.update_count += 1
 
                 # External profiler callback (for --profile-trace)
@@ -1022,37 +1494,8 @@ class PPOTrainer:
 
                 # Reset buffer index (buffers are pre-allocated, just overwrite)
                 step_in_buffer = 0
-                
-                # Progress - calculate three sps metrics
-                now = time.perf_counter()
-                update_steps = self.total_steps - last_update_steps
-                update_time = now - last_update_time
 
-                # Instantaneous sps (this update only)
-                sps_instant = update_steps / update_time if update_time > 0 else 0
-
-                # Add to rolling window
-                sps_window.append((update_steps, update_time))
-                if len(sps_window) > 4:
-                    sps_window.pop(0)
-
-                # Rolling sps (last 4 updates)
-                window_steps = sum(s for s, t in sps_window)
-                window_time = sum(t for s, t in sps_window)
-                sps_rolling = window_steps / window_time if window_time > 0 else 0
-
-                # Global sps (total steps / total elapsed)
-                elapsed = now - self.start_time
-                sps_global = self.total_steps / elapsed if elapsed > 0 else 0
-
-                # ASYNC METRICS PIPELINE: Process PREVIOUS update, start CURRENT transfer
-                # GPU never waits for CPU. Transfer happens while next update runs.
-
-                # 1. Process previous update's metrics (if any)
-                #    By now, transfer started 800ms ago - it's definitely done
-                self._process_pending_metrics()
-
-                # 2. Run validation (must happen before we capture profiler summary)
+                # Run validation if needed (before metrics submission)
                 val_metrics = None
                 if cfg.validation_interval > 0 and self.update_count % cfg.validation_interval == 0:
                     val_metrics = self._run_validation_episodes()
@@ -1061,39 +1504,70 @@ class PPOTrainer:
                         self.reward_computer.initialize(states)
                         episode_rewards.zero_()
 
-                # 3. Pack metrics according to METRICS_SCHEMA (see module top)
-                #    Order MUST match schema for unpack_metrics to work correctly
-                action_probs_gpu = F.softmax(last_logits, dim=1)[0]
+                # ============================================================
+                # INFERENCE PREFETCH: Issue next rollout's inference NOW
+                # GPU runs inference while CPU does bookkeeping (overlap)
+                # ============================================================
+                # Save old logits for metrics packing (action probs from previous update)
+                prev_logits = last_logits
 
+                with torch.no_grad():
+                    with record_function("INFERENCE"):
+                        if self._compiled_inference is not None:
+                            logits, features, values = self._compiled_inference(states)
+                            actions, log_probs = self._compiled_sample(logits)
+                        else:
+                            states_t = states.float()
+                            with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                                logits, features = self.policy.forward_with_features(states_t)
+                                values = self.value_head(features).squeeze(-1)
+                                dist = Categorical(logits=logits, validate_args=False)
+                                actions = dist.sample()
+                                log_probs = dist.log_prob(actions)
+                last_logits = logits
+                inference_pending = True
+
+                # ============================================================
+                # CPU BOOKKEEPING: GPU is running inference in parallel
+                # ============================================================
+
+                # Pack metrics tensor (GPU work - fast)
+                # Use prev_logits (from last step of previous update) for action probs
+                action_probs_gpu = F.softmax(prev_logits, dim=1)[0]
                 metrics_values = torch.cat([
-                    # METRICS_SCHEMA order: episode aggregates first, then PPO metrics
                     episode_agg_tensor,           # n_episodes, reward_sum/min/max, food/poison
                     policy_loss.unsqueeze(0),
                     value_loss.unsqueeze(0),
                     entropy.unsqueeze(0),
                     explained_var.unsqueeze(0),
-                    action_probs_gpu,             # Variable length tail (not in schema)
+                    action_probs_gpu,             # Variable length tail
                 ])
 
-                # 4. Start async transfer - GPU continues immediately to next update
-                #    profiler.summary() processes CUDA events (one sync) and returns timing
-                self._start_metrics_transfer(
-                    metrics_values=metrics_values,
+                # ZERO-BLOCK SUBMISSION: Send metrics to background thread
+                # Main thread continues immediately, GPU keeps running
+                # Background thread handles: sync, unpack, SPS calc, LogPayload, async_logger
+                #
+                # Pass profiler events instead of summary to avoid sync on main thread!
+                # The background thread computes summary after its DMA sync completes.
+                profiler_events = list(self.profiler._pending_events) if cfg.profile_enabled else []
+                self.bookkeeper.submit(
+                    gpu_tensor=metrics_values,
                     update_count=self.update_count,
                     total_steps=self.total_steps,
-                    sps_instant=sps_instant,
-                    sps_rolling=sps_rolling,
-                    sps_global=sps_global,
-                    profiler_summary=self.profiler.summary(),
+                    best_reward=self.bookkeeper.best_reward,
+                    mode=cfg.mode,
+                    profiler_events=profiler_events,
+                    profiler_enabled=cfg.profile_enabled,
                     validation_metrics=val_metrics,
+                    update_start_time=last_update_time,
+                    prev_update_steps=last_update_steps,
+                    training_start_time=self.start_time,
                 )
 
-                # 5. Reset profiler for next update (AFTER summary captured)
+                # Reset profiler for next update (clears pending events)
                 self.profiler.reset()
 
-                # Update timing reference AFTER all update work (including validation)
-                # This ensures validation time is charged to the update that runs it,
-                # not the following update
+                # Update timing reference for NEXT submission
                 last_update_time = time.perf_counter()
                 last_update_steps = self.total_steps
                 
@@ -1316,8 +1790,13 @@ class PPOTrainer:
         """Save final model and return summary."""
         cfg = self.config
 
-        # Flush any pending async metrics from last update
-        self._process_pending_metrics()
+        # Let bookkeeper finish processing any remaining metrics
+        # (It processes in background, so give it a moment to catch up)
+        if hasattr(self, 'bookkeeper') and self.bookkeeper is not None:
+            time.sleep(0.1)  # Brief pause for background thread
+            best_reward = self.bookkeeper.best_reward
+        else:
+            best_reward = self.best_reward
 
         # Calculate throughput (handle case where start_time wasn't set)
         elapsed = 0.0
@@ -1341,7 +1820,7 @@ class PPOTrainer:
                 'total_steps': self.total_steps,
                 'elapsed_seconds': elapsed,
                 'throughput': throughput,
-                'best_reward': self.best_reward,
+                'best_reward': best_reward,
                 'model_path': None,
                 'aborted': True,
             }
@@ -1359,7 +1838,7 @@ class PPOTrainer:
             print(f"  Total steps:    {self.total_steps:,}")
             print(f"  Elapsed time:   {elapsed:.2f}s")
             print(f"  Throughput:     {throughput:,.0f} steps/sec")
-            print(f"  Best reward:    {self.best_reward:.1f}")
+            print(f"  Best reward:    {best_reward:.1f}")
             print(f"{'='*60}")
         else:
             # Save with full metadata for architecture-agnostic loading
@@ -1376,7 +1855,7 @@ class PPOTrainer:
             print(f"\n[PPO] Training complete: {cfg.output_path} (seed={self.seed})")
 
             if self.logger:
-                self.logger.finalize(best_efficiency=self.best_reward, final_model_path=cfg.output_path)
+                self.logger.finalize(best_efficiency=best_reward, final_model_path=cfg.output_path)
 
         # Close TensorBoard writer to flush all data
         if self.tb_writer:
@@ -1393,7 +1872,7 @@ class PPOTrainer:
             'total_steps': self.total_steps,
             'elapsed_seconds': elapsed,
             'throughput': throughput,
-            'best_reward': self.best_reward,
+            'best_reward': best_reward,
             'model_path': None if cfg.benchmark_mode else cfg.output_path,
             'aborted': False,
         }

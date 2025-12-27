@@ -189,6 +189,8 @@ def main():
                          help='Profile N updates and save trace to ./profile_trace/')
     utility.add_argument('--clean-cache', action='store_true',
                          help='Delete compilation cache before starting')
+    utility.add_argument('--gpu-log-interval-ms', type=int, metavar='MS',
+                         help='Log GPU utilization every MS milliseconds (0 = disabled)')
 
     args = parser.parse_args()
     
@@ -215,6 +217,8 @@ def main():
         # Default to 50k steps if not specified
         if args.timesteps is None and args.updates is None:
             overrides['total_timesteps'] = 50_000
+    if args.gpu_log_interval_ms is not None:
+        overrides['gpu_log_interval_ms'] = args.gpu_log_interval_ms
 
     # Handle timesteps (--updates is a convenience conversion)
     n_envs = args.n_envs or train_cfg.get('n_envs', 64)
