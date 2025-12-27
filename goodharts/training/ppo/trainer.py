@@ -1306,7 +1306,6 @@ class PPOTrainer:
             )
             self.gpu_monitor.start()
 
-        step_in_update = 0
         self.start_time = time.perf_counter()
 
         # Rolling window for sps calculation (all updates valid post-warmup)
@@ -1321,15 +1320,16 @@ class PPOTrainer:
         while self.total_steps < cfg.total_timesteps:
             self.profiler.start()
             
-            # Check for abort request (signal handler or dashboard stop button)
-            if is_abort_requested():
-                print(f"\n[{cfg.mode}] Abort signal received")
-                break
-
-            # Check stop signal via dashboard (if available)
-            if self.dashboard and hasattr(self.dashboard, 'should_stop') and self.dashboard.should_stop():
-                print(f"\n[{cfg.mode}] Dashboard stop requested")
-                break
+            # Check for abort (only at start of each UPDATE, not every step)
+            # This reduces multiprocessing Event checks from 128x to 1x per update
+            if step_in_buffer == 0:
+                if is_abort_requested():
+                    print(f"\n[{cfg.mode}] Abort signal received")
+                    break
+                # Check stop signal via dashboard (if available)
+                if self.dashboard and hasattr(self.dashboard, 'should_stop') and self.dashboard.should_stop():
+                    print(f"\n[{cfg.mode}] Dashboard stop requested")
+                    break
             
             if v:
                 _vprint(f"Step {self.total_steps}: collecting experience...", v)
