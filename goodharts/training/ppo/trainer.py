@@ -1106,6 +1106,17 @@ class PPOTrainer:
             lr=cfg.lr,
             fused=use_fused
         )
+
+        # Separate CUDA stream for inference - allows overlapping kernel scheduling
+        # with PPO's final operations. No extra VRAM, just a scheduling queue.
+        self._inference_stream = None
+        self._ppo_done_event = None
+        self._inference_done_event = None
+        if self.device.type == 'cuda':
+            self._inference_stream = torch.cuda.Stream(device=self.device)
+            self._ppo_done_event = torch.cuda.Event()
+            self._inference_done_event = torch.cuda.Event()
+            print(f"   [Streams] Inference stream created for overlap")
         
         
         # Reward computer - unified class handles both numpy and torch
@@ -1326,8 +1337,10 @@ class PPOTrainer:
             # Collect experience
             with torch.no_grad():
                 if inference_pending:
-                    # Inference was issued after previous PPO update (overlapped with bookkeeping)
-                    # Results are already in logits, features, values, actions, log_probs
+                    # Inference was issued on separate stream after previous PPO update
+                    # Make default stream wait on inference completion (GPU-level sync, no CPU block)
+                    if self._inference_stream is not None:
+                        torch.cuda.current_stream().wait_event(self._inference_done_event)
                     inference_pending = False
                 else:
                     # Normal inference path
@@ -1507,25 +1520,54 @@ class PPOTrainer:
                 # ============================================================
                 # INFERENCE PREFETCH: Issue next rollout's inference NOW
                 # GPU runs inference while CPU does bookkeeping (overlap)
+                #
+                # Using separate CUDA stream: inference kernels are scheduled
+                # immediately, overlapping with PPO's final cleanup. The stream
+                # waits on ppo_done_event to ensure weights are updated.
                 # ============================================================
                 # Save old logits for metrics packing (action probs from previous update)
                 prev_logits = last_logits
 
+                # Record event on default stream - inference stream will wait on this
+                if self._ppo_done_event is not None:
+                    self._ppo_done_event.record()
+
                 with torch.no_grad():
                     with record_function("INFERENCE"):
-                        if self._compiled_inference is not None:
-                            logits, features, values = self._compiled_inference(states)
-                            actions, log_probs = self._compiled_sample(logits)
+                        # Issue inference on separate stream (overlaps kernel scheduling)
+                        if self._inference_stream is not None:
+                            self._inference_stream.wait_event(self._ppo_done_event)
+                            with torch.cuda.stream(self._inference_stream):
+                                if self._compiled_inference is not None:
+                                    logits, features, values = self._compiled_inference(states)
+                                    actions, log_probs = self._compiled_sample(logits)
+                                else:
+                                    states_t = states.float()
+                                    with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                                        logits, features = self.policy.forward_with_features(states_t)
+                                        values = self.value_head(features).squeeze(-1)
+                                        dist = Categorical(logits=logits, validate_args=False)
+                                        actions = dist.sample()
+                                        log_probs = dist.log_prob(actions)
                         else:
-                            states_t = states.float()
-                            with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                                logits, features = self.policy.forward_with_features(states_t)
-                                values = self.value_head(features).squeeze(-1)
-                                dist = Categorical(logits=logits, validate_args=False)
-                                actions = dist.sample()
-                                log_probs = dist.log_prob(actions)
+                            # CPU/TPU fallback - no streams
+                            if self._compiled_inference is not None:
+                                logits, features, values = self._compiled_inference(states)
+                                actions, log_probs = self._compiled_sample(logits)
+                            else:
+                                states_t = states.float()
+                                with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                                    logits, features = self.policy.forward_with_features(states_t)
+                                    values = self.value_head(features).squeeze(-1)
+                                    dist = Categorical(logits=logits, validate_args=False)
+                                    actions = dist.sample()
+                                    log_probs = dist.log_prob(actions)
                 last_logits = logits
                 inference_pending = True
+
+                # Record event on inference stream - default stream will wait on this
+                if self._inference_stream is not None:
+                    self._inference_done_event.record(self._inference_stream)
 
                 # ============================================================
                 # CPU BOOKKEEPING: GPU is running inference in parallel
