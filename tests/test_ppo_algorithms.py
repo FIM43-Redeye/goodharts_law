@@ -33,14 +33,22 @@ class SimplePolicy(nn.Module):
 
 
 class SimpleValueHead(nn.Module):
-    """Minimal value head for testing."""
-    
+    """Minimal value head for testing (matches ValueHead interface)."""
+
     def __init__(self, hidden=32):
         super().__init__()
         self.fc = nn.Linear(hidden, 1)
-    
+
     def forward(self, features):
         return self.fc(features)
+
+    def get_training_value(self, features):
+        """Match interface expected by ppo_update."""
+        return self.forward(features)
+
+    def prepare_targets(self, returns, old_values):
+        """No-op for simple head (no normalization)."""
+        return returns, old_values
 
 
 class TestComputeGAE:

@@ -117,6 +117,7 @@ n_envs = 192                # Parallel envs (192 = less GPU burstiness than 64, 
 n_minibatches = 1           # 1 = full batch (max VRAM utilization, best for single GPU)
 value_coef = 0.5            # Value loss coefficient
 brain_type = "base_cnn"     # Neural network architecture
+value_head_type = "popart"  # "simple" or "popart" (adaptive normalization)
 
 # Reward shaping - provides gradient toward food/away from poison
 reward_scale = 0.1          # Standardize rewards (was 1.0)
