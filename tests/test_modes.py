@@ -18,12 +18,12 @@ from goodharts.modes import (
     get_mode_for_requirement,
     _get_modes,
 )
-from goodharts.configs.default_config import get_config, CellType
+from goodharts.configs.default_config import get_simulation_config, CellType
 
 
 @pytest.fixture
 def config():
-    return get_config()
+    return get_simulation_config()
 
 
 @pytest.fixture

@@ -2,18 +2,12 @@
 Proxy-optimizing behavior that only sees interestingness signals.
 
 In proxy mode, all channels contain the same interestingness values,
-so this agent cannot distinguish food (interestingness=1.0) from 
+so this agent cannot distinguish food (interestingness=1.0) from
 poison (interestingness=0.9). This is the Goodhart's Law trap.
 """
 import torch
 from goodharts.behaviors.base import BehaviorStrategy
-
-
-# 8-directional random walk moves (cardinals + diagonals)
-RANDOM_WALK_MOVES = [
-    (0, 1), (0, -1), (1, 0), (-1, 0),   # Cardinals
-    (1, 1), (1, -1), (-1, 1), (-1, -1)  # Diagonals
-]
+from goodharts.behaviors.utils import RANDOM_WALK_MOVES, sign_scalar, create_circular_mask
 
 
 class ProxySeeker(BehaviorStrategy):
@@ -57,17 +51,14 @@ class ProxySeeker(BehaviorStrategy):
         # Original logic: "if dx==0 and dy==0: continue" -> Yes.
         
         input_view = proxy_signal.clone()
-        input_view[center, center] = -1.0 # Mask center
-        
+        input_view[center, center] = -1.0  # Mask center
+
         # Mask out area outside sight radius (circle)
-        # Create a grid of coordinates
         H, W = input_view.shape
-        y_grid, x_grid = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-        dist_sq = (x_grid - center)**2 + (y_grid - center)**2
-        radius_sq = agent.sight_radius**2
-        
-        # Mask outside radius
-        input_view[dist_sq > radius_sq] = -1.0
+        _, _, visible_mask, _ = create_circular_mask(
+            H, center, agent.sight_radius, device
+        )
+        input_view[~visible_mask] = -1.0
         
         # Find max value
         max_val = torch.max(input_view)
@@ -84,9 +75,9 @@ class ProxySeeker(BehaviorStrategy):
             
             dx = best_x - center
             dy = best_y - center
-            
-            step_x = int(torch.sign(torch.tensor(dx)).item())
-            step_y = int(torch.sign(torch.tensor(dy)).item())
+
+            step_x = sign_scalar(dx)
+            step_y = sign_scalar(dy)
             return step_x, step_y
         
         # Random walk if nothing interesting visible

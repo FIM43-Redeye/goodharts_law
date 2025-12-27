@@ -102,12 +102,13 @@ class CellType:
         """Number of distinct cell types."""
         return len(cls.all_types())
 
-def get_config(config_path: str | None = None):
+def get_simulation_config(config_path: str | None = None):
     """
     Build runtime config dictionary from TOML config file.
 
-    This bridges the TOML config to the legacy dictionary format
-    expected by simulation code.
+    This bridges the TOML config to the simulation-ready dictionary format
+    expected by simulation code. Distinct from config.py:get_config() which
+    returns raw TOML data.
 
     All config values MUST be present in the TOML file - there are no
     fallback defaults. This ensures config.default.toml is the single
@@ -184,4 +185,15 @@ def get_config(config_path: str | None = None):
 
     return config
 
+
+# Deprecated alias for backward compatibility
+def get_config(config_path: str | None = None):
+    """DEPRECATED: Use get_simulation_config() instead."""
+    import warnings
+    warnings.warn(
+        "get_config() is deprecated, use get_simulation_config()",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    return get_simulation_config(config_path)
 

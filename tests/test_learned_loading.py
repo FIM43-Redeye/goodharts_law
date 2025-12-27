@@ -1,7 +1,7 @@
 import pytest
 from goodharts.behaviors import create_learned_behavior, get_behavior, LEARNED_PRESETS
 from goodharts.simulation import Simulation
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 
 def test_create_learned_behavior_presets():
     """Verify all defined presets can be created."""
@@ -17,7 +17,7 @@ def test_create_learned_behavior_invalid():
 
 def test_simulation_loads_learned_preset():
     """Verify Simulation can load a learned behavior by preset name."""
-    config = get_config()
+    config = get_simulation_config()
     # Replace default agents with a learned preset
     config['AGENTS_SETUP'] = [
         {'behavior_class': 'ground_truth', 'count': 1}
@@ -36,7 +36,7 @@ def test_simulation_loads_learned_preset():
 
 def test_simulation_loads_hardcoded():
     """Verify Simulation can still load hardcoded behaviors."""
-    config = get_config()
+    config = get_simulation_config()
     config['AGENTS_SETUP'] = [
         {'behavior_class': 'OmniscientSeeker', 'count': 1}
     ]
@@ -55,7 +55,7 @@ def test_simulation_loads_hardcoded():
 def test_legacy_names_removed():
     """Verify legacy class names are no longer importable or loadable."""
     # Attempt to use legacy name in simulation
-    config = get_config()
+    config = get_simulation_config()
     config['AGENTS_SETUP'] = [
         {'behavior_class': 'LearnedGroundTruth', 'count': 1}
     ]

@@ -6,14 +6,8 @@ This agent can distinguish food from poison perfectly.
 """
 import torch
 from goodharts.behaviors.base import BehaviorStrategy
+from goodharts.behaviors.utils import RANDOM_WALK_MOVES, sign_scalar, create_circular_mask
 from goodharts.configs.default_config import CellType
-
-
-# 8-directional random walk moves (cardinals + diagonals)
-RANDOM_WALK_MOVES = [
-    (0, 1), (0, -1), (1, 0), (-1, 0),   # Cardinals
-    (1, 1), (1, -1), (-1, 1), (-1, -1)  # Diagonals
-]
 
 
 class OmniscientSeeker(BehaviorStrategy):
@@ -50,19 +44,11 @@ class OmniscientSeeker(BehaviorStrategy):
         poison_channel = view[CellType.POISON.channel_index]  # (H, W)
         wall_channel = view[CellType.WALL.channel_index]      # (H, W)
         
-        # Find all visible food positions
-        # Create grid for distances
+        # Find all visible food positions using circular mask
         H, W = food_channel.shape
-        y_grid, x_grid = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-        
-        # Relative coordinates
-        rel_y = y_grid - center
-        rel_x = x_grid - center
-        dist_sq = rel_x**2 + rel_y**2
-        radius_sq = agent.sight_radius**2
-        
-        # Mask valid area (inside radius)
-        visible_mask = dist_sq <= radius_sq
+        y_grid, x_grid, visible_mask, dist_sq = create_circular_mask(
+            H, center, agent.sight_radius, device
+        )
         
         # Identify food locations > 0.5
         food_mask = (food_channel > 0.5) & visible_mask
@@ -141,21 +127,4 @@ class OmniscientSeeker(BehaviorStrategy):
             move = moves_tensor[idx]
             return move[0].item(), move[1].item()
         
-        return 0, 0  # Completley stuck
-
-
-def sign_scalar(x: int | float) -> int:
-    """
-    Return the sign of a scalar value.
-
-    Args:
-        x: Numeric value
-
-    Returns:
-        1 if x > 0, -1 if x < 0, 0 if x == 0
-    """
-    if x > 0:
-        return 1
-    if x < 0:
-        return -1
-    return 0
+        return 0, 0  # Completely stuck

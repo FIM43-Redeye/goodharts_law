@@ -220,12 +220,23 @@ class BrainVisualizer:
         self.remove_hooks()
 
 
-# Direction labels for 8-action space (can be extended)
-ACTION_LABELS_8 = ['↖', '←', '↙', '↑', '↓', '↗', '→', '↘']
+# Re-export from action_space for convenience
+from goodharts.behaviors.action_space import (
+    get_action_labels,
+    get_direction_arrow,
+    DISCRETE_8,
+)
 
 
 def get_action_label(idx: int, n_actions: int) -> str:
-    """Get human-readable label for action index."""
-    if n_actions == 8 and idx < len(ACTION_LABELS_8):
-        return ACTION_LABELS_8[idx]
+    """
+    Get human-readable label for action index.
+
+    For standard 8-action discrete grid, returns direction arrows.
+    Falls back to numeric index for unknown action counts.
+    """
+    if n_actions == 8:
+        labels = get_action_labels(DISCRETE_8)
+        if idx < len(labels):
+            return labels[idx]
     return str(idx)

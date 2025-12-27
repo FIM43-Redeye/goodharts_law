@@ -27,7 +27,7 @@ import torch
 
 from goodharts.utils.device import get_device
 from goodharts.utils.seed import set_seed
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 from goodharts.modes import ObservationSpec
 from goodharts.behaviors.brains import create_brain
 from goodharts.behaviors.action_space import num_actions
@@ -56,7 +56,7 @@ def evaluate_model(
     
     Returns list of episode results.
     """
-    config = get_config()
+    config = get_simulation_config()
     spec = ObservationSpec.for_mode(mode, config)
     n_actions = num_actions(1)
     

@@ -6,13 +6,48 @@ Separated from main.py for cleaner organization.
 """
 import matplotlib.pyplot as plt
 from matplotlib import colors
-from matplotlib.patches import Patch
+from matplotlib.patches import Patch, Rectangle
 from matplotlib.widgets import RadioButtons
 import numpy as np
 import torch
 
+# Dark theme for consistency with training dashboard
+plt.style.use('dark_background')
+
+# Dark toolbar background (affects the navigation bar at bottom of window)
+plt.rcParams['figure.facecolor'] = '#1a1a1a'
+plt.rcParams['axes.facecolor'] = '#1a1a1a'
+plt.rcParams['savefig.facecolor'] = '#1a1a1a'
+
 from goodharts.behaviors.utils import get_behavior_name
+from goodharts.behaviors.action_space import get_action_labels, DISCRETE_8
 from goodharts.configs.default_config import CellType
+
+
+def add_image_border(ax, img, color='white', linewidth=1.5):
+    """
+    Add a visible border around an imshow image.
+
+    Spines don't work reliably with axis('off'), so we use a Rectangle patch
+    that matches the image extent.
+
+    Args:
+        ax: Matplotlib axes containing the image
+        img: AxesImage returned by imshow()
+        color: Border color
+        linewidth: Border thickness
+    """
+    extent = img.get_extent()
+    rect = Rectangle(
+        (extent[0], extent[2]),
+        extent[1] - extent[0],
+        extent[3] - extent[2],
+        fill=False,
+        edgecolor=color,
+        linewidth=linewidth,
+        zorder=10  # Draw on top
+    )
+    ax.add_patch(rect)
 
 
 def _to_numpy(data) -> np.ndarray:
@@ -129,6 +164,7 @@ def create_standard_layout(sim):
     img_sim = ax_sim.imshow(rgb_grid)
     ax_sim.set_title("World View")
     ax_sim.axis('off')
+    add_image_border(ax_sim, img_sim)
     
     # Legend
     legend_elements = build_legend_elements(sim)
@@ -167,6 +203,7 @@ def create_standard_layout(sim):
     ax_heatmap.set_title("Activity Heatmap (All)")
     ax_heatmap.axis('off')
     plt.colorbar(img_heatmap, ax=ax_heatmap, fraction=0.046)
+    add_image_border(ax_heatmap, img_heatmap)
     
     # Radio Buttons for Heatmap Selection
     # Place in left margin
@@ -188,9 +225,9 @@ def create_standard_layout(sim):
     # Initial empty bars (Starvation usually bottom, Poison top)
     # We keep references to bar containers to update height later
     bar_width = 0.5
-    bars_starved = ax_stats.bar(x_pos, [0]*len(behavior_names), width=bar_width, 
-                                label='Starvation', color='#4a4a4a', edgecolor='white')
-    bars_poisoned = ax_stats.bar(x_pos, [0]*len(behavior_names), width=bar_width, 
+    bars_starved = ax_stats.bar(x_pos, [0]*len(behavior_names), width=bar_width,
+                                label='Starvation', color='#7a7a7a', edgecolor='white')
+    bars_poisoned = ax_stats.bar(x_pos, [0]*len(behavior_names), width=bar_width,
                                  bottom=[0]*len(behavior_names),
                                  label='Poison', color='#ff6b6b', edgecolor='white')
     ax_stats.legend(loc='upper right', fontsize=8)
@@ -226,8 +263,6 @@ def create_brain_layout(sim, agent, visualizer):
     Returns:
         Dict with figure, axes, panels, and objects for updates.
     """
-    from goodharts.utils.brain_viz import get_action_label
-    
     layers = visualizer.get_displayable_layers()
     n_layers = len(layers)
     
@@ -244,12 +279,13 @@ def create_brain_layout(sim, agent, visualizer):
     
     # 1. Main View (Left column, spanning both rows)
     ax_main = fig.add_subplot(gs[:, 0])
-    
+
     # Placeholder for RGB Observation
     # Size depends on view range, will act as placeholder
     img_main = ax_main.imshow(np.zeros((21, 21, 3), dtype=np.uint8))
     ax_main.set_title("Agent Observation")
     ax_main.axis('off')
+    add_image_border(ax_main, img_main)
     
     # 2. Layer panels - dynamically placed
     layer_panels = {}
@@ -269,11 +305,20 @@ def create_brain_layout(sim, agent, visualizer):
     
     # 3. Action probabilities panel
     ax_actions = fig.add_subplot(gs[:, -1])  # Right-most column, span rows
-    n_actions = 8  # Will be updated dynamically
+
+    # Get action labels from the agent's action space
+    if hasattr(agent.behavior, 'action_space'):
+        action_space = agent.behavior.action_space
+        action_labels = get_action_labels(action_space)
+    else:
+        # Fallback to standard 8-direction
+        action_labels = get_action_labels(DISCRETE_8)
+
+    n_actions = len(action_labels)
     bars_actions = ax_actions.barh(range(n_actions), np.zeros(n_actions), color='#00d9ff')
     ax_actions.set_xlim(0, 1)
     ax_actions.set_yticks(range(n_actions))
-    ax_actions.set_yticklabels([get_action_label(i, n_actions) for i in range(n_actions)])
+    ax_actions.set_yticklabels(action_labels)
     ax_actions.set_title("Action Probabilities")
     ax_actions.set_xlabel("Probability")
     

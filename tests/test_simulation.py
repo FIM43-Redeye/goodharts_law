@@ -1,11 +1,11 @@
 import pytest
 import torch
 from goodharts.simulation import Simulation
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 
 @pytest.fixture
 def config():
-    cfg = get_config()
+    cfg = get_simulation_config()
     # Reduce size for faster tests
     cfg['GRID_WIDTH'] = 10
     cfg['GRID_HEIGHT'] = 10

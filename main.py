@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
 from goodharts.simulation import Simulation
-from goodharts.configs.default_config import get_config
+from goodharts.configs.default_config import get_simulation_config
 from goodharts.utils.logging_config import setup_logging
 from goodharts.visualization import (
     create_standard_layout,
@@ -277,7 +277,8 @@ def main():
         cache_frame_data=False
     )
     
-    plt.tight_layout(rect=[0, 0, 1, 0.96])  # Leave room for suptitle
+    # Note: tight_layout() conflicts with manually positioned axes (RadioButtons),
+    # so we skip it here - layouts are already configured in visualization.py
     plt.show()
 
 

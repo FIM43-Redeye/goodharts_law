@@ -258,23 +258,3 @@ class BaseCNN(nn.Module):
     # NOTE: Action decoding has been moved to ActionSpace classes.
     # Use action_space.decode(brain_output) instead of brain.get_action().
     # See goodharts/behaviors/action_space.py
-
-
-class BaseCNNWithMemory(nn.Module):
-    """
-    CNN with LSTM for temporal memory.
-    
-    STUB for Phase 3 - allows agents to develop behavior 
-    that evolves over time.
-    """
-    
-    def __init__(
-        self,
-        input_shape: tuple[int, int],
-        input_channels: int = 1,
-        output_size: int = 8,
-        hidden_size: int = 32,
-        memory_size: int = 16,
-    ):
-        super().__init__()
-        raise NotImplementedError("BaseCNNWithMemory is a Phase 3 stub")

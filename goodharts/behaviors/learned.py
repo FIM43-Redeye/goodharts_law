@@ -7,6 +7,7 @@ enabling empirical demonstration of Goodhart's Law.
 import torch
 from goodharts.behaviors import BehaviorStrategy
 from goodharts.behaviors.brains.base_cnn import BaseCNN
+from goodharts.behaviors.brains import load_brain
 from goodharts.behaviors.action_space import (
     ActionSpace,
     DiscreteGridActionSpace,
@@ -87,59 +88,42 @@ class LearnedBehavior(BehaviorStrategy):
     def _init_brain(self, input_shape: tuple[int, int, int]):
         """
         Lazy initialization of the brain based on actual view shape.
-        
-        Supports loading both BaseCNN and ActorCritic (PPO) models.
-        
+
+        Uses load_brain() which handles both new checkpoint format (with metadata)
+        and legacy format (raw state_dict).
+
         Args:
             input_shape: (num_channels, height, width) from observation
         """
         num_channels, height, width = input_shape
-        self.brain = BaseCNN(
-            input_shape=(height, width), 
-            input_channels=num_channels, 
-            output_size=self.num_actions
-        )
-        
+
         if self.model_path:
             try:
-                state_dict = torch.load(self.model_path, map_location=self.device, weights_only=True)
-                
-                # Sanitize keys (remove _orig_mod prefix from torch.compile)
-                state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
-                
-                # Detect if this is an ActorCritic model (has 'actor' keys)
-                if any('actor' in k for k in state_dict.keys()):
-                    # Map ActorCritic keys to BaseCNN keys
-                    # ActorCritic: conv1, conv2, fc_shared (64), actor, critic
-                    # BaseCNN: conv1, conv2, fc1 (64), fc_out (output)
-                    new_state_dict = {}
-                    for k, v in state_dict.items():
-                        if k.startswith('conv1') or k.startswith('conv2'):
-                            new_state_dict[k] = v
-                        elif k.startswith('fc_shared'):
-                            # fc_shared -> fc1
-                            new_key = k.replace('fc_shared', 'fc1')
-                            new_state_dict[new_key] = v
-                        elif k.startswith('actor'):
-                            # actor -> fc_out (output layer)
-                            new_key = k.replace('actor', 'fc_out')
-                            new_state_dict[new_key] = v
-                        # Skip 'critic' - not needed for inference
-                    
-                    self.brain.load_state_dict(new_state_dict)
-                    logger.info(f"Loaded PPO ActorCritic model from {self.model_path}")
-                else:
-                    # Standard BaseCNN model
-                    self.brain.load_state_dict(state_dict)
-                    logger.info(f"Loaded BaseCNN model from {self.model_path}")
+                # Use load_brain() which handles both new and legacy formats
+                self.brain, metadata = load_brain(self.model_path, device=self.device)
+
+                steps = metadata.get('training_steps', metadata.get('total_steps', '?'))
+                mode = metadata.get('mode', '?')
+                logger.info(f"Loaded model from {self.model_path} (mode={mode}, steps={steps})")
 
             except FileNotFoundError:
                 logger.warning(f"Model not found at {self.model_path}, using random weights")
+                self.brain = None
             except Exception as e:
                 logger.warning(f"Error loading model: {e}, using random weights")
-        
-        self.brain.to(self.device)
-        self.brain.eval()
+                self.brain = None
+
+        # Fallback: create fresh brain if loading failed or no path provided
+        if self.brain is None:
+            self.brain = BaseCNN(
+                input_shape=(height, width),
+                input_channels=num_channels,
+                output_size=self.num_actions
+            )
+            self.brain.to(self.device)
+
+        # Set to inference mode (disables dropout, batchnorm training, etc.)
+        self.brain.train(False)
 
     def get_action_logits(self, view: torch.Tensor) -> torch.Tensor:
         """

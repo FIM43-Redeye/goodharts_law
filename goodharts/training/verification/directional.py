@@ -5,7 +5,7 @@ Tests whether models correctly move toward food placed in different directions.
 """
 import torch
 
-from goodharts.configs.default_config import get_config, CellType
+from goodharts.configs.default_config import get_simulation_config, CellType
 from goodharts.behaviors.brains.base_cnn import BaseCNN
 
 
@@ -25,7 +25,7 @@ def test_directional_accuracy(model_path: str, model_name: str) -> float:
     """
     print(f"Testing {model_name}...")
     
-    config = get_config()
+    config = get_simulation_config()
     obs_spec = config['get_observation_spec']('ground_truth')
     
     # Dynamic dimensions from observation spec
