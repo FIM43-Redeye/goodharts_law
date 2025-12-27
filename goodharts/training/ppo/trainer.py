@@ -600,6 +600,7 @@ class PPOConfig:
     profile_enabled: bool = True  # Disable with --no-profile for production
     benchmark_mode: bool = False  # Skip saving, just measure throughput
     gpu_log_interval_ms: int = 0  # GPU utilization logging interval (0 = disabled)
+    cuda_graphs: bool = False     # Use CUDA/HIP graphs for inference (experimental)
 
     # Reproducibility
     seed: Optional[int] = None  # None = random seed (logged for reproducibility)
@@ -809,6 +810,8 @@ class PPOTrainer:
             with torch.no_grad():
                 # Use compiled functions if available (triggers compilation on first call)
                 if self._compiled_inference is not None:
+                    # Mark step begin for CUDA graph tensor reuse
+                    torch.compiler.cudagraph_mark_step_begin()
                     logits, features, values = self._compiled_inference(states)
                     actions, log_probs = self._compiled_sample(logits)
                 else:
@@ -1060,9 +1063,9 @@ class PPOTrainer:
         with _COMPILE_LOCK:
             if cfg.compile_models and hasattr(torch, 'compile') and not is_tpu(self.device):
                 try:
-                    # Use max-autotune-no-cudagraphs for best kernel optimization
-                    # without CUDA graph tensor reuse conflicts
-                    compile_mode = 'max-autotune-no-cudagraphs'
+                    # Try max-autotune with CUDA graphs (works on ROCm 7.1+)
+                    # Falls back to no-cudagraphs if graphs fail
+                    compile_mode = 'max-autotune'
 
                     # Compile the full inference step, not just individual models
                     # This fuses .float(), autocast, forward, and squeeze into one graph
@@ -1073,10 +1076,10 @@ class PPOTrainer:
 
                     @torch.compile(mode=compile_mode)
                     def compiled_inference(states):
-                        """Fused inference: float conversion + policy + value."""
-                        states_t = states.float()
+                        """Fused inference: policy forward + value head."""
+                        # Note: states already float32 from TorchVecEnv._view_buffer
                         with autocast(device_type=device_type, enabled=use_amp):
-                            logits, features = policy.forward_with_features(states_t)
+                            logits, features = policy.forward_with_features(states)
                             values = value_head(features).squeeze(-1)
                         return logits, features, values
 
@@ -1091,7 +1094,7 @@ class PPOTrainer:
                     self._compiled_inference = compiled_inference
                     self._compiled_sample = compiled_sample
 
-                    print(f"   [JIT] torch.compile enabled (max-autotune-no-cudagraphs)")
+                    print(f"   [JIT] torch.compile enabled ({compile_mode})")
                 except RuntimeError as e:
                     if "FX" in str(e) or "dynamo" in str(e).lower():
                         print(f"   [JIT] Warning: torch.compile failed ({e}). Using eager mode.")
@@ -1350,6 +1353,8 @@ class PPOTrainer:
                     # Use compiled functions if available (fuses many small kernels)
                     with record_function("INFERENCE"):
                         if self._compiled_inference is not None:
+                            # Mark step begin for CUDA graph tensor reuse
+                            torch.compiler.cudagraph_mark_step_begin()
                             logits, features, values = self._compiled_inference(states)
                             actions, log_probs = self._compiled_sample(logits)
                         else:

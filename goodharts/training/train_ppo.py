@@ -305,7 +305,7 @@ def _run_with_profiling(mode: str, overrides: dict, n_updates: int):
     Runs warmup first, then profiles exactly n_updates and stops cleanly.
     """
     import torch
-    from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler
+    from torch.profiler import profile, schedule, ProfilerActivity
     import shutil
 
     # Clear old profile data
@@ -318,7 +318,7 @@ def _run_with_profiling(mode: str, overrides: dict, n_updates: int):
     n_envs = overrides.get('n_envs', 192)
     steps_per_env = 128
     warmup_updates = 3  # Let JIT compile and stabilize
-    total_updates = warmup_updates + n_updates + 1  # +1 buffer
+    total_updates = warmup_updates + n_updates + 2  # +2 buffer for schedule
     total_timesteps = total_updates * n_envs * steps_per_env
 
     profile_overrides = {
@@ -337,78 +337,85 @@ def _run_with_profiling(mode: str, overrides: dict, n_updates: int):
     config = PPOConfig.from_config(mode=mode, **profile_overrides)
     trainer = PPOTrainer(config, dashboard=None)
 
+    # Trace export path
+    trace_path = os.path.join(profile_dir, 'trace.json')
+
     # Profiler state
     profiler_state = {
         'profiler': None,
-        'started': False,
-        'updates_profiled': 0,
+        'done': False,
     }
+
+    def on_trace_ready(prof):
+        """Called when trace is ready - export it."""
+        print(f"   [Exporting trace to {trace_path}]")
+        prof.export_chrome_trace(trace_path)
+
+        # Print summary
+        print("\n" + "=" * 70)
+        print("KERNEL TIME SUMMARY (sorted by CUDA time)")
+        print("=" * 70)
+        print(prof.key_averages().table(
+            sort_by="cuda_time_total", row_limit=30
+        ))
+
+        print(f"\n[Profile] Trace saved to {trace_path}")
+        print("[Profile] View with: Open chrome://tracing or ui.perfetto.dev and load trace.json")
+        profiler_state['done'] = True
+
+    # Create profiler with schedule:
+    # - wait: skip first N updates (our warmup)
+    # - warmup: profiler's own warmup (1 update)
+    # - active: actually record N updates
+    # - repeat: only do this once
+    profiler = profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=schedule(
+            wait=warmup_updates,
+            warmup=1,
+            active=n_updates,
+            repeat=1,
+        ),
+        on_trace_ready=on_trace_ready,
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+    )
+    profiler_state['profiler'] = profiler
 
     def profiler_callback(update_count: int) -> bool:
         """Called after each update. Returns False to stop training."""
-        state = profiler_state
+        prof = profiler_state['profiler']
+
+        # Step the profiler (advances through wait -> warmup -> active -> done)
+        prof.step()
 
         if update_count < warmup_updates:
-            # Still warming up
             print(f"   [Warmup {update_count}/{warmup_updates}]")
-            return True
+        elif update_count < warmup_updates + 1:
+            print(f"   [Profiler warmup]")
+        elif not profiler_state['done']:
+            active_step = update_count - warmup_updates
+            print(f"   [Profiling {active_step}/{n_updates}]")
 
-        if update_count == warmup_updates:
-            # Start profiler now - absolute minimal overhead settings
-            print(f"   [Warmup complete - starting profiler]")
-            state['profiler'] = profile(
-                activities=[ProfilerActivity.CUDA],  # GPU only, skip CPU
-                record_shapes=False,    # Skip shape recording
-                profile_memory=False,   # Skip memory tracking
-                with_stack=False,       # Skip Python stack traces
-                with_flops=False,       # Skip FLOP counting
-                with_modules=False,     # Skip module hierarchy
-            )
-            state['profiler'].__enter__()
-            state['started'] = True
-            return True
-
-        if state['started']:
-            state['updates_profiled'] += 1
-            print(f"   [Profiling {state['updates_profiled']}/{n_updates}]")
-
-            if state['updates_profiled'] >= n_updates:
-                # Done profiling - stop and save
-                print(f"   [Stopping profiler]")
-                state['profiler'].__exit__(None, None, None)
-
-                # Save trace
-                trace_path = os.path.join(profile_dir, 'trace.json')
-                state['profiler'].export_chrome_trace(trace_path)
-
-                # Print summary
-                print("\n" + "=" * 70)
-                print("KERNEL TIME SUMMARY (sorted by CUDA time)")
-                print("=" * 70)
-                print(state['profiler'].key_averages().table(
-                    sort_by="cuda_time_total", row_limit=30
-                ))
-
-                print(f"\n[Profile] Trace saved to {trace_path}")
-                print("[Profile] View with: Open chrome://tracing and load trace.json")
-                return False  # Stop training
-
-        return True
+        # Stop once trace is exported
+        return not profiler_state['done']
 
     # Install callback and run
     trainer._profiler_callback = profiler_callback
 
     print("\n[Profile] Starting training...")
+    profiler.__enter__()
     try:
         trainer.train()
-    except Exception as e:
-        # Clean up profiler if it's still running
-        if profiler_state['started'] and profiler_state['profiler']:
-            try:
-                profiler_state['profiler'].__exit__(None, None, None)
-            except Exception:
-                pass
-        raise
+    finally:
+        # Clean up profiler
+        try:
+            profiler.__exit__(None, None, None)
+        except Exception:
+            pass
 
     print("\n[Profile] Done!")
 
