@@ -10,17 +10,21 @@ This project provides a concrete, reproducible example of how optimizing for pro
 
 ## Results
 
-Trained agents evaluated over 1,000 episodes each (512 steps/episode):
+Trained agents evaluated using continuous survival testing (agents run until death, then respawn):
 
-| Mode | Observation | Reward Signal | Food | Poison | Poison Ratio |
-|------|-------------|---------------|------|--------|--------------|
-| **ground_truth** | Real cell types | Energy | 185.0 | 0.8 | 1.0× (baseline) |
-| **proxy_jammed** | Interestingness only | Interestingness | 162.1 | 3.5 | **4.3×** |
-| **proxy** | Interestingness only | Energy | 42.2 | 3.8 | 4.7× |
+| Mode | Observation | Reward | Efficiency | Survival | Deaths/1k | Food/1k | Poison/1k |
+|------|-------------|--------|------------|----------|-----------|---------|-----------|
+| **ground_truth** | Cell types | Energy | TBD | TBD | TBD | TBD | TBD |
+| **ground_truth_handhold** | Cell types | Shaped | TBD | TBD | TBD | TBD | TBD |
+| **proxy** | Interestingness | Interestingness | TBD | TBD | TBD | TBD | TBD |
+| **proxy_jammed** | Interestingness | Energy | TBD | TBD | TBD | TBD | TBD |
 
-**Key finding:** The `proxy_jammed` agent—which optimizes purely for "interestingness"—eats **4.3× more poison** than the ground-truth agent while collecting nearly as much food. It has successfully optimized for the proxy metric, but this optimization is misaligned with the true objective (survival).
+**Key metrics:**
+- **Efficiency** = food / (food + poison) — the core Goodhart failure metric
+- **Survival** = average steps lived before death
+- **Deaths/1k** = population death rate per 1000 steps
 
-The `proxy` agent performs worst overall because it faces an impossible learning problem: it's rewarded based on energy changes it cannot observe, creating a credit assignment nightmare.
+**Expected finding:** Proxy agents will show lower efficiency than ground-truth agents because they cannot distinguish food (interestingness 1.0) from poison (interestingness 0.9). They optimize the proxy metric successfully but fail at the true objective.
 
 ---
 
@@ -32,6 +36,7 @@ The `proxy` agent performs worst overall because it faces an impossible learning
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [Training](#training)
+- [Evaluation](#evaluation)
 - [Architecture Deep Dive](#architecture-deep-dive)
 - [AI Safety Connection](#ai-safety-connection)
 - [Roadmap](#roadmap)
@@ -56,9 +61,10 @@ This project explores a fundamental AI safety concern: **what happens when agent
 
 | Mode | Observation | Reward Signal | Purpose |
 |------|-------------|---------------|---------|
-| `ground_truth` | One-hot cell types | Energy delta (+food, -poison) | Baseline: full information |
+| `ground_truth` | One-hot cell types | Energy delta | Baseline: full information |
+| `ground_truth_handhold` | One-hot cell types | Shaped rewards | Easier learning curve |
 | `proxy` | Interestingness values | Interestingness gain | **Main Goodhart failure mode** |
-| `proxy_jammed` | Interestingness values | Energy delta | Information asymmetry (bonus) |
+| `proxy_jammed` | Interestingness values | Energy delta | Information asymmetry test |
 
 ---
 
@@ -236,7 +242,7 @@ The primary training method uses Proximal Policy Optimization with Generalized A
 # Train a ground truth agent
 python -m goodharts.training.train_ppo --mode ground_truth --timesteps 100000
 
-# Train all three modes in parallel
+# Train all modes in parallel
 python -m goodharts.training.train_ppo --mode all --timesteps 100000
 
 # With live dashboard showing all modes
@@ -246,12 +252,27 @@ python -m goodharts.training.train_ppo --mode all --dashboard --timesteps 100000
 python -m goodharts.training.train_ppo --n-envs 128 --timesteps 200000
 ```
 
+### Key CLI Options
+
+| Option | Description |
+|--------|-------------|
+| `--mode MODE` | Training mode: `ground_truth`, `proxy`, `proxy_jammed`, `all`, or comma-separated |
+| `--timesteps N` | Total environment steps (default: from config) |
+| `--updates N` | PPO updates instead of timesteps (more intuitive for long runs) |
+| `-d, --dashboard` | Live training visualization |
+| `-e, --n-envs N` | Parallel environments (higher = faster, more VRAM) |
+| `--benchmark` | Measure throughput without saving models |
+| `--deterministic` | Full reproducibility (slower) |
+| `--seed N` | Random seed for reproducibility |
+| `--no-amp` | Disable mixed precision (for debugging) |
+| `--no-compile` | Disable torch.compile (faster startup, slower training) |
+
 ### Training Performance
 
-With the vectorized environment and optimized PPO updates:
-- **~14K steps/second** on GPU (AMD RX 7700S)
-- **~1K steps/second** on CPU
-- 100,000 timesteps complete in ~10 seconds (GPU) or ~100 seconds (CPU)
+With the GPU-native vectorized environment and optimized PPO:
+- GPU training is 10-30x faster than CPU
+- Exact throughput varies by configuration (n_envs, compile settings) and hardware
+- Use `--benchmark` flag to measure throughput on your system
 
 ### Training Output
 
@@ -267,6 +288,40 @@ Training produces:
 # Run verification suite
 python -m goodharts.training.verification --steps 500 --verbose
 ```
+
+---
+
+## Evaluation
+
+The evaluation system uses a **continuous survival paradigm**: agents run until they die (starvation), then auto-respawn. We track death events and survival times, not artificial "episodes".
+
+### Key Metrics
+
+| Metric | Description |
+|--------|-------------|
+| **Efficiency** | food / (food + poison) — the Goodhart failure metric |
+| **Survival** | Steps lived before each death |
+| **Deaths/1k** | Population death rate per 1000 steps |
+| **Food/1k** | Food consumption rate per 1000 steps |
+| **Poison/1k** | Poison consumption rate per 1000 steps |
+
+### Usage
+
+```bash
+# Evaluate a single mode
+python scripts/evaluate.py --mode ground_truth --timesteps 100000
+
+# Evaluate all modes with comparison
+python scripts/evaluate.py --mode all --timesteps 100000
+
+# With live dashboard
+python scripts/evaluate.py --mode all --dashboard
+
+# Deterministic evaluation (reproducible)
+python scripts/evaluate.py --mode all --deterministic --seed 42
+```
+
+Results are saved to `generated/eval_results.json` with cross-mode comparison.
 
 ---
 
@@ -404,7 +459,7 @@ This accidental demonstration of Goodhart's Law on ourselves is documented in `d
 ### ✅ Phase 2: Learned Behaviors
 - [x] BaseCNN architecture with dynamic channels
 - [x] PPO training with GAE and curriculum
-- [x] GPU-native vectorized training (~14K steps/sec)
+- [x] GPU-native vectorized training
 - [x] Multi-mode dashboard
 - [x] Structured logging (CSV/JSON)
 - [x] Model verification suite
@@ -413,7 +468,7 @@ This accidental demonstration of Goodhart's Law on ourselves is documented in `d
 - [x] TOML configuration system
 - [x] Auto-discovery behavior registry
 - [x] Centralized device selection
-- [x] Comprehensive test suite (166 tests)
+- [x] Comprehensive test suite
 
 ### 🔮 Phase 3: Emergent Deception
 - [ ] Multi-agent signaling dynamics
