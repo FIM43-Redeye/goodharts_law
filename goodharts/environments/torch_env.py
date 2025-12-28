@@ -91,6 +91,10 @@ class TorchVecEnv:
         # Mode-aware observation encoding
         # Detect proxy mode: uses 'interestingness' instead of cell-type one-hot
         self.is_proxy_mode = 'interestingness' in self.channel_names
+
+        # Freeze energy during training: agents don't die, enabling exploration
+        # Used for proxy mode where agents can't learn from energy consequences
+        self.freeze_energy = obs_spec.freeze_energy_in_training
         
         # Build interestingness lookup table: cell_value -> interestingness
         # Used for proxy mode observations
@@ -655,10 +659,11 @@ class TorchVecEnv:
             self.agent_x = torch.clamp(self.agent_x + dx, 0, self.width - 1)
             self.agent_y = torch.clamp(self.agent_y + dy, 0, self.height - 1)
 
-        # Energy cost (physical, happens regardless of reward mode)
-        self.agent_energy -= self.energy_move_cost
+        # Energy cost (skipped when frozen for training exploration)
+        if not self.freeze_energy:
+            self.agent_energy -= self.energy_move_cost
 
-        # Eating (updates energy, underlying_cell, and clears eaten items)
+        # Eating (updates energy unless frozen, plus underlying_cell and item clearing)
         food_mask, poison_mask = self._eat_batch()
 
         # Mark agents at new positions
@@ -667,7 +672,8 @@ class TorchVecEnv:
         # Step count and done check
         # Separate terminated (real death) from truncated (time limit)
         self.agent_steps += 1
-        self.terminated = self.agent_energy <= 0  # Agent died (starvation)
+        # When frozen, agents never die - enables exploration without penalty
+        self.terminated = torch.zeros_like(self.dones) if self.freeze_energy else (self.agent_energy <= 0)
         self.truncated = self.agent_steps >= self.max_steps  # Hit time limit (neutral)
         self.dones = self.terminated | self.truncated  # Combined for reset logic
 
@@ -707,9 +713,10 @@ class TorchVecEnv:
         food_mask = (cell_values == self.CellType.FOOD.value)
         poison_mask = (cell_values == self.CellType.POISON.value)
 
-        # Update agent energy (physical consequence, independent of reward signal)
-        self.agent_energy = torch.where(food_mask, self.agent_energy + self.food_reward, self.agent_energy)
-        self.agent_energy = torch.where(poison_mask, self.agent_energy - self.poison_penalty, self.agent_energy)
+        # Update agent energy (skipped when frozen for training exploration)
+        if not self.freeze_energy:
+            self.agent_energy = torch.where(food_mask, self.agent_energy + self.food_reward, self.agent_energy)
+            self.agent_energy = torch.where(poison_mask, self.agent_energy - self.poison_penalty, self.agent_energy)
 
         # Update episode counters
         self.current_episode_food = torch.where(food_mask, self.current_episode_food + 1, self.current_episode_food)
