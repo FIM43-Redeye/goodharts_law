@@ -20,6 +20,7 @@ def config():
     cfg['GRID_FOOD_INIT'] = 20
     cfg['GRID_POISON_INIT'] = 10
     cfg['WORLD_LOOP'] = False
+    cfg['MAX_MOVE_DISTANCE'] = 1  # Tests expect 3x3 action space
     return cfg
 
 
@@ -31,6 +32,7 @@ def looping_config():
     cfg['GRID_FOOD_INIT'] = 20
     cfg['GRID_POISON_INIT'] = 10
     cfg['WORLD_LOOP'] = True
+    cfg['MAX_MOVE_DISTANCE'] = 1  # Tests expect 3x3 action space
     return cfg
 
 
@@ -250,7 +252,7 @@ class TestEnergyMechanics:
         initial_energy = env.agent_energy[0].item()
 
         actions = torch.tensor([right_action], dtype=torch.long, device=device)
-        obs, rewards, dones = env.step(actions)
+        obs, eating_info, terminated, truncated = env.step(actions)
 
         final_energy = env.agent_energy[0].item()
 
@@ -304,7 +306,8 @@ class TestEnergyMechanics:
         env.grids[0, 8:13, 8:13] = CellType.EMPTY.value
 
         actions = torch.tensor([0], dtype=torch.long, device=device)
-        obs, rewards, dones = env.step(actions)
+        obs, eating_info, terminated, truncated = env.step(actions)
+        dones = terminated | truncated
 
         # Should be done (energy <= 0 after move cost deduction)
         assert dones[0].item() == True, \
@@ -474,19 +477,21 @@ class TestRewardMechanics:
         env.grids[0, 10, 11] = CellType.FOOD.value
 
         actions = torch.tensor([right_action], dtype=torch.long, device=device)
-        obs, rewards, dones = env.step(actions)
+        obs, eating_info, terminated, truncated = env.step(actions)
+        food_mask, poison_mask, starved_mask = eating_info
 
-        # Reward should be positive (food reward - move cost)
-        assert rewards[0].item() > 0, f"Food reward should be positive, got {rewards[0].item()}"
+        # Agent should have eaten food
+        assert food_mask[0].item(), "Agent should have eaten food"
 
-    def test_poison_gives_negative_reward(self, config, device):
-        """Eating poison should give negative reward."""
+    def test_poison_gives_negative_effect(self, config, device):
+        """Eating poison should be detected and reduce energy."""
         spec = ObservationSpec.for_mode('ground_truth', config)
         env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
 
         env.agent_x[0] = 10
         env.agent_y[0] = 10
-        env.agent_energy[0] = 100.0  # Survive poison
+        initial_energy = 100.0
+        env.agent_energy[0] = initial_energy  # Survive poison
 
         right_action = None
         for idx in range(8):
@@ -498,18 +503,22 @@ class TestRewardMechanics:
         env.grids[0, 10, 11] = CellType.POISON.value
 
         actions = torch.tensor([right_action], dtype=torch.long, device=device)
-        obs, rewards, dones = env.step(actions)
+        obs, eating_info, terminated, truncated = env.step(actions)
+        food_mask, poison_mask, starved_mask = eating_info
 
-        # Reward should be negative
-        assert rewards[0].item() < 0, f"Poison reward should be negative, got {rewards[0].item()}"
+        # Agent should have eaten poison
+        assert poison_mask[0].item(), "Agent should have eaten poison"
+        # Energy should have decreased (poison penalty + move cost)
+        assert env.agent_energy[0].item() < initial_energy, "Energy should decrease after poison"
 
-    def test_empty_step_has_small_negative_reward(self, config, device):
-        """Moving to empty cell should have small negative reward (move cost)."""
+    def test_empty_step_only_costs_movement(self, config, device):
+        """Moving to empty cell should only cost movement energy."""
         spec = ObservationSpec.for_mode('ground_truth', config)
         env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
 
         env.agent_x[0] = 10
         env.agent_y[0] = 10
+        initial_energy = env.agent_energy[0].item()
 
         # Clear target cell
         env.grids[0, 10, 11] = CellType.EMPTY.value
@@ -522,11 +531,15 @@ class TestRewardMechanics:
                 break
 
         actions = torch.tensor([right_action], dtype=torch.long, device=device)
-        obs, rewards, dones = env.step(actions)
+        obs, eating_info, terminated, truncated = env.step(actions)
+        food_mask, poison_mask, starved_mask = eating_info
 
-        # Reward should be small negative (just move cost)
-        assert rewards[0].item() < 0, f"Empty move should have negative reward"
-        assert rewards[0].item() > -1.0, f"Empty move reward too negative: {rewards[0].item()}"
+        # Agent should not have eaten anything
+        assert not food_mask[0].item(), "Agent should not have eaten food"
+        assert not poison_mask[0].item(), "Agent should not have eaten poison"
+        # Energy should only decrease by move cost
+        expected = initial_energy - env.energy_move_cost
+        assert abs(env.agent_energy[0].item() - expected) < 0.01, "Energy should decrease by move cost only"
 
 
 class TestSpawnCorrectness:

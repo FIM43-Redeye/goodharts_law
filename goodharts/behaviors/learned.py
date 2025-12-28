@@ -106,6 +106,12 @@ class LearnedBehavior(BehaviorStrategy):
                 mode = metadata.get('mode', '?')
                 logger.info(f"Loaded model from {self.model_path} (mode={mode}, steps={steps})")
 
+                # Update action space from checkpoint if available
+                # This ensures we use the same action space the model was trained with
+                if 'action_space' in metadata:
+                    self.action_space = load_action_space(metadata['action_space'])
+                    logger.debug(f"Loaded action space from checkpoint: {self.action_space}")
+
             except FileNotFoundError:
                 logger.warning(f"Model not found at {self.model_path}, using random weights")
                 self.brain = None

@@ -1,144 +1,162 @@
 # Goodhart's Law Simulation - Default Configuration
 #
-# This file contains the default settings shipped with the project.
-# To customize, copy this to `config.toml` and edit that file.
-# config.toml is in .gitignore so your changes won't be committed.
-#
-# Usage:
-#   python main.py                     # Uses config.toml (or config.default.toml)
-#   python main.py --config other.toml # Uses specific config
+# To customize: copy to `config.toml` and edit (gitignored).
+# CLI args override config values where applicable.
 
 # =============================================================================
-# WORLD
+# CELL TYPES - The physics of the world
 # =============================================================================
+# Each cell type has intrinsic properties that define:
+#   - energy_delta: Energy change when consumed (positive = food, negative = poison)
+#   - interestingness: What proxy-metric agents observe (the misleading signal)
+#   - color: RGB for visualization
+
+[cell_types.empty]
+color = [26, 26, 46]
+energy_delta = 0.0
+interestingness = 0.0
+
+[cell_types.wall]
+color = [74, 74, 74]
+energy_delta = 0.0
+interestingness = 0.0
+
+[cell_types.food]
+color = [22, 199, 154]
+energy_delta = 1.0
+interestingness = 1.0
+
+[cell_types.poison]
+color = [255, 107, 107]
+energy_delta = -2.0
+interestingness = 0.9    # Nearly as "interesting" as food - the trap!
+
+[cell_types.prey]
+color = [0, 255, 255]
+energy_delta = 10.0     # Edible?
+interestingness = 0.0
+
+[cell_types.predator]
+color = [255, 0, 0]
+energy_delta = 0.0
+interestingness = 1.0
+
+# =============================================================================
+# WORLD - Grid geometry
+# =============================================================================
+
 [world]
-width = 100
-height = 100
-loop = true   # true = edges wrap (toroidal), false = bounded with walls
+width = 128
+height = 128
+loop = true              # Toroidal (wrap edges) vs bounded (walls at edges)
 
 # =============================================================================
-# RESOURCES
+# RESOURCES - What spawns in the world
 # =============================================================================
+
 [resources]
-food = 500      # Matches training final_food for consistency
-poison = 50     # Initial poison items
-respawn = true  # Respawn consumed resources
+food = 500
+poison = 50
+respawn = true           # Respawn consumed items
 
 # =============================================================================
-# AGENTS
+# AGENTS - Who lives in the world
 # =============================================================================
 # Each [[agents]] block spawns agents of that type.
-# Available types: OmniscientSeeker, ProxySeeker, 
-#                  ground_truth, proxy, proxy_jammed (presets)
+# Types: OmniscientSeeker, ProxySeeker, or learned presets (ground_truth, proxy)
 
 [[agents]]
 type = "OmniscientSeeker"
 count = 5
 
 [[agents]]
-type = "ProxySeeker" 
+type = "ProxySeeker"
 count = 5
 
-# Example: learned agents
+# Learned agent example:
 # [[agents]]
 # type = "ground_truth"
 # count = 3
-# model = "goodharts/models/ground_truth.pth"
+# model = "models/ground_truth.pth"
 
-# =============================================================================
-# AGENT PROPERTIES
-# =============================================================================
 [agent]
-view_range = 5         # How far agents can see
-energy_start = 50.0    # Starting energy
-energy_move_cost = 0.05 # Cheap movement to encourage exploration (was 0.1)
+view_range = 5           # Observation radius (creates 11x11 view)
+energy_start = 50.0
+energy_move_cost = 0.05
 move_cost_exponent = 1.5
-max_move_distance = 3  # Speed cap
+max_move_distance = 1
 
 # =============================================================================
-# VISUALIZATION (for main.py)
+# VISUALIZATION - main.py display settings
 # =============================================================================
+
 [visualization]
-speed = 50    # Animation interval in ms (lower = faster)
-steps = 0     # 0 = run forever, >0 = stop after N steps
+speed = 50               # Animation interval (ms), lower = faster
+steps = 0                # 0 = infinite, N = stop after N steps
 
-# =============================================================================
-# BRAIN VIEW MODE
-# =============================================================================
-# When enabled, spawns a SINGLE agent for neural network visualization.
-# This REPLACES the [[agents]] list above.
 [brain_view]
-enabled = false
+enabled = false          # Single-agent mode for neural net visualization
 agent_type = "ground_truth"
-model = ""           # Optional: specific model path (empty = auto-detect)
-freeze_energy = true # If true, agent energy stays constant (for visualization)
+model = ""               # Empty = auto-detect latest
+freeze_energy = true     # Keep energy constant for cleaner visualization
 
 # =============================================================================
-# RUNTIME
+# TRAINING - PPO hyperparameters
 # =============================================================================
-[runtime]
-# device = "cuda"      # Force specific device: "cpu", "cuda", "cuda:0", etc.
-#                      # Leave commented for auto-detection (CUDA > CPU)
-#                      # Can also use GOODHARTS_DEVICE env var
 
-# hsa_override_gfx_version = "11.0.0" # Override for ROCm iGPU support (e.g. gfx1103 -> 11.0.0)
-
-# cuDNN benchmark mode - runs algorithm selection to find fastest kernels
-# ON: ~3% faster training, but 60-300s startup (NVIDIA caches well, AMD doesn't)
-# OFF: Fast startup (~4s), slightly slower training
-# Default ON because we detect AMD issues and abort cuDNN benching
-cudnn_benchmark = true
-
-
-# =============================================================================
-# TRAINING (for train_ppo.py and other training scripts)
-# =============================================================================
 [training]
-# Curriculum learning - gradually make environment harder
-initial_food = 200          # Start sparse (was 500)
-final_food = 50             # End very sparse (was 200)
-curriculum_fraction = 0.7   # Fraction of episodes for curriculum
+# Algorithm
+learning_rate = 0.0003
+gamma = 0.99             # Discount factor
+gae_lambda = 0.95        # GAE bias-variance tradeoff
+eps_clip = 0.2           # PPO clipping
+k_epochs = 4             # PPO epochs per update
+entropy_coef = 0.01
+value_coef = 0.5
+reward_scale = 0.1
 
-# Environment density ranges (randomized each update for robustness)
-min_food = 50               # Minimum food count during training
-max_food = 200              # Maximum food count during training  
-min_poison = 20             # Minimum poison count during training
-max_poison = 100            # Maximum poison count during training
-steps_per_episode = 512     # Max steps per episode
+# Batching
+n_envs = 192             # Parallel environments
+n_minibatches = 1        # 1 = full batch gradient descent
+steps_per_env = 128      # Rollout length (horizon)
+steps_per_episode = 512  # Max steps before forced reset
 
-# PPO hyperparameters
-learning_rate = 0.0003       # 3e-4
-gamma = 0.99                # Discount factor
-gae_lambda = 0.95           # GAE lambda (bias-variance tradeoff)
-eps_clip = 0.2              # PPO clipping parameter
-k_epochs = 4                # PPO epochs per update
-steps_per_env = 128         # Horizon length for PPO (critical for GAE)
-n_envs = 192                # Parallel envs (192 = less GPU burstiness than 64, fits 8GB VRAM)
-n_minibatches = 1           # 1 = full batch (max VRAM utilization, best for single GPU)
-value_coef = 0.5            # Value loss coefficient
-brain_type = "base_cnn"     # Neural network architecture
-value_head_type = "popart"  # "simple" or "popart" (adaptive normalization)
+# Architecture
+brain_type = "base_cnn"
+value_head_type = "popart"
+action_space_type = "discrete_grid"
 
-# Reward shaping - provides gradient toward food/away from poison
-reward_scale = 0.1          # Standardize rewards (was 1.0)
-entropy_coef = 0.01         # Standard PPO entropy (was 0.002)
-shaping_food_attract = 0.5  # Reward weight for moving toward visible food
-shaping_poison_repel = 0.3  # Reward weight for moving away from visible poison
-enable_shaping = true       # Enable/disable shaping rewards
+# Environment curriculum
+initial_food = 200
+final_food = 50
+curriculum_fraction = 0.7
+min_food = 50
+max_food = 200
+min_poison = 20
+max_poison = 100
 
 # Performance
-compile_models = true       # Enable torch.compile (JIT)
-use_amp = true              # Mixed precision (fp16) for 2x memory bandwidth
+compile_models = true    # torch.compile (JIT)
+compile_mode = "max-autotune-no-cudagraphs"  # reduce-overhead, max-autotune, max-autotune-no-cudagraphs
+use_amp = true           # Mixed precision (fp16)
 
-# Long training run options
-checkpoint_interval = 0     # Save checkpoint every N updates (0 = disabled)
-lr_decay = false            # Enable learning rate decay over training
-lr_decay_factor = 0.1       # Final LR = initial_lr * factor (if lr_decay enabled)
+# Checkpointing
+checkpoint_interval = 0  # Save every N updates (0 = disabled)
+lr_decay = false
+lr_decay_factor = 0.1
 
-# Validation (periodic eval without exploration)
-validation_interval = 0       # Run every N PPO updates (disabled by default for speed)
-validation_episodes = 16      # Episodes per validation run
-validation_mode = "training"  # "training" = same env, "fixed" = controlled density
-validation_food = 100         # Fixed mode: food count
-validation_poison = 50        # Fixed mode: poison count
+# Validation
+validation_interval = 0  # Eval every N updates (0 = disabled)
+validation_episodes = 16
+validation_mode = "training"
+validation_food = 100
+validation_poison = 50
 
+# =============================================================================
+# RUNTIME - Device and system settings
+# =============================================================================
+
+[runtime]
+# device = "cuda"        # Override auto-detection (or use GOODHARTS_DEVICE env)
+# hsa_override_gfx_version = "11.0.0"  # ROCm iGPU workaround
+cudnn_benchmark = true   # Algorithm autotuning (slow startup, faster training)

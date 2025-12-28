@@ -107,17 +107,23 @@ class TestEnvironmentDeterminism:
         env1.reset()
 
         actions = torch.tensor([0, 1, 2, 3], dtype=torch.long, device=device)
-        obs1, rewards1, dones1 = env1.step(actions)
+        obs1, eating_info1, terminated1, truncated1 = env1.step(actions)
+        food1, poison1, starved1 = eating_info1
+        dones1 = terminated1 | truncated1
 
         # Second run
         set_all_seeds(42)
         env2 = create_torch_vec_env(n_envs=4, obs_spec=spec, config=config, device=device)
         env2.reset()
 
-        obs2, rewards2, dones2 = env2.step(actions)
+        obs2, eating_info2, terminated2, truncated2 = env2.step(actions)
+        food2, poison2, starved2 = eating_info2
+        dones2 = terminated2 | truncated2
 
         assert torch.equal(obs1, obs2), "Same seed should produce same observations after step"
-        assert torch.equal(rewards1, rewards2), "Same seed should produce same rewards"
+        assert torch.equal(food1, food2), "Same seed should produce same food masks"
+        assert torch.equal(poison1, poison2), "Same seed should produce same poison masks"
+        assert torch.equal(starved1, starved2), "Same seed should produce same starved masks"
         assert torch.equal(dones1, dones2), "Same seed should produce same done flags"
 
     def test_env_trajectory_reproducible(self, config, device):
@@ -132,8 +138,10 @@ class TestEnvironmentDeterminism:
         trajectory1 = []
         for _ in range(20):
             actions = torch.randint(0, 8, (2,), device=device)
-            obs, rewards, dones = env1.step(actions)
-            trajectory1.append((obs.clone(), rewards.clone(), dones.clone()))
+            obs, eating_info, terminated, truncated = env1.step(actions)
+            food, poison, starved = eating_info
+            dones = terminated | truncated
+            trajectory1.append((obs.clone(), food.clone(), poison.clone(), starved.clone(), dones.clone()))
 
         # Second trajectory
         set_all_seeds(42)
@@ -143,13 +151,17 @@ class TestEnvironmentDeterminism:
         trajectory2 = []
         for _ in range(20):
             actions = torch.randint(0, 8, (2,), device=device)
-            obs, rewards, dones = env2.step(actions)
-            trajectory2.append((obs.clone(), rewards.clone(), dones.clone()))
+            obs, eating_info, terminated, truncated = env2.step(actions)
+            food, poison, starved = eating_info
+            dones = terminated | truncated
+            trajectory2.append((obs.clone(), food.clone(), poison.clone(), starved.clone(), dones.clone()))
 
         # Compare trajectories
-        for i, ((obs1, r1, d1), (obs2, r2, d2)) in enumerate(zip(trajectory1, trajectory2)):
+        for i, ((obs1, f1, p1, s1, d1), (obs2, f2, p2, s2, d2)) in enumerate(zip(trajectory1, trajectory2)):
             assert torch.equal(obs1, obs2), f"Observations differ at step {i}"
-            assert torch.equal(r1, r2), f"Rewards differ at step {i}"
+            assert torch.equal(f1, f2), f"Food masks differ at step {i}"
+            assert torch.equal(p1, p2), f"Poison masks differ at step {i}"
+            assert torch.equal(s1, s2), f"Starved masks differ at step {i}"
             assert torch.equal(d1, d2), f"Dones differ at step {i}"
 
 
@@ -291,7 +303,8 @@ class TestCrossRunConsistency:
             env.grids.clone()
         )
 
-        _, rewards1, _ = env.step(actions)
+        _, eating_info1, _, _ = env.step(actions)
+        food1, poison1, starved1 = eating_info1
 
         # Restore state
         env.agent_x[:] = initial_state[0]
@@ -299,6 +312,9 @@ class TestCrossRunConsistency:
         env.agent_energy[:] = initial_state[2]
         env.grids[:] = initial_state[3]
 
-        _, rewards2, _ = env.step(actions)
+        _, eating_info2, _, _ = env.step(actions)
+        food2, poison2, starved2 = eating_info2
 
-        assert torch.equal(rewards1, rewards2), "Reward computation is inconsistent"
+        assert torch.equal(food1, food2), "Food mask computation is inconsistent"
+        assert torch.equal(poison1, poison2), "Poison mask computation is inconsistent"
+        assert torch.equal(starved1, starved2), "Starved mask computation is inconsistent"

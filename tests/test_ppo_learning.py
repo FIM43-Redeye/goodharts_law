@@ -206,17 +206,18 @@ class TestTorchEnv(unittest.TestCase):
         # Assuming action space: 0: stay, 1: up, 2: down, 3: left, 4: right
         # We'll pick action 1 (Up)
         actions = torch.ones(self.n_envs, dtype=torch.long, device=self.device)
-        
-        obs, rewards, dones = env.step(actions)
-        
+
+        obs, eating_info, terminated, truncated = env.step(actions)
+        dones = terminated | truncated
+
         # Energy should decrease
         # Note: if they ate food, it might increase, but chance is low with random spawn.
         # To be safe, we check if energy changed at all.
-        
+
         self.assertFalse(torch.equal(env.agent_energy, initial_energy))
         # Check standard move cost
         move_cost = env.energy_move_cost
-        
+
         # For agents that didn't eat or die
         not_done = ~dones
         # If they didn't eat, energy should be initial - move_cost
@@ -256,14 +257,15 @@ class TestTorchEnv(unittest.TestCase):
         # Step just agent 0 (we need to step all, but we only care about 0)
         actions = torch.zeros(self.n_envs, dtype=torch.long, device=self.device)
         actions[0] = 1 # Move UP
-        
+
         initial_eps_food = env.current_episode_food[0].item()
-        
-        obs, rewards, dones = env.step(actions)
-        
-        # Check reward (Food reward is usually +1 or +10, definitely > 0)
-        self.assertGreater(rewards[0].item(), 0.0)
-        
+
+        obs, eating_info, terminated, truncated = env.step(actions)
+        food_mask, poison_mask, starved_mask = eating_info
+
+        # Check that agent 0 ate food
+        self.assertTrue(food_mask[0].item(), "Agent 0 should have eaten food")
+
         # Check food count increased
         self.assertGreater(env.current_episode_food[0].item(), initial_eps_food)
         

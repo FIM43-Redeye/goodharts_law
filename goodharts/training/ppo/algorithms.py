@@ -13,7 +13,7 @@ from torch.distributions import Categorical
 def compute_gae(
     rewards: torch.Tensor | list[torch.Tensor],
     values: torch.Tensor | list[torch.Tensor],
-    dones: torch.Tensor | list[torch.Tensor],
+    terminated: torch.Tensor | list[torch.Tensor],
     next_value: torch.Tensor,
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
@@ -25,10 +25,15 @@ def compute_gae(
     Accepts either pre-allocated tensors (T, n_envs) or lists of tensors.
     Using tensors directly avoids torch.stack overhead.
 
+    IMPORTANT: Only use `terminated` (true episode ends like death), NOT
+    `truncated` (artificial time limits). Truncation should bootstrap with V(s),
+    not zero - the episode didn't really end, we just stopped collecting.
+
     Args:
         rewards: Tensor (T, n_envs) or list of (n_envs,) tensors
         values: Tensor (T, n_envs) or list of (n_envs,) tensors
-        dones: Tensor (T, n_envs) or list of (n_envs,) tensors
+        terminated: Tensor (T, n_envs) - True only when episode TRULY ends
+                    (e.g., agent death). Do NOT include truncation (time limits).
         next_value: Bootstrap value for final state, shape (n_envs,)
         gamma: Discount factor
         gae_lambda: GAE lambda parameter
@@ -42,17 +47,18 @@ def compute_gae(
     if isinstance(rewards, list):
         rewards_t = torch.stack(rewards)      # (T, n_envs)
         values_t = torch.stack(values)        # (T, n_envs)
-        dones_t = torch.stack(dones).float()  # (T, n_envs)
+        terminated_t = torch.stack(terminated).float()  # (T, n_envs)
     else:
         rewards_t = rewards
         values_t = values
-        dones_t = dones.float() if dones.dtype == torch.bool else dones
-    
+        terminated_t = terminated.float() if terminated.dtype == torch.bool else terminated
+
     device = device or rewards_t.device
     T, n_envs = rewards_t.shape
-    
-    # Pre-compute masks: 1 where episode continues, 0 where it ends
-    masks = 1.0 - dones_t  # (T, n_envs)
+
+    # Masks: 1 where episode continues, 0 where agent truly died (terminated)
+    # Truncation (time limits) should NOT zero the mask - those episodes continue
+    masks = 1.0 - terminated_t  # (T, n_envs)
     
     # Build next_values tensor: values shifted by 1, with bootstrap at end
     # next_values[t] = values[t+1] for t < T-1, next_value for t = T-1

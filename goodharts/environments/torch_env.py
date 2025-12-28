@@ -17,10 +17,10 @@ from goodharts.utils.device import get_device
 
 
 # Build action deltas as a torch tensor
-def _build_action_deltas(device: torch.device) -> torch.Tensor:
-    """Build action delta tensor matching build_action_space(1) order."""
+def _build_action_deltas(device: torch.device, max_move_distance: int = 1) -> torch.Tensor:
+    """Build action delta tensor matching build_action_space order."""
     from goodharts.behaviors.action_space import build_action_space
-    actions = build_action_space(1)  # Get action list
+    actions = build_action_space(max_move_distance)
     deltas = []
     for action in actions:
         if isinstance(action, (tuple, list)) and len(action) >= 2:
@@ -126,9 +126,10 @@ class TorchVecEnv:
         if agent_types is None:
             agent_types = [self.CellType.PREY.value] * n_envs
         self.agent_types = torch.tensor(agent_types, dtype=torch.int32, device=device)
-        
-        # Action deltas
-        self.action_deltas = _build_action_deltas(device)
+
+        # Action deltas - must match policy's action space
+        self.max_move_distance = config.get('MAX_MOVE_DISTANCE', 1)
+        self.action_deltas = _build_action_deltas(device, self.max_move_distance)
         
         # Grid setup
         self.n_grids = 1 if shared_grid else n_envs
@@ -157,13 +158,17 @@ class TorchVecEnv:
             dtype=torch.float32, device=device
         )
         
-        # Done states
-        self.dones = torch.zeros(n_envs, dtype=torch.bool, device=device)
+        # Done states - separate terminated (real death) from truncated (time limit)
+        self.terminated = torch.zeros(n_envs, dtype=torch.bool, device=device)
+        self.truncated = torch.zeros(n_envs, dtype=torch.bool, device=device)
+        self.dones = torch.zeros(n_envs, dtype=torch.bool, device=device)  # Combined for resets
 
         # Pre-allocated temporaries for step() to avoid per-step allocations
         self._old_y = torch.zeros(n_envs, dtype=torch.int32, device=device)
         self._old_x = torch.zeros(n_envs, dtype=torch.int32, device=device)
         self._dones_return = torch.zeros(n_envs, dtype=torch.bool, device=device)
+        self._terminated_return = torch.zeros(n_envs, dtype=torch.bool, device=device)
+        self._truncated_return = torch.zeros(n_envs, dtype=torch.bool, device=device)
         self._step_rewards = torch.zeros(n_envs, dtype=torch.float32, device=device)
         self._empty_value = torch.tensor(self.CellType.EMPTY.value, device=device, dtype=torch.float32)
         self._neg_inf = torch.tensor(-float('inf'), device=device, dtype=torch.float32)
@@ -617,8 +622,16 @@ class TorchVecEnv:
         ).expand(max_k)
         flat_grid.scatter_(0, flat_indices, scatter_values)
     
-    def step(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Execute batched actions with proper grid updates."""
+    def step(self, actions: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+        """
+        Execute batched actions with proper grid updates.
+
+        Returns:
+            observations: (n_envs, channels, height, width) observation tensor
+            eating_info: (food_mask, poison_mask, starved_mask) - what happened this step
+            terminated: (n_envs,) boolean - True when agent died (starvation)
+            truncated: (n_envs,) boolean - True when episode hit max_steps (time limit)
+        """
         # Ensure actions are on device
         if actions.device != self.device:
             actions = actions.to(self.device)
@@ -642,27 +655,26 @@ class TorchVecEnv:
             self.agent_x = torch.clamp(self.agent_x + dx, 0, self.width - 1)
             self.agent_y = torch.clamp(self.agent_y + dy, 0, self.height - 1)
 
-        # Energy cost
+        # Energy cost (physical, happens regardless of reward mode)
         self.agent_energy -= self.energy_move_cost
 
-        # Eating (updates underlying_cell and clears eaten items)
-        rewards = self._eat_batch()
+        # Eating (updates energy, underlying_cell, and clears eaten items)
+        food_mask, poison_mask = self._eat_batch()
 
         # Mark agents at new positions
         self.grids[self.grid_indices, self.agent_y, self.agent_x] = self.agent_types.float()
 
         # Step count and done check
+        # Separate terminated (real death) from truncated (time limit)
         self.agent_steps += 1
-        self.dones = (self.agent_energy <= 0) | (self.agent_steps >= self.max_steps)
+        self.terminated = self.agent_energy <= 0  # Agent died (starvation)
+        self.truncated = self.agent_steps >= self.max_steps  # Hit time limit (neutral)
+        self.dones = self.terminated | self.truncated  # Combined for reset logic
 
-        # Death penalty (ONLY for starvation, not timeout)
-        rewards = torch.where(self.agent_energy <= 0, rewards - 10.0, rewards)
-
-        # Movement cost (living penalty) - crucial for sparse reward learning!
-        rewards -= self.energy_move_cost
-
-        # Save dones before reset (reuse pre-allocated buffer)
+        # Save signals before reset (reuse pre-allocated buffers)
         self._dones_return.copy_(self.dones)
+        self._terminated_return.copy_(self.terminated)
+        self._truncated_return.copy_(self.truncated)
 
         # Auto-reset done agents
         # Use masked reset for independent grids (training) - no GPU sync
@@ -677,26 +689,30 @@ class TorchVecEnv:
             # Independent grids: fully masked reset - ZERO GPU sync
             self._reset_agents_masked(self.dones)
 
-        return self._get_observations(), rewards, self._dones_return
+        eating_info = (food_mask, poison_mask, self.terminated)
+        return self._get_observations(), eating_info, self._terminated_return, self._truncated_return
     
-    def _eat_batch(self) -> torch.Tensor:
-        """Vectorized eating logic with underlying cell tracking."""
-        # Reuse pre-allocated rewards buffer
-        self._step_rewards.zero_()
+    def _eat_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Vectorized eating logic with underlying cell tracking.
 
+        Returns:
+            (food_mask, poison_mask): Boolean tensors indicating what each agent ate.
+            The reward computer uses these to compute rewards based on mode.
+        """
         # Get cell values at agent positions (vectorized)
         cell_values = self.grids[self.grid_indices, self.agent_y, self.agent_x]
 
-        # Food eating
+        # Detect what was eaten
         food_mask = (cell_values == self.CellType.FOOD.value)
-        self._step_rewards = torch.where(food_mask, self._step_rewards + self.food_reward, self._step_rewards)
-        self.agent_energy = torch.where(food_mask, self.agent_energy + self.food_reward, self.agent_energy)
-        self.current_episode_food = torch.where(food_mask, self.current_episode_food + 1, self.current_episode_food)
-
-        # Poison eating (check against original cell_values before any modifications)
         poison_mask = (cell_values == self.CellType.POISON.value)
-        self._step_rewards = torch.where(poison_mask, self._step_rewards - self.poison_penalty, self._step_rewards)
+
+        # Update agent energy (physical consequence, independent of reward signal)
+        self.agent_energy = torch.where(food_mask, self.agent_energy + self.food_reward, self.agent_energy)
         self.agent_energy = torch.where(poison_mask, self.agent_energy - self.poison_penalty, self.agent_energy)
+
+        # Update episode counters
+        self.current_episode_food = torch.where(food_mask, self.current_episode_food + 1, self.current_episode_food)
         self.current_episode_poison = torch.where(poison_mask, self.current_episode_poison + 1, self.current_episode_poison)
 
         # Determine what the cell becomes after eating
@@ -714,7 +730,7 @@ class TorchVecEnv:
         self._respawn_items_vectorized(food_mask, self.CellType.FOOD.value)
         self._respawn_items_vectorized(poison_mask, self.CellType.POISON.value)
 
-        return self._step_rewards
+        return food_mask, poison_mask
     
     def _respawn_items_vectorized(self, eaten_mask: torch.Tensor, cell_type: int):
         """

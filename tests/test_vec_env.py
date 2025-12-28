@@ -34,12 +34,18 @@ def test_vec_env_step(config):
     
     # Random actions (8 possible directions)
     actions = torch.randint(0, 8, (8,), device=env.device)
-    
-    obs, rewards, dones = env.step(actions)
-    
+
+    obs, eating_info, terminated, truncated = env.step(actions)
+    food_mask, poison_mask, starved_mask = eating_info
+    dones = terminated | truncated
+
     assert obs.shape[0] == 8  # batch size
     assert obs.shape[1] == spec.num_channels
-    assert rewards.shape == (8,)
+    assert food_mask.shape == (8,)
+    assert poison_mask.shape == (8,)
+    assert starved_mask.shape == (8,)
+    assert terminated.shape == (8,)
+    assert truncated.shape == (8,)
     assert dones.shape == (8,)
 
 
