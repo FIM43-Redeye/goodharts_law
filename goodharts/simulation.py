@@ -196,39 +196,39 @@ class Simulation:
                 actions.append(0) # No-Op
         
         actions_tensor = torch.tensor(actions, dtype=torch.int32, device=self.vec_env.device)
-        
+
         # 3. Step VecEnv
-        # returns next_obs, rewards, dones (all tensors)
-        _, rewards, dones = self.vec_env.step(actions_tensor)
-        
+        # returns next_obs, eating_info, terminated, truncated
+        _, eating_info, terminated, truncated = self.vec_env.step(actions_tensor)
+        food_mask, poison_mask, starved_mask = eating_info
+        dones = terminated | truncated  # Combined for reset detection
+
         # 4. Process Events (Deaths, Stats)
         # We iterate to log events - might be slow for huge N, but fine for sim viz
         # Move relevant tensors to CPU once if needed, or index scalar
-        
+
         # Accessing single scalars from CUDA tensor is slow due to synchronization
         # But for 'simulation mode' (visualized), we tolerate it.
         # For training mode, we wouldn't use this class (Trainer uses VecEnv directly).
-        
-        rewards_cpu = rewards.cpu().numpy()
+
         dones_cpu = dones.cpu().numpy()
-        
-        # Helper to get energy efficiently? 
-        # Actually agent.energy accesses .item() which syncs.
-        
+        terminated_cpu = terminated.cpu().numpy()
+        truncated_cpu = truncated.cpu().numpy()
+        poison_cpu = poison_mask.cpu().numpy()
+
         for i, agent in enumerate(self.agents):
             # Check for death/reset
             if dones_cpu[i]:
-                current_energy = agent.energy # This is post-reset (so it's full)
-                # We need PRE-reset energy to know if it starved.
-                # But VecEnv auto-resets.
-                # If reward was very negative, it was poison or starvation.
-                
-                if rewards_cpu[i] <= POISON_REWARD_THRESHOLD:
-                    reason = "Poisoned"
-                elif rewards_cpu[i] <= STARVATION_REWARD_THRESHOLD:
-                    reason = "Starvation"
+                # Determine reason from terminated/truncated signals
+                if terminated_cpu[i]:
+                    # Agent truly died - check if poisoned or starved
+                    if poison_cpu[i]:
+                        reason = "Poisoned"
+                    else:
+                        reason = "Starvation"
                 else:
-                    reason = "Old Age" # Not really implemented yet
+                    # truncated_cpu[i] must be True - hit time limit
+                    reason = "Old Age"
                 
                 # Log death
                 b_name = get_behavior_name(agent.behavior)

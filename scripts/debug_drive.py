@@ -69,15 +69,16 @@ def debug_drive():
 
     # Step 2: Move Right (Action 6)
     print("\nExecuting Action 6 (Right)...")
-    actions = torch.tensor([6], device=device) 
-    obs, rewards, dones = env.step(actions)
-    
-    print(f"Reward Received: {rewards[0].item()}")
-    
-    if rewards[0].item() > 0:
+    actions = torch.tensor([6], device=device)
+    obs, eating_info, terminated, truncated = env.step(actions)
+    food_mask, poison_mask, starved_mask = eating_info
+
+    print(f"Food eaten: {food_mask[0].item()}")
+
+    if food_mask[0].item():
         print("SUCCESS: Agent ate food!")
     else:
-        print(f"FAILURE: Agent did not eat! Reward: {rewards[0].item()}")
+        print("FAILURE: Agent did not eat!")
         
     # Verify Agent Position
     print(f"New Position: {env.agent_y[0].item()}, {env.agent_x[0].item()}")

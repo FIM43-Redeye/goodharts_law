@@ -303,5 +303,7 @@ class TestLearnedBehaviorLoading:
 
         assert len(result) == 2, "decide_action should return (dx, dy)"
         dx, dy = result
-        assert -1 <= dx <= 1, f"dx out of range: {dx}"
-        assert -1 <= dy <= 1, f"dy out of range: {dy}"
+        # Action range depends on the model's action space (loaded from checkpoint)
+        max_dist = behavior.action_space.max_move_distance
+        assert -max_dist <= dx <= max_dist, f"dx out of range: {dx}"
+        assert -max_dist <= dy <= max_dist, f"dy out of range: {dy}"

@@ -592,6 +592,7 @@ class PPOConfig:
     log_dir: str = 'generated/logs'
     use_amp: bool = False
     compile_models: bool = True
+    compile_mode: str = 'max-autotune-no-cudagraphs'  # reduce-overhead, max-autotune, max-autotune-no-cudagraphs
     tensorboard: bool = False
     skip_warmup: bool = False
     use_torch_env: bool = True
@@ -618,8 +619,8 @@ class PPOConfig:
         """
         Create PPOConfig from config.toml with optional CLI overrides.
 
-        Config file provides defaults; explicit kwargs override them.
-        This allows CLI args to be truly optional.
+        TOML provides all defaults; explicit kwargs override them.
+        Missing TOML keys will raise KeyError - no silent fallbacks.
 
         Args:
             mode: Training mode (ground_truth, proxy, etc.)
@@ -627,34 +628,39 @@ class PPOConfig:
 
         Returns:
             PPOConfig with values from config file + overrides
-        """
-        train_cfg = get_training_config()
 
-        # Build config from file defaults
+        Raises:
+            KeyError: If required config keys are missing from TOML
+        """
+        from goodharts.config import get_agent_config
+        train_cfg = get_training_config()
+        agent_cfg = get_agent_config()
+
+        # Build config from TOML - no fallbacks, missing keys will crash
         config_values = {
             'mode': mode,
-            'brain_type': train_cfg.get('brain_type', 'base_cnn'),
-            'value_head_type': train_cfg.get('value_head_type', 'popart'),
-            'action_space_type': train_cfg.get('action_space_type', 'discrete_grid'),
-            'max_move_distance': train_cfg.get('max_move_distance', 1),
-            'n_envs': train_cfg.get('n_envs', 64),
-            'lr': train_cfg.get('learning_rate', 3e-4),
-            'gamma': train_cfg.get('gamma', 0.99),
-            'gae_lambda': train_cfg.get('gae_lambda', 0.95),
-            'eps_clip': train_cfg.get('eps_clip', 0.2),
-            'k_epochs': train_cfg.get('k_epochs', 4),
-            'steps_per_env': train_cfg.get('steps_per_env', 128),
-            'n_minibatches': train_cfg.get('n_minibatches', 4),
-            'entropy_coef': train_cfg.get('entropy_coef', 0.01),
-            'value_coef': train_cfg.get('value_coef', 0.5),
-            'use_amp': train_cfg.get('use_amp', False),
-            'compile_models': train_cfg.get('compile_models', True),
+            'brain_type': train_cfg['brain_type'],
+            'value_head_type': train_cfg['value_head_type'],
+            'action_space_type': train_cfg['action_space_type'],
+            'max_move_distance': agent_cfg['max_move_distance'],
+            'n_envs': train_cfg['n_envs'],
+            'lr': train_cfg['learning_rate'],
+            'gamma': train_cfg['gamma'],
+            'gae_lambda': train_cfg['gae_lambda'],
+            'eps_clip': train_cfg['eps_clip'],
+            'k_epochs': train_cfg['k_epochs'],
+            'steps_per_env': train_cfg['steps_per_env'],
+            'n_minibatches': train_cfg['n_minibatches'],
+            'entropy_coef': train_cfg['entropy_coef'],
+            'value_coef': train_cfg['value_coef'],
+            'use_amp': train_cfg['use_amp'],
+            'compile_models': train_cfg['compile_models'],
             # Validation
-            'validation_interval': train_cfg.get('validation_interval', 0),
-            'validation_episodes': train_cfg.get('validation_episodes', 16),
-            'validation_mode': train_cfg.get('validation_mode', 'training'),
-            'validation_food': train_cfg.get('validation_food', 100),
-            'validation_poison': train_cfg.get('validation_poison', 50),
+            'validation_interval': train_cfg['validation_interval'],
+            'validation_episodes': train_cfg['validation_episodes'],
+            'validation_mode': train_cfg['validation_mode'],
+            'validation_food': train_cfg['validation_food'],
+            'validation_poison': train_cfg['validation_poison'],
         }
 
         # Apply overrides (CLI args take precedence)
@@ -804,6 +810,7 @@ class PPOTrainer:
         log_probs_buf = self._log_probs_buf
         rewards_buf = self._rewards_buf
         dones_buf = self._dones_buf
+        terminated_buf = self._terminated_buf
         values_buf = self._values_buf
 
         for step in range(cfg.steps_per_env):
@@ -824,8 +831,9 @@ class PPOTrainer:
                         log_probs = dist.log_prob(actions)
 
             current_states = states.clone()
-            next_states, rewards, dones = self.vec_env.step(actions)
-            shaped_rewards = self.reward_computer.compute(rewards, current_states, next_states, dones)
+            next_states, eating_info, terminated, truncated = self.vec_env.step(actions)
+            dones = terminated | truncated
+            shaped_rewards = self.reward_computer.compute(eating_info, current_states, next_states, terminated)
 
             # Store in pre-allocated tensor buffers
             states_buf[step] = current_states
@@ -833,9 +841,10 @@ class PPOTrainer:
             log_probs_buf[step] = log_probs.detach()
             rewards_buf[step] = shaped_rewards
             dones_buf[step] = dones
+            terminated_buf[step] = terminated
             values_buf[step] = values
 
-            episode_rewards += rewards
+            episode_rewards += shaped_rewards
             episode_rewards *= (~dones)
             states = next_states
 
@@ -846,8 +855,9 @@ class PPOTrainer:
             next_value = self.value_head(features).squeeze(-1)
 
         # Compute GAE (pass tensors directly, no stacking needed)
+        # Use terminated_buf - only zero bootstrap on true death
         advantages, returns = compute_gae(
-            rewards_buf, values_buf, dones_buf,
+            rewards_buf, values_buf, terminated_buf,
             next_value, cfg.gamma, cfg.gae_lambda, device=self.device
         )
 
@@ -1063,9 +1073,9 @@ class PPOTrainer:
         with _COMPILE_LOCK:
             if cfg.compile_models and hasattr(torch, 'compile') and not is_tpu(self.device):
                 try:
-                    # Try max-autotune with CUDA graphs (works on ROCm 7.1+)
-                    # Falls back to no-cudagraphs if graphs fail
-                    compile_mode = 'max-autotune'
+                    # Use configured compile mode
+                    # max-autotune-no-cudagraphs is safest for AMD ROCm
+                    compile_mode = cfg.compile_mode
 
                     # Compile the full inference step, not just individual models
                     # This fuses .float(), autocast, forward, and squeeze into one graph
@@ -1123,9 +1133,10 @@ class PPOTrainer:
         
         
         # Reward computer - unified class handles both numpy and torch
+        # Shaping is now handled internally by each RewardComputer subclass
         self.reward_computer = RewardComputer.create(
-            cfg.mode, self.spec, cfg.gamma, 
-            shaping_coef=train_cfg['shaping_food_attract'], 
+            cfg.mode, self.spec, sim_config,
+            gamma=cfg.gamma,
             device=self.device
         )
         
@@ -1175,7 +1186,9 @@ class PPOTrainer:
 
         # Background bookkeeper - processes metrics in parallel with GPU work
         # Uses double-buffered pinned memory for zero-copy submission
-        buffer_size = N_SCALAR_METRICS + 16  # Schema metrics + action probs
+        from goodharts.behaviors.action_space import num_actions
+        n_actions = num_actions(cfg.max_move_distance)
+        buffer_size = N_SCALAR_METRICS + n_actions  # Schema metrics + action probs
         self.bookkeeper = BackgroundBookkeeper(
             buffer_size=buffer_size,
             async_logger=self.async_logger,
@@ -1210,6 +1223,7 @@ class PPOTrainer:
         self._log_probs_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
         self._rewards_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
         self._dones_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
+        self._terminated_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
         self._values_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
 
         # Episode tracking buffers (for async logging)
@@ -1239,6 +1253,7 @@ class PPOTrainer:
         log_probs_buf = self._log_probs_buf
         rewards_buf = self._rewards_buf
         dones_buf = self._dones_buf
+        terminated_buf = self._terminated_buf
         values_buf = self._values_buf
         finished_dones_buf = self._finished_dones_buf
         finished_rewards_buf = self._finished_rewards_buf
@@ -1377,20 +1392,23 @@ class PPOTrainer:
             # CRITICAL: Snapshot state BEFORE step because env may mutate it in-place!
             with record_function("ENV_STEP"):
                 current_states = states.clone()
-                next_states, rewards, dones = self.vec_env.step(actions)
+                next_states, eating_info, terminated, truncated = self.vec_env.step(actions)
+                dones = terminated | truncated  # Combined for episode tracking
 
             # Compute shaped rewards (torch-native, stays on GPU)
+            # Pass terminated (not dones) - truncation is neutral, not failure
             with record_function("REWARD_SHAPE"):
                 shaped_rewards = self.reward_computer.compute(
-                    rewards, current_states, next_states, dones
+                    eating_info, current_states, next_states, terminated
                 )
-            
+
             # Store experience in pre-allocated tensor buffers (no torch.cat needed)
             states_buf[step_in_buffer] = current_states
             actions_buf[step_in_buffer] = actions
             log_probs_buf[step_in_buffer] = log_probs.detach()
             rewards_buf[step_in_buffer] = shaped_rewards
             dones_buf[step_in_buffer] = dones
+            terminated_buf[step_in_buffer] = terminated
             values_buf[step_in_buffer] = values
 
             # Track episode stats (defer logging to avoid Sync)
@@ -1399,10 +1417,10 @@ class PPOTrainer:
 
             step_in_buffer += 1
             self.total_steps += cfg.n_envs
-            episode_rewards += rewards  # Tensor addition
+            episode_rewards += shaped_rewards  # Tensor addition
 
             self.profiler.tick("Env Step")
-            
+
             # Reset rewards for done agents (Sync-free)
             # episode_rewards = episode_rewards * (1 - dones)
             episode_rewards *= (~dones)
@@ -1421,8 +1439,9 @@ class PPOTrainer:
                         next_value = self.value_head(features).squeeze(-1)
 
                     # Compute GAE (pass pre-allocated tensors directly, no stacking)
+                    # Use terminated_buf (not dones_buf) - only zero bootstrap on true death
                     advantages, returns = compute_gae(
-                        rewards_buf, values_buf, dones_buf,
+                        rewards_buf, values_buf, terminated_buf,
                         next_value, cfg.gamma, cfg.gae_lambda, device=self.device
                     )
 
@@ -1792,14 +1811,16 @@ class PPOTrainer:
         with torch.no_grad():
             while episodes_done < cfg.validation_episodes and steps < max_steps:
                 states_t = states.float()
-                
+
                 # Deterministic action selection (argmax instead of sample)
                 logits = self.policy(states_t)
                 actions = logits.argmax(dim=-1)
-                
-                next_states, rewards, dones = val_env.step(actions)
-                episode_rewards += rewards
-                
+
+                next_states, eating_info, terminated, truncated = val_env.step(actions)
+                dones = terminated | truncated
+                shaped_rewards = self.reward_computer.compute(eating_info, states, next_states, terminated)
+                episode_rewards += shaped_rewards
+
                 # Check for completed episodes
                 done_mask = dones.nonzero(as_tuple=False).squeeze(-1)
                 if done_mask.numel() > 0:

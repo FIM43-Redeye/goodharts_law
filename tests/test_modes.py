@@ -113,61 +113,78 @@ class TestRewardComputer:
     
     def test_reward_computer_factory(self, config, gt_spec):
         """RewardComputer.create should return correct subclass."""
-        computer = RewardComputer.create('ground_truth', gt_spec, gamma=0.99)
+        computer = RewardComputer.create('ground_truth', gt_spec, config, gamma=0.99)
         assert isinstance(computer, GroundTruthRewards)
-        
+
         # proxy mode uses ProxyRewards (main Goodhart failure case)
         proxy_spec = ObservationSpec.for_mode('proxy', config)
-        computer = RewardComputer.create('proxy', proxy_spec, gamma=0.99)
+        computer = RewardComputer.create('proxy', proxy_spec, config, gamma=0.99)
         assert isinstance(computer, ProxyRewards)
-        
+
         # proxy_jammed uses ProxyJammedRewards (information asymmetry case)
         jammed_spec = ObservationSpec.for_mode('proxy_jammed', config)
-        computer = RewardComputer.create('proxy_jammed', jammed_spec, gamma=0.99)
+        computer = RewardComputer.create('proxy_jammed', jammed_spec, config, gamma=0.99)
         assert isinstance(computer, ProxyJammedRewards)
     
     def test_reward_computer_compute_returns_tensor(self, config, gt_spec):
         """compute() should return shaped rewards as torch tensor."""
         import torch
         device = torch.device('cpu')
-        computer = RewardComputer.create('ground_truth', gt_spec, gamma=0.99, device=device)
-        
+        computer = RewardComputer.create('ground_truth', gt_spec, config, gamma=0.99, device=device)
+
         n_envs = 4
         view_size = gt_spec.view_size
         n_channels = gt_spec.num_channels
-        
+
         # Create dummy observations as tensors
         states = torch.randn(n_envs, n_channels, view_size, view_size, device=device)
         next_states = torch.randn(n_envs, n_channels, view_size, view_size, device=device)
-        raw_rewards = torch.randn(n_envs, device=device)
-        dones = torch.zeros(n_envs, device=device)
-        
+        dones = torch.zeros(n_envs, dtype=torch.bool, device=device)
+
+        # Create eating_info tuple (food_mask, poison_mask, starved_mask)
+        food_mask = torch.tensor([True, False, False, False], device=device)
+        poison_mask = torch.tensor([False, True, False, False], device=device)
+        starved_mask = torch.tensor([False, False, False, False], device=device)
+        eating_info = (food_mask, poison_mask, starved_mask)
+
         # Initialize potentials
         computer.initialize(states)
-        
+
         # Compute shaped rewards
-        shaped = computer.compute(raw_rewards, states, next_states, dones)
-        
+        shaped = computer.compute(eating_info, states, next_states, dones)
+
         assert shaped.shape == (n_envs,)
         assert shaped.dtype == torch.float32
-    
-    def test_reward_scaling_normalizes(self, config):
-        """HandholdRewards should scale rewards to [-1, 1] range."""
+
+    def test_reward_base_rewards(self, config):
+        """RewardComputers should compute correct base rewards from eating_info."""
         import torch
         device = torch.device('cpu')
-        
-        # Use handhold mode which actually scales rewards
-        hh_spec = ObservationSpec.for_mode('ground_truth_handhold', config)
-        computer = RewardComputer.create('ground_truth_handhold', hh_spec, gamma=0.99, device=device)
-        
-        # Test typical energy deltas
-        # Food gives +5, poison gives -3, movement costs are ~-0.05
-        raw_rewards = torch.tensor([5.0, -3.0, 0.0, -0.05], device=device)
-        
-        scaled = computer._scale_rewards(raw_rewards)
-        
-        # Food (+5) should scale to +1, poison (-3) to -1, movement to ~-0.017
-        assert scaled[0].item() == pytest.approx(1.0), "Food should scale to +1"
-        assert scaled[1].item() == pytest.approx(-1.0), "Poison should scale to -1"
-        assert scaled[2].item() == 0.0, "Zero should stay zero"
-        assert -0.1 < scaled[3].item() < 0, "Movement cost should be small negative"
+
+        # Test ground truth mode
+        gt_spec = ObservationSpec.for_mode('ground_truth', config)
+        computer = RewardComputer.create('ground_truth', gt_spec, config, gamma=0.99, device=device)
+
+        # Test eating_info scenarios
+        food_mask = torch.tensor([True, False, False, False], device=device)
+        poison_mask = torch.tensor([False, True, False, False], device=device)
+        starved_mask = torch.tensor([False, False, True, False], device=device)
+
+        rewards = computer._compute_base_rewards(food_mask, poison_mask, starved_mask)
+
+        # Expected values computed from scaled config values
+        # All penalties are relative to food_reward, so rewards scale properly
+        food_reward = computer.food_reward
+        poison_penalty = computer.poison_penalty
+        death_penalty = computer.death_penalty
+        move_cost = computer.movement_cost
+
+        expected_food = food_reward - move_cost
+        expected_poison = -poison_penalty - move_cost
+        expected_death = -death_penalty - move_cost
+        expected_nothing = -move_cost
+
+        assert rewards[0].item() == pytest.approx(expected_food, rel=0.01), "Food reward"
+        assert rewards[1].item() == pytest.approx(expected_poison, rel=0.01), "Poison penalty"
+        assert rewards[2].item() == pytest.approx(expected_death, rel=0.01), "Death penalty"
+        assert rewards[3].item() == pytest.approx(expected_nothing, rel=0.01), "Movement cost"
