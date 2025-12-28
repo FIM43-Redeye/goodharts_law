@@ -132,6 +132,9 @@ class ProcessLogger:
         reward_max: float = 0.0,
         food_mean: float = 0.0,
         poison_mean: float = 0.0,
+        # Derived curriculum-invariant metrics
+        food_ratio: float = 0.5,
+        reward_per_consumed: float = 0.0,
     ):
         """Queue update for async write. Nearly instant."""
         if self._queue is None:
@@ -154,6 +157,8 @@ class ProcessLogger:
             reward_max=reward_max,
             food_mean=food_mean,
             poison_mean=poison_mean,
+            food_ratio=food_ratio,
+            reward_per_consumed=reward_per_consumed,
             action_probs=action_probs,
         )
         row = asdict(log)

@@ -117,6 +117,15 @@ class AsyncLogger:
         if self.trainer_logger:
             # Compute means from sums (avoid div-by-zero)
             n = p.episodes_count if p.episodes_count > 0 else 1
+            food_mean = p.food_sum / n
+            poison_mean = p.poison_sum / n
+            reward_mean = p.reward_sum / n
+
+            # Derived curriculum-invariant metrics
+            total_consumed = food_mean + poison_mean
+            food_ratio = food_mean / total_consumed if total_consumed > 0 else 0.5
+            reward_per_consumed = reward_mean / total_consumed if total_consumed > 0 else 0.0
+
             self.trainer_logger.log_update(
                 update_num=p.update_count,
                 total_steps=p.total_steps,
@@ -126,11 +135,13 @@ class AsyncLogger:
                 explained_variance=p.explained_var,
                 action_probs=p.action_probs,
                 episodes_count=p.episodes_count,
-                reward_mean=p.reward_sum / n,
+                reward_mean=reward_mean,
                 reward_min=p.reward_min if p.episodes_count > 0 else 0.0,
                 reward_max=p.reward_max if p.episodes_count > 0 else 0.0,
-                food_mean=p.food_sum / n,
-                poison_mean=p.poison_sum / n,
+                food_mean=food_mean,
+                poison_mean=poison_mean,
+                food_ratio=food_ratio,
+                reward_per_consumed=reward_per_consumed,
             )
         
         # TensorBoard logging
@@ -139,6 +150,9 @@ class AsyncLogger:
             self.tb_writer.add_scalar('loss/value', p.value_loss, p.total_steps)
             self.tb_writer.add_scalar('metrics/entropy', p.entropy, p.total_steps)
             self.tb_writer.add_scalar('metrics/explained_variance', p.explained_var, p.total_steps)
+            # Curriculum-invariant metrics
+            self.tb_writer.add_scalar('metrics/food_ratio', food_ratio, p.total_steps)
+            self.tb_writer.add_scalar('metrics/reward_per_consumed', reward_per_consumed, p.total_steps)
             if p.episode_stats:
                 self.tb_writer.add_scalar('reward/episode', p.episode_stats['reward'], p.total_steps)
             # Validation metrics

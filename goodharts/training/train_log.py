@@ -46,6 +46,9 @@ class UpdateLog:
     reward_max: float = 0.0
     food_mean: float = 0.0
     poison_mean: float = 0.0
+    # Derived metrics (curriculum-invariant)
+    food_ratio: float = 0.5  # food / (food + poison), 0.5 = random
+    reward_per_consumed: float = 0.0  # reward / items eaten
     action_probs: list[float] = field(default_factory=list)
     timestamp: str = ""
 
@@ -167,6 +170,8 @@ def analyze_training_log(summary_path: str | Path) -> dict:
                 "reward_max": float(row["reward_max"]),
                 "food_mean": float(row["food_mean"]),
                 "poison_mean": float(row["poison_mean"]),
+                "food_ratio": float(row.get("food_ratio", 0.5)),
+                "reward_per_consumed": float(row.get("reward_per_consumed", 0.0)),
             })
 
     analysis = {
@@ -231,13 +236,25 @@ def analyze_training_log(summary_path: str | Path) -> dict:
         analysis["diagnostics"]["avg_final_food_eaten"] = avg_food
         analysis["diagnostics"]["avg_final_poison_eaten"] = avg_poison
 
+        # Curriculum-invariant metrics
+        weighted_food_ratio = sum(u["food_ratio"] * u["episodes_count"] for u in updates_with_episodes)
+        avg_food_ratio = weighted_food_ratio / total_episodes if total_episodes > 0 else 0.5
+        weighted_rpc = sum(u["reward_per_consumed"] * u["episodes_count"] for u in updates_with_episodes)
+        avg_reward_per_consumed = weighted_rpc / total_episodes if total_episodes > 0 else 0.0
+
+        analysis["diagnostics"]["avg_final_food_ratio"] = avg_food_ratio
+        analysis["diagnostics"]["avg_final_reward_per_consumed"] = avg_reward_per_consumed
+
         if avg_food < 1.0:
             analysis["issues"].append("Agent rarely eating food")
             analysis["recommendations"].append("Check reward shaping or curriculum")
 
-        if avg_poison > avg_food:
-            analysis["issues"].append("Agent eating more poison than food")
+        if avg_food_ratio < 0.45:
+            analysis["issues"].append(f"Food ratio {avg_food_ratio:.2f} below random (eating more poison than food)")
             analysis["recommendations"].append("Check observation space or reward signal")
+        elif avg_food_ratio < 0.55:
+            analysis["issues"].append(f"Food ratio {avg_food_ratio:.2f} near random (weak discrimination)")
+            analysis["recommendations"].append("Agent may not be learning to distinguish food from poison")
 
     # Reward trend (compare first vs last updates with episodes)
     first_with_eps = [u for u in updates[:n_final] if u["episodes_count"] > 0]

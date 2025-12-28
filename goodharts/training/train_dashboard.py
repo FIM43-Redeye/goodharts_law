@@ -57,6 +57,7 @@ class RunState:
     explained_variances: list = field(default_factory=list)
     food_history: list = field(default_factory=list)
     poison_history: list = field(default_factory=list)
+    food_ratio_history: list = field(default_factory=list)  # food / (food + poison)
 
     # Pre-smoothed metrics (computed incrementally on append)
     rewards_smoothed: list = field(default_factory=list)
@@ -65,6 +66,7 @@ class RunState:
     explained_variances_smoothed: list = field(default_factory=list)
     food_smoothed: list = field(default_factory=list)
     poison_smoothed: list = field(default_factory=list)
+    food_ratio_smoothed: list = field(default_factory=list)
 
     # Status
     is_running: bool = True
@@ -89,6 +91,11 @@ class RunState:
         self.food_history.append(food)
         self.poison_history.append(poison)
 
+        # Compute food_ratio (curriculum-invariant discrimination metric)
+        total = food + poison
+        food_ratio = food / total if total > 0 else 0.5
+        self.food_ratio_history.append(food_ratio)
+
         # Incremental EMA: smoothed = alpha * prev_smoothed + (1-alpha) * new_value
         def ema_append(smoothed_list: list, raw_value: float) -> None:
             if smoothed_list:
@@ -103,6 +110,7 @@ class RunState:
         ema_append(self.rewards_smoothed, reward)
         ema_append(self.food_smoothed, food)
         ema_append(self.poison_smoothed, poison)
+        ema_append(self.food_ratio_smoothed, food_ratio)
 
         # Trim to max points to prevent unbounded growth
         max_pts = DASHBOARD_MAX_POINTS
@@ -116,12 +124,14 @@ class RunState:
             self.explained_variances = self.explained_variances[trim_from:]
             self.food_history = self.food_history[trim_from:]
             self.poison_history = self.poison_history[trim_from:]
+            self.food_ratio_history = self.food_ratio_history[trim_from:]
             self.rewards_smoothed = self.rewards_smoothed[trim_from:]
             self.policy_losses_smoothed = self.policy_losses_smoothed[trim_from:]
             self.value_losses_smoothed = self.value_losses_smoothed[trim_from:]
             self.explained_variances_smoothed = self.explained_variances_smoothed[trim_from:]
             self.food_smoothed = self.food_smoothed[trim_from:]
             self.poison_smoothed = self.poison_smoothed[trim_from:]
+            self.food_ratio_smoothed = self.food_ratio_smoothed[trim_from:]
 
 
 class TrainingDashboard:
@@ -311,18 +321,32 @@ class TrainingDashboard:
         self.axes[mode]['ev'] = ax
         self.artists[mode]['ev'] = l_ev
         
-        # 6. Behavior
+        # 6. Behavior (food/poison counts + food_ratio on secondary axis)
         ax = self.fig.add_subplot(gs[row_idx, 5])
         ax.set_title("Behavior", fontsize=10, color='silver')
         ax.grid(True, alpha=0.15)
-        
+
         l_food, = ax.plot([], [], 'g-', linewidth=1.5, alpha=0.9, label='Food')
         l_poison, = ax.plot([], [], 'r-', linewidth=1.5, alpha=0.9, label='Pois')
-        ax.legend(fontsize=7, loc='upper right', framealpha=0.3)
-        
+
+        # Secondary y-axis for food_ratio (0-1 scale)
+        ax2 = ax.twinx()
+        ax2.set_ylim(0, 1)
+        ax2.axhline(y=0.5, color='cyan', linestyle=':', alpha=0.4)  # Random baseline
+        l_ratio, = ax2.plot([], [], 'c--', linewidth=1.5, alpha=0.8, label='Ratio')
+        ax2.tick_params(axis='y', labelcolor='cyan', labelsize=7)
+        ax2.set_ylabel('F/(F+P)', color='cyan', fontsize=7)
+
+        # Combined legend
+        lines = [l_food, l_poison, l_ratio]
+        labels = ['Food', 'Pois', 'Ratio']
+        ax.legend(lines, labels, fontsize=7, loc='upper right', framealpha=0.3)
+
         self.axes[mode]['beh'] = ax
+        self.axes[mode]['beh2'] = ax2  # Secondary axis for ratio
         self.artists[mode]['food'] = l_food
         self.artists[mode]['poison'] = l_poison
+        self.artists[mode]['food_ratio'] = l_ratio
         
         # 7. Action Distribution (Bar Chart)
         ax = self.fig.add_subplot(gs[row_idx, 6])
@@ -440,19 +464,21 @@ class TrainingDashboard:
             artists['ev'].set_data(x_data, y_ev)
             axes['ev'].set_xlim(0, n_updates + 5)
 
-            # 6. Behavior (pre-smoothed)
+            # 6. Behavior (pre-smoothed + food_ratio on secondary axis)
             y_food = run.food_smoothed
             y_pois = run.poison_smoothed
+            y_ratio = run.food_ratio_smoothed
             artists['food'].set_data(x_data, y_food)
             artists['poison'].set_data(x_data, y_pois)
+            artists['food_ratio'].set_data(x_data, y_ratio)
             axes['beh'].set_xlim(0, n_updates + 5)
             all_beh = y_food + y_pois
             if all_beh:
                 mn, mx = min(all_beh), max(all_beh)
                 rng = mx - mn if mx != mn else 1.0
                 axes['beh'].set_ylim(max(0, mn - rng * 0.1), mx + rng * 0.1)
-                
-            # 6. Action Distribution
+
+            # 7. Action Distribution
             probs = run.current_action_probs
             for bar, prob in zip(artists['act_bars'], probs):
                 bar.set_height(prob)
@@ -700,7 +726,7 @@ def load_run_from_logs(log_prefix: str) -> RunState:
     else:
         print(f"   Warning: Episodes file not found: {episodes_path}")
     
-    # Load updates (losses, entropy, explained_variance)
+    # Load updates (losses, entropy, explained_variance, food/poison metrics)
     if os.path.exists(updates_path):
         with open(updates_path, 'r') as f:
             reader = csv.DictReader(f)
@@ -712,11 +738,32 @@ def load_run_from_logs(log_prefix: str) -> RunState:
                 # EV may not exist in old logs
                 if 'explained_variance' in row and row['explained_variance']:
                     run.explained_variances.append(float(row['explained_variance']))
+                # Food/poison metrics (may not exist in old logs)
+                if 'food_mean' in row and row['food_mean']:
+                    food = float(row['food_mean'])
+                    poison = float(row['poison_mean']) if row.get('poison_mean') else 0.0
+                    run.food_history.append(food)
+                    run.poison_history.append(poison)
+                    # food_ratio may be in CSV or computed
+                    if 'food_ratio' in row and row['food_ratio']:
+                        run.food_ratio_history.append(float(row['food_ratio']))
+                    else:
+                        total = food + poison
+                        run.food_ratio_history.append(food / total if total > 0 else 0.5)
         ev_status = f" ({len(run.explained_variances)} EV)" if run.explained_variances else ""
-        print(f"   Loaded {len(run.policy_losses)} updates from {updates_path}{ev_status}")
+        beh_status = f" ({len(run.food_history)} beh)" if run.food_history else ""
+        print(f"   Loaded {len(run.policy_losses)} updates from {updates_path}{ev_status}{beh_status}")
+
+        # Populate smoothed lists for visualization (use raw values from historical data)
+        run.policy_losses_smoothed = list(run.policy_losses)
+        run.value_losses_smoothed = list(run.value_losses)
+        run.explained_variances_smoothed = list(run.explained_variances)
+        run.food_smoothed = list(run.food_history)
+        run.poison_smoothed = list(run.poison_history)
+        run.food_ratio_smoothed = list(run.food_ratio_history)
     else:
         print(f"   Warning: Updates file not found: {updates_path}")
-    
+
     return run
 
 
