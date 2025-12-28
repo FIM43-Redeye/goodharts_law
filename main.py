@@ -102,7 +102,7 @@ def setup_config(args):
         print(f"Using config: {args.config}")
 
     # Get runtime config
-    config = get_config(args.config)
+    config = get_simulation_config(args.config)
 
     # Get visualization settings from TOML
     viz_cfg = get_visualization_config()
