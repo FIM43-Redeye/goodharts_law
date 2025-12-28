@@ -97,16 +97,8 @@ class RewardComputer(ABC):
     accept shaping coefficients from config. This keeps reward shaping as
     an implementation detail of each training mode's pedagogical design.
 
-    All penalties are computed relative to food_reward, ensuring the reward
-    signal scales properly regardless of the absolute values in config.
+    All values come directly from config - no hidden scaling constants.
     """
-
-    # Death penalty as a multiple of food_reward (dying costs N food worth)
-    DEATH_PENALTY_RATIO = 2.0
-
-    # Reference food reward for scaling movement cost
-    # Movement cost ratio is computed relative to this baseline
-    REFERENCE_FOOD_REWARD = 5.0
 
     def __init__(self, mode: str, spec: 'ObservationSpec', config: dict,
                  gamma: float = 0.99, device: torch.device = None):
@@ -132,12 +124,10 @@ class RewardComputer(ABC):
         self.poison_penalty = CellType.POISON.energy_penalty
         self.food_interestingness = CellType.FOOD.interestingness
         self.poison_interestingness = CellType.POISON.interestingness
-        self._raw_movement_cost = config['ENERGY_MOVE_COST']
 
-        # Compute scaled penalties (relative to food reward)
-        # This preserves the original ratio when food_reward was REFERENCE_FOOD_REWARD
-        self.death_penalty = self.food_reward * self.DEATH_PENALTY_RATIO
-        self.movement_cost = self._raw_movement_cost * (self.food_reward / self.REFERENCE_FOOD_REWARD)
+        # Movement and death costs from config (direct values, no scaling)
+        self.movement_cost = config['ENERGY_MOVE_COST']
+        self.death_penalty = self.food_reward * config['DEATH_PENALTY_RATIO']
 
         # Cache constant tensor to avoid per-call allocation
         self._inf_tensor = torch.tensor(float('inf'), device=self.device)

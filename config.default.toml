@@ -82,9 +82,10 @@ count = 5
 [agent]
 view_range = 5           # Observation radius (creates 11x11 view)
 energy_start = 50.0
-energy_move_cost = 0.05
+energy_move_cost = 0.01  # Energy cost per move (direct value, no scaling)
 move_cost_exponent = 1.5
 max_move_distance = 1
+death_penalty_ratio = 2.0  # Death penalty as multiple of food reward
 
 # =============================================================================
 # VISUALIZATION - main.py display settings
@@ -116,10 +117,10 @@ value_coef = 0.5
 reward_scale = 0.1
 
 # Batching
-n_envs = 192             # Parallel environments
+n_envs = 384             # Parallel environments
 n_minibatches = 1        # 1 = full batch gradient descent
-steps_per_env = 128      # Rollout length (horizon)
-steps_per_episode = 512  # Max steps before forced reset
+steps_per_env = 64      # Rollout length (horizon)
+steps_per_episode = 256  # Max steps before forced reset
 
 # Architecture
 brain_type = "base_cnn"
@@ -136,7 +137,7 @@ min_poison = 20
 max_poison = 100
 
 # Performance
-compile_models = true    # torch.compile (JIT)
+compile_models = false    # torch.compile (JIT)
 compile_mode = "max-autotune-no-cudagraphs"  # reduce-overhead, max-autotune, max-autotune-no-cudagraphs
 use_amp = true           # Mixed precision (fp16)
 

@@ -260,6 +260,7 @@ def get_simulation_config(config_path: str | None = None):
         'MOVE_COST_EXPONENT': agent_cfg['move_cost_exponent'],
         'MAX_MOVE_DISTANCE': agent_cfg['max_move_distance'],
         'AGENT_VIEW_RANGE': agent_cfg['view_range'],
+        'DEATH_PENALTY_RATIO': agent_cfg.get('death_penalty_ratio', 2.0),
 
         # Agents
         'AGENTS_SETUP': agents_setup,
