@@ -429,7 +429,7 @@ def _get_modes(config: dict) -> dict[str, ModeSpec]:
             observation_channels=gt_channels,
             reward_type='energy_delta',
             reward_strategy=GroundTruthRewards,
-            freeze_energy_in_training=True,
+            freeze_energy_in_training=False,  # Real energy dynamics
             behavior_requirement='ground_truth',
         ),
         'ground_truth_handhold': ModeSpec(
@@ -437,7 +437,7 @@ def _get_modes(config: dict) -> dict[str, ModeSpec]:
             observation_channels=gt_channels,
             reward_type='shaped',
             reward_strategy=HandholdRewards,
-            freeze_energy_in_training=True,
+            freeze_energy_in_training=False,  # Real energy dynamics
             behavior_requirement='ground_truth',
         ),
         'proxy_jammed': ModeSpec(
@@ -445,7 +445,7 @@ def _get_modes(config: dict) -> dict[str, ModeSpec]:
             observation_channels=proxy_channels,
             reward_type='energy_delta',
             reward_strategy=ProxyJammedRewards,
-            freeze_energy_in_training=True,
+            freeze_energy_in_training=False,  # Gets energy rewards, should experience consequences
             behavior_requirement='proxy_metric',
         ),
         'proxy': ModeSpec(
@@ -453,7 +453,7 @@ def _get_modes(config: dict) -> dict[str, ModeSpec]:
             observation_channels=proxy_channels,
             reward_type='interestingness',
             reward_strategy=ProxyRewards,
-            freeze_energy_in_training=True,
+            freeze_energy_in_training=True,  # Only proxy freezes - can't see energy consequences
             behavior_requirement='proxy_metric',
         ),
     }
