@@ -14,8 +14,8 @@ but the "a-ha" moment should be watching agents *discover* deceptive strategies 
 
 ## Phase 2: Learned Behaviors (CNN/RL) ✅
 - [x] BaseCNN architecture with dynamic channel input
-- [x] LearnedBehavior with presets (ground_truth, proxy, proxy_jammed)
-- [x] PPO with GAE-Lambda (vectorized, ~6000 sps)
+- [x] LearnedBehavior with presets (ground_truth, ground_truth_handhold, proxy, proxy_jammed)
+- [x] PPO with GAE-Lambda (GPU-native vectorized)
 - [x] Multi-mode training dashboard
 - [x] Structured logging (CSV/JSON)
 - [x] Model verification suite
@@ -27,7 +27,7 @@ but the "a-ha" moment should be watching agents *discover* deceptive strategies 
 - [x] TOML configuration system with defaults
 - [x] Auto-discovery behavior registry
 - [x] Centralized device selection (CPU/CUDA/ROCm)
-- [x] Comprehensive test suite (27 tests)
+- [x] Comprehensive test suite
 - [x] Vectorized environment (VecEnv with shared_grid mode)
 - [x] Documentation refresh (README, training docs)
 
