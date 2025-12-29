@@ -659,6 +659,7 @@ class PPOConfig:
             'value_coef': train_cfg['value_coef'],
             'use_amp': train_cfg['use_amp'],
             'compile_models': train_cfg['compile_models'],
+            'compile_mode': train_cfg.get('compile_mode', 'max-autotune-no-cudagraphs'),
             # Validation
             'validation_interval': train_cfg['validation_interval'],
             'validation_episodes': train_cfg['validation_episodes'],

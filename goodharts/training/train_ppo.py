@@ -157,6 +157,9 @@ def main():
                       help='Skip JIT warmup (faster startup, slower training)')
     perf.add_argument('--no-profile', action='store_true',
                       help='Disable profiling (faster for production)')
+    perf.add_argument('--compile-mode', type=str, default=None,
+                      choices=['reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'],
+                      help='torch.compile mode (reduce-overhead enables CUDA graphs)')
 
     # Monitoring
     monitor = parser.add_argument_group('Monitoring')
@@ -235,7 +238,11 @@ def main():
     # Handle AMP
     if args.no_amp:
         overrides['use_amp'] = False
-    
+
+    # Handle compile mode
+    if args.compile_mode:
+        overrides['compile_mode'] = args.compile_mode
+
     # Handle --no-warmup
     if args.no_warmup:
         overrides['compile_models'] = False
