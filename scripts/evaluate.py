@@ -149,7 +149,7 @@ def merge_results(results: dict, output_path: Path):
         if 'aggregates' in result and result['aggregates']:
             agg = result['aggregates']
             aggregates[mode] = {
-                'efficiency': agg['efficiency_mean'],
+                'efficiency': agg['overall_efficiency'],
                 'survival': agg['survival_mean'],
                 'deaths_per_1k': agg['deaths_per_1k_steps'],
                 'food_per_1k': agg['food_per_1k_steps'],
@@ -184,7 +184,7 @@ def print_comparison(results: dict):
 
     for mode, result in sorted(valid_results.items()):
         agg = result['aggregates']
-        print(f"{mode:<20} {agg['efficiency_mean']:>12.1%} {agg['survival_mean']:>10.1f} "
+        print(f"{mode:<20} {agg['overall_efficiency']:>12.1%} {agg['survival_mean']:>10.1f} "
               f"{agg['deaths_per_1k_steps']:>10.2f} {agg['food_per_1k_steps']:>10.1f} "
               f"{agg['poison_per_1k_steps']:>10.1f}")
 
@@ -195,12 +195,12 @@ def print_comparison(results: dict):
         gt = valid_results['ground_truth']['aggregates']
         px = valid_results['proxy']['aggregates']
 
-        efficiency_gap = gt['efficiency_mean'] - px['efficiency_mean']
+        efficiency_gap = gt['overall_efficiency'] - px['overall_efficiency']
         survival_gap = gt['survival_mean'] - px['survival_mean']
 
         print(f"\nGoodhart's Law Effect:")
-        print(f"  Ground truth efficiency: {gt['efficiency_mean']:.1%}")
-        print(f"  Proxy efficiency:        {px['efficiency_mean']:.1%}")
+        print(f"  Ground truth efficiency: {gt['overall_efficiency']:.1%}")
+        print(f"  Proxy efficiency:        {px['overall_efficiency']:.1%}")
         if efficiency_gap > 0.1:
             print(f"  Efficiency gap: {efficiency_gap:.1%} (proxy fails to distinguish food from poison)")
         if survival_gap > 0:
@@ -325,10 +325,13 @@ def main():
     
     # Run with or without dashboard
     dashboard = None
-    
+
     if args.dashboard:
         from goodharts.evaluation.eval_dashboard import create_testing_dashboard
-        dashboard = create_testing_dashboard(modes_to_test)
+        # Total timesteps = per-env steps * n_envs
+        n_envs = overrides.get('n_envs', train_cfg.get('n_envs', 64))
+        total_timesteps = args.timesteps * n_envs
+        dashboard = create_testing_dashboard(modes_to_test, total_timesteps)
         dashboard.start()
     
     try:

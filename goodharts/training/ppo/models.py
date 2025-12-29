@@ -11,21 +11,60 @@ from goodharts.utils.device import get_device
 
 
 class ValueHead(nn.Module):
-    """Simple value head that attaches to BaseCNN features."""
+    """
+    Simple value head that attaches to BaseCNN features.
+
+    Supports optional auxiliary inputs (e.g., episode density info) for
+    privileged critic training - the value function can see info that
+    the policy cannot, improving value estimation without affecting
+    what the policy learns.
+    """
 
     # Class attribute for compile-time branching (no hasattr needed)
     is_popart = False
 
-    def __init__(self, input_size: int):
+    def __init__(self, input_size: int, num_aux_inputs: int = 0):
+        """
+        Initialize value head.
+
+        Args:
+            input_size: Size of feature vector from policy network
+            num_aux_inputs: Number of auxiliary scalar inputs (density info, etc.)
+        """
         super().__init__()
-        self.fc = nn.Linear(input_size, 1)
+        self.num_aux_inputs = num_aux_inputs
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if num_aux_inputs > 0:
+            # Small MLP to combine features + aux info
+            combined_size = input_size + num_aux_inputs
+            self.aux_combine = nn.Sequential(
+                nn.Linear(combined_size, input_size),
+                nn.ReLU(),
+            )
+            self.fc = nn.Linear(input_size, 1)
+        else:
+            self.aux_combine = None
+            self.fc = nn.Linear(input_size, 1)
+
+    def forward(self, features: torch.Tensor, aux: torch.Tensor = None) -> torch.Tensor:
+        """
+        Compute value prediction.
+
+        Args:
+            features: Policy features (batch, hidden_size)
+            aux: Optional auxiliary inputs (batch, num_aux_inputs)
+
+        Returns:
+            Value predictions (batch, 1)
+        """
+        if self.aux_combine is not None and aux is not None:
+            combined = torch.cat([features, aux], dim=-1)
+            features = self.aux_combine(combined)
         return self.fc(features)
 
-    def get_training_value(self, features: torch.Tensor) -> torch.Tensor:
+    def get_training_value(self, features: torch.Tensor, aux: torch.Tensor = None) -> torch.Tensor:
         """Return value for training loss computation (same as forward for simple head)."""
-        return self.fc(features)
+        return self.forward(features, aux)
 
     def prepare_targets(
         self, returns: torch.Tensor, old_values: torch.Tensor
@@ -43,6 +82,9 @@ class PopArtValueHead(nn.Module):
     weights when statistics change, preventing catastrophic forgetting when
     reward scales shift during training.
 
+    Supports optional auxiliary inputs (e.g., episode density info) for
+    privileged critic training.
+
     Key insight: when we update statistics (mean/std), we also inversely adjust
     the linear layer weights so the actual output remains unchanged. This lets
     the network adapt to new reward scales without losing what it learned.
@@ -51,17 +93,30 @@ class PopArtValueHead(nn.Module):
     # Class attribute for compile-time branching (no hasattr needed)
     is_popart = True
 
-    def __init__(self, input_size: int, beta_min: float = 0.01):
+    def __init__(self, input_size: int, num_aux_inputs: int = 0, beta_min: float = 0.01):
         """
         Initialize PopArt value head.
 
         Args:
             input_size: Size of feature vector from policy network
+            num_aux_inputs: Number of auxiliary scalar inputs (density info, etc.)
             beta_min: Minimum EMA decay rate (asymptotic value after many updates)
         """
         super().__init__()
-        self.fc = nn.Linear(input_size, 1)
+        self.num_aux_inputs = num_aux_inputs
         self.beta_min = beta_min
+
+        if num_aux_inputs > 0:
+            # Small MLP to combine features + aux info
+            combined_size = input_size + num_aux_inputs
+            self.aux_combine = nn.Sequential(
+                nn.Linear(combined_size, input_size),
+                nn.ReLU(),
+            )
+        else:
+            self.aux_combine = None
+
+        self.fc = nn.Linear(input_size, 1)
 
         # Running statistics as buffers (saved with model, moved with .to())
         self.register_buffer('mean', torch.zeros(1))
@@ -71,31 +126,45 @@ class PopArtValueHead(nn.Module):
         # This naturally handles cold start without needing special init logic
         self._update_count = 0
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
+    def _combine_features(self, features: torch.Tensor, aux: torch.Tensor = None) -> torch.Tensor:
+        """Combine features with auxiliary inputs if present."""
+        if self.aux_combine is not None and aux is not None:
+            combined = torch.cat([features, aux], dim=-1)
+            return self.aux_combine(combined)
+        return features
+
+    def forward(self, features: torch.Tensor, aux: torch.Tensor = None) -> torch.Tensor:
         """
         Return DENORMALIZED value predictions.
 
         The linear layer outputs normalized values, which we denormalize
         using the running statistics for use in GAE/advantage computation.
+
+        Args:
+            features: Policy features (batch, hidden_size)
+            aux: Optional auxiliary inputs (batch, num_aux_inputs)
         """
+        features = self._combine_features(features, aux)
         normalized = self.fc(features)
         return self.mean + self.std * normalized
 
-    def get_normalized_value(self, features: torch.Tensor) -> torch.Tensor:
+    def get_normalized_value(self, features: torch.Tensor, aux: torch.Tensor = None) -> torch.Tensor:
         """
         Return raw (normalized) value output for training.
 
         Used when computing value loss against normalized targets.
         """
+        features = self._combine_features(features, aux)
         return self.fc(features)
 
     def normalize_targets(self, returns: torch.Tensor) -> torch.Tensor:
         """Normalize returns for value function training."""
         return (returns - self.mean) / (self.std + 1e-8)
 
-    def get_training_value(self, features: torch.Tensor) -> torch.Tensor:
+    def get_training_value(self, features: torch.Tensor, aux: torch.Tensor = None) -> torch.Tensor:
         """Return normalized value for training loss computation."""
-        return self.fc(features)  # Same as get_normalized_value
+        features = self._combine_features(features, aux)
+        return self.fc(features)
 
     def prepare_targets(
         self, returns: torch.Tensor, old_values: torch.Tensor

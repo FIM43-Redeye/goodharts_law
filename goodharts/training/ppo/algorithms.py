@@ -104,15 +104,21 @@ def ppo_update(
     scaler: GradScaler = None,
     n_minibatches: int = 4,
     verbose: bool = False,
+    aux_inputs: torch.Tensor = None,
 ) -> tuple[float, float, float, float]:
     """
     Perform PPO clipped objective update with minibatches.
-    
+
     All inputs should be torch tensors already on the target device.
+
+    Args:
+        aux_inputs: Optional auxiliary inputs for privileged critic (batch, num_aux).
+                    Passed to value_head but NOT to policy - enables asymmetric
+                    actor-critic where value function has more information.
     """
     use_amp = scaler is not None
     device_type = 'cuda' if device.type == 'cuda' else 'cpu'
-    
+
     # Ensure correct dtypes (tensors should already be on device)
     old_states_d = states.float()
     old_actions_d = actions.long()
@@ -120,6 +126,7 @@ def ppo_update(
     returns_d = returns.float()
     advantages_d = advantages.float()
     old_values_d = old_values.float()
+    aux_d = aux_inputs.float() if aux_inputs is not None else None
 
     batch_size = states.shape[0]
     minibatch_size = batch_size // n_minibatches
@@ -146,7 +153,8 @@ def ppo_update(
             mb_returns = returns_d[mb_inds]
             mb_advantages = advantages_d[mb_inds]
             mb_old_values = old_values_d[mb_inds]
-            
+            mb_aux = aux_d[mb_inds] if aux_d is not None else None
+
             with autocast(device_type=device_type, enabled=use_amp):
                 # CRITICAL: Compute features ONCE and reuse for both logits and values
                 # Using interface method keeps this architecture-agnostic
@@ -168,7 +176,8 @@ def ppo_update(
                 # Value loss with clipping
                 # Uniform interface: works for both ValueHead and PopArtValueHead
                 # PopArt normalizes values/targets; simple head passes through unchanged
-                values = value_head.get_training_value(features).squeeze()
+                # Pass auxiliary inputs to value head (privileged critic)
+                values = value_head.get_training_value(features, mb_aux).squeeze()
                 target_returns, target_old_values = value_head.prepare_targets(
                     mb_returns, mb_old_values
                 )
