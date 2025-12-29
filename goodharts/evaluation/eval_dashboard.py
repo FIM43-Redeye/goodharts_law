@@ -38,7 +38,7 @@ MODE_COLORS = {
     'ground_truth': '#00ff88',      # Bright green
     'ground_truth_handhold': '#88ff00',  # Lime
     'proxy': '#ff4444',             # Red
-    'proxy_jammed': '#ffaa00',      # Orange
+    'ground_truth_blinded': '#ffaa00',   # Orange
 }
 DEFAULT_COLOR = '#00aaff'           # Cyan fallback
 

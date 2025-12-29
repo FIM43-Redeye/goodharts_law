@@ -187,18 +187,33 @@ class TestProxyEncoding:
         assert abs(poison_interestingness - CellType.POISON.interestingness) < 0.001, \
             f"Poison interestingness wrong: {poison_interestingness} != {CellType.POISON.interestingness}"
 
-    def test_proxy_food_poison_similar(self, config, device):
-        """In proxy mode, food and poison should have similar interestingness."""
+    def test_proxy_poison_more_interesting_than_food(self, config, device):
+        """
+        In proxy mode, poison should be MORE interesting than food.
+
+        This is the sharpened Goodhart trap: agents optimizing for interestingness
+        will actively PREFER poison over food, making the failure mode more dramatic.
+        The proxy metric (interestingness) is actively anti-correlated with true value.
+
+        TODO: Explain WHY this design choice makes the Goodhart demonstration stronger.
+        """
         food_i = CellType.FOOD.interestingness
         poison_i = CellType.POISON.interestingness
 
-        # Both should be high (> 0.8)
-        assert food_i > 0.8, f"Food interestingness should be high: {food_i}"
-        assert poison_i > 0.8, f"Poison interestingness should be high: {poison_i}"
+        # Poison should be more interesting than food (the trap)
+        assert poison_i > food_i, (
+            f"Poison should be MORE interesting than food for sharp Goodhart trap. "
+            f"Got food={food_i}, poison={poison_i}"
+        )
 
-        # Difference should be small (the deception)
-        diff = abs(food_i - poison_i)
-        assert diff < 0.2, f"Food/poison interestingness too different: {diff}"
+        # Both should be non-zero (so agents seek them)
+        assert food_i > 0, f"Food should have some interestingness: {food_i}"
+        assert poison_i > 0, f"Poison should have interestingness: {poison_i}"
+
+        # Empty cells should be boring (so agents move toward items)
+        empty_i = CellType.EMPTY.interestingness
+        assert empty_i < food_i, f"Empty should be less interesting than food"
+        assert empty_i < poison_i, f"Empty should be less interesting than poison"
 
     def test_proxy_empty_has_zero_interestingness(self, config, device):
         """Empty cells should have zero interestingness."""

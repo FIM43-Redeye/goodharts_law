@@ -41,10 +41,9 @@ class ValueHead(nn.Module):
                 nn.Linear(combined_size, input_size),
                 nn.ReLU(),
             )
-            self.fc = nn.Linear(input_size, 1)
         else:
             self.aux_combine = None
-            self.fc = nn.Linear(input_size, 1)
+        self.fc = nn.Linear(input_size, 1)
 
     def forward(self, features: torch.Tensor, aux: torch.Tensor = None) -> torch.Tensor:
         """

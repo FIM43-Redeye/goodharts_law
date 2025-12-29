@@ -182,7 +182,15 @@ class TorchVecEnv:
         self.last_episode_food = torch.zeros(n_envs, dtype=torch.int32, device=device)
         self.current_episode_poison = torch.zeros(n_envs, dtype=torch.int32, device=device)
         self.last_episode_poison = torch.zeros(n_envs, dtype=torch.int32, device=device)
-        
+
+        # Pre-allocated density buffer and cached normalization constants
+        # Eliminates ~384 tensor allocations per update in privileged critic mode
+        self._density_buffer = torch.zeros((n_envs, 2), dtype=torch.float32, device=device)
+        self._density_food_mid = (default_food + default_food) / 2.0
+        self._density_food_scale = 1.0  # Updated in set_curriculum_ranges
+        self._density_poison_mid = (default_poison + default_poison) / 2.0
+        self._density_poison_scale = 1.0
+
         # Initialize
         self.reset()
     
@@ -193,6 +201,11 @@ class TorchVecEnv:
         self.poison_range = (poison_min, poison_max)
         # Update max for fixed-size topk in _place_items
         self._max_items_per_grid = max(food_max, poison_max, 1)
+        # Cache normalization constants for get_density_info() (avoids per-call arithmetic)
+        self._density_food_mid = (food_min + food_max) / 2.0
+        self._density_food_scale = (food_max - food_min) / 2.0 if food_max > food_min else 1.0
+        self._density_poison_mid = (poison_min + poison_max) / 2.0
+        self._density_poison_scale = (poison_max - poison_min) / 2.0 if poison_max > poison_min else 1.0
     
     def reset(self, env_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Reset environments and return observations.
@@ -671,11 +684,20 @@ class TorchVecEnv:
 
         # Step count and done check
         # Separate terminated (real death) from truncated (time limit)
+        # Use in-place ops on pre-allocated buffers to avoid tensor allocation
         self.agent_steps += 1
-        # When frozen, agents never die - enables exploration without penalty
-        self.terminated = torch.zeros_like(self.dones) if self.freeze_energy else (self.agent_energy <= 0)
-        self.truncated = self.agent_steps >= self.max_steps  # Hit time limit (neutral)
-        self.dones = self.terminated | self.truncated  # Combined for reset logic
+
+        # Truncated: hit time limit (in-place comparison)
+        torch.ge(self.agent_steps, self.max_steps, out=self.truncated)
+
+        # Terminated: agent died (in-place, respects freeze_energy)
+        if self.freeze_energy:
+            self.terminated.zero_()  # In-place zero, no allocation
+        else:
+            torch.le(self.agent_energy, 0, out=self.terminated)
+
+        # Dones: combined for reset logic (in-place OR)
+        torch.bitwise_or(self.terminated, self.truncated, out=self.dones)
 
         # Save signals before reset (reuse pre-allocated buffers)
         self._dones_return.copy_(self.dones)
@@ -846,25 +868,23 @@ class TorchVecEnv:
 
         This info helps the value function predict returns more accurately
         without affecting the policy (which only sees the grid).
+
+        Performance: Uses pre-allocated buffer and cached normalization constants
+        to eliminate ~384 tensor allocations per update.
         """
-        # Get counts for each env's grid (in independent mode, grid_id == env_id)
-        food_counts = self.grid_food_counts[self.grid_indices].float()
-        poison_counts = self.grid_poison_counts[self.grid_indices].float()
+        # Write directly into pre-allocated buffer using in-place ops
+        # Column 0: normalized food density
+        # Column 1: normalized poison density
+        buf = self._density_buffer
 
-        # Normalize to [-1, 1] based on curriculum ranges
-        # Center on midpoint, scale by half-range
-        food_min, food_max = self.food_range
-        poison_min, poison_max = self.poison_range
+        # Get counts and normalize in-place (no intermediate tensors)
+        buf[:, 0] = self.grid_food_counts[self.grid_indices].float()
+        buf[:, 0].sub_(self._density_food_mid).div_(self._density_food_scale)
 
-        food_mid = (food_min + food_max) / 2
-        food_scale = (food_max - food_min) / 2 if food_max > food_min else 1.0
-        poison_mid = (poison_min + poison_max) / 2
-        poison_scale = (poison_max - poison_min) / 2 if poison_max > poison_min else 1.0
+        buf[:, 1] = self.grid_poison_counts[self.grid_indices].float()
+        buf[:, 1].sub_(self._density_poison_mid).div_(self._density_poison_scale)
 
-        food_norm = (food_counts - food_mid) / food_scale
-        poison_norm = (poison_counts - poison_mid) / poison_scale
-
-        return torch.stack([food_norm, poison_norm], dim=1)  # (n_envs, 2)
+        return buf
 
 
 def create_torch_vec_env(

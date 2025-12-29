@@ -28,6 +28,9 @@ import threading
 _cached_device: torch.device | None = None
 _device_logged: bool = False
 
+# Lock to ensure device detection is thread-safe (prevents CUDA init race conditions)
+_DEVICE_LOCK = threading.Lock()
+
 # Lock to ensure global optimizations are applied only once and thread-safely
 _OPTIMIZATION_LOCK = threading.Lock()
 _optimizations_applied = False
@@ -133,65 +136,76 @@ def get_device(override: str | None = None, verbose: bool = True) -> torch.devic
             return device
         return torch.device(override)
     
-    # Return cached device if already determined
+    # Fast path: return cached device if already determined
     if _cached_device is not None:
         return _cached_device
-    
-    # Priority 1: Environment variable
-    env_device = os.environ.get('GOODHARTS_DEVICE')
-    if env_device:
-        if env_device == 'tpu':
-            if is_xla_available():
-                _cached_device = _get_xla().xla_device()
+
+    # Thread-safe device detection (prevents CUDA initialization race conditions
+    # when multiple threads call get_device() simultaneously)
+    with _DEVICE_LOCK:
+        # Check again inside lock (another thread may have set it)
+        if _cached_device is not None:
+            return _cached_device
+
+        # Priority 1: Environment variable
+        env_device = os.environ.get('GOODHARTS_DEVICE')
+        if env_device:
+            if env_device == 'tpu':
+                if is_xla_available():
+                    _cached_device = _get_xla().xla_device()
+                    if verbose and not _device_logged:
+                        print(f"Device: TPU (XLA) (from GOODHARTS_DEVICE env)")
+                        _device_logged = True
+                    return _cached_device
+                else:
+                    print("Warning: TPU requested but torch_xla not available. Falling back.")
+            else:
+                _cached_device = torch.device(env_device)
                 if verbose and not _device_logged:
-                    print(f"Device: TPU (XLA) (from GOODHARTS_DEVICE env)")
+                    print(f"Device: {_cached_device} (from GOODHARTS_DEVICE env)")
                     _device_logged = True
                 return _cached_device
-            else:
-                print("Warning: TPU requested but torch_xla not available. Falling back.")
+
+        # Priority 2: Config file
+        try:
+            from goodharts.config import get_runtime_config
+            runtime_cfg = get_runtime_config()
+            if runtime_cfg and runtime_cfg.get('device'):
+                cfg_device = runtime_cfg['device']
+                if cfg_device == 'tpu' and is_xla_available():
+                    _cached_device = _get_xla().xla_device()
+                else:
+                    _cached_device = torch.device(cfg_device)
+                if verbose and not _device_logged:
+                    print(f"Device: {_cached_device} (from config)")
+                    _device_logged = True
+                return _cached_device
+        except (ImportError, KeyError):
+            pass  # Config not available or no device setting
+
+        # Priority 3: Auto-detect (CUDA > TPU > CPU)
+        if torch.cuda.is_available():
+            _cached_device = torch.device('cuda')
+            if verbose and not _device_logged:
+                try:
+                    gpu_name = torch.cuda.get_device_name(0)
+                    print(f"Device: {_cached_device} ({gpu_name})")
+                except (AssertionError, RuntimeError):
+                    # CUDA device query can fail during concurrent initialization
+                    print(f"Device: {_cached_device}")
+                _device_logged = True
+        elif is_xla_available():
+            _cached_device = _get_xla().xla_device()
+            if verbose and not _device_logged:
+                print(f"Device: TPU (XLA)")
+                _device_logged = True
         else:
-            _cached_device = torch.device(env_device)
+            _cached_device = torch.device('cpu')
             if verbose and not _device_logged:
-                print(f"Device: {_cached_device} (from GOODHARTS_DEVICE env)")
+                print(f"Device: {_cached_device}")
                 _device_logged = True
-            return _cached_device
-    
-    # Priority 2: Config file
-    try:
-        from goodharts.config import get_runtime_config
-        runtime_cfg = get_runtime_config()
-        if runtime_cfg and runtime_cfg.get('device'):
-            cfg_device = runtime_cfg['device']
-            if cfg_device == 'tpu' and is_xla_available():
-                _cached_device = _get_xla().xla_device()
-            else:
-                _cached_device = torch.device(cfg_device)
-            if verbose and not _device_logged:
-                print(f"Device: {_cached_device} (from config)")
-                _device_logged = True
-            return _cached_device
-    except (ImportError, KeyError):
-        pass  # Config not available or no device setting
-    
-    # Priority 3: Auto-detect (CUDA > TPU > CPU)
-    if torch.cuda.is_available():
-        _cached_device = torch.device('cuda')
-        if verbose and not _device_logged:
-            gpu_name = torch.cuda.get_device_name(0)
-            print(f"Device: {_cached_device} ({gpu_name})")
-            _device_logged = True
-    elif is_xla_available():
-        _cached_device = _get_xla().xla_device()
-        if verbose and not _device_logged:
-            print(f"Device: TPU (XLA)")
-            _device_logged = True
-    else:
-        _cached_device = torch.device('cpu')
-        if verbose and not _device_logged:
-            print(f"Device: {_cached_device}")
-            _device_logged = True
-    
-    return _cached_device
+
+        return _cached_device
 
 
 def reset_device_cache():

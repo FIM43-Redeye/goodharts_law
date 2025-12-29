@@ -53,8 +53,8 @@ class LearnedBehavior(BehaviorStrategy):
                          High (2.0+) = more random
             action_space: ActionSpace instance (optional, defaults to DiscreteGridActionSpace)
         """
-        if mode not in ('ground_truth', 'ground_truth_handhold', 'proxy', 'proxy_jammed'):
-            raise ValueError(f"mode must be 'ground_truth', 'ground_truth_handhold', 'proxy', or 'proxy_jammed', got '{mode}'")
+        if mode not in ('ground_truth', 'ground_truth_handhold', 'proxy', 'ground_truth_blinded'):
+            raise ValueError(f"mode must be 'ground_truth', 'ground_truth_handhold', 'proxy', or 'ground_truth_blinded', got '{mode}'")
 
         self.name = name
         self._mode = mode
@@ -254,9 +254,9 @@ LEARNED_PRESETS: dict[str, dict] = {
         'model_path': 'models/ppo_proxy.pth',
         'color': (255, 100, 255),  # Light magenta
     },
-    'proxy_jammed': {
-        'mode': 'proxy_jammed',
-        'model_path': 'models/ppo_proxy_jammed.pth',
+    'ground_truth_blinded': {
+        'mode': 'ground_truth_blinded',
+        'model_path': 'models/ppo_ground_truth_blinded.pth',
         'color': (138, 43, 226),  # Blue-violet
     },
 }
@@ -270,7 +270,7 @@ def create_learned_behavior(preset: str = 'ground_truth', **kwargs) -> LearnedBe
     sensible defaults that can be overridden via kwargs.
     
     Args:
-        preset: One of 'ground_truth', 'proxy', 'proxy_jammed'
+        preset: One of 'ground_truth', 'proxy', 'ground_truth_blinded'
         **kwargs: Override preset values (model_path, epsilon, temperature, etc.)
         
     Returns:

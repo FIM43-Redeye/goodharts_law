@@ -2,8 +2,17 @@
 Proxy-optimizing behavior that only sees interestingness signals.
 
 In proxy mode, all channels contain the same interestingness values,
-so this agent cannot distinguish food (interestingness=1.0) from
-poison (interestingness=0.9). This is the Goodhart's Law trap.
+so this agent cannot distinguish food from poison based on cell type.
+With poison being MORE interesting (1.0) than food (0.5), this agent
+will actively PREFER poison. This is the Goodhart's Law trap.
+
+TODO (Goodhart Documentation):
+    Explain why this behavior embodies Goodhart's Law:
+    - What is the "proxy metric" and why is it a proxy?
+    - Why can't this agent distinguish food from poison?
+    - How does optimizing for interestingness lead to eating poison?
+    - Connect this to real-world examples of specification gaming
+    - Why is poison being MORE interesting than food a sharper demonstration?
 """
 import torch
 from goodharts.behaviors.base import BehaviorStrategy

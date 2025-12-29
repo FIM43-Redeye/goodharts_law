@@ -10,6 +10,18 @@ This project provides a concrete, reproducible example of how optimizing for pro
 
 ## Results
 
+<!-- TODO (Goodhart Documentation):
+     Fill in this table with actual experimental results. Include:
+     - Data from at least 3 random seeds per mode
+     - Confidence intervals or standard deviations
+     - Statistical significance tests between ground_truth and proxy
+
+     After filling in, write a brief interpretation:
+     - What does the efficiency gap tell us about Goodhart's Law?
+     - Why does proxy perform as it does?
+     - What's surprising or confirming about these results?
+-->
+
 Trained agents evaluated using continuous survival testing (agents run until death, then respawn):
 
 | Mode | Observation | Reward | Efficiency | Survival | Deaths/1k | Food/1k | Poison/1k |
@@ -17,14 +29,14 @@ Trained agents evaluated using continuous survival testing (agents run until dea
 | **ground_truth** | Cell types | Energy | TBD | TBD | TBD | TBD | TBD |
 | **ground_truth_handhold** | Cell types | Shaped | TBD | TBD | TBD | TBD | TBD |
 | **proxy** | Interestingness | Interestingness | TBD | TBD | TBD | TBD | TBD |
-| **proxy_jammed** | Interestingness | Energy | TBD | TBD | TBD | TBD | TBD |
+| **ground_truth_blinded** | Interestingness | Energy | TBD | TBD | TBD | TBD | TBD |
 
 **Key metrics:**
 - **Efficiency** = food / (food + poison) — the core Goodhart failure metric
 - **Survival** = average steps lived before death
 - **Deaths/1k** = population death rate per 1000 steps
 
-**Expected finding:** Proxy agents will show lower efficiency than ground-truth agents because they cannot distinguish food (interestingness 1.0) from poison (interestingness 0.9). They optimize the proxy metric successfully but fail at the true objective.
+**Expected finding:** Proxy agents will show lower efficiency than ground-truth agents because they cannot distinguish food from poison—and worse, poison is MORE interesting (1.0) than food (0.5), so they actively prefer it. They optimize the proxy metric successfully but fail catastrophically at the true objective.
 
 ---
 
@@ -64,7 +76,7 @@ This project explores a fundamental AI safety concern: **what happens when agent
 | `ground_truth` | One-hot cell types | Energy delta | Baseline: full information |
 | `ground_truth_handhold` | One-hot cell types | Shaped rewards | Easier learning curve |
 | `proxy` | Interestingness values | Interestingness gain | **Main Goodhart failure mode** |
-| `proxy_jammed` | Interestingness values | Energy delta | Information asymmetry test |
+| `ground_truth_blinded` | Interestingness values | Energy delta | Control: blinded but true rewards |
 
 ---
 
@@ -256,7 +268,7 @@ python -m goodharts.training.train_ppo --n-envs 128 --timesteps 200000
 
 | Option | Description |
 |--------|-------------|
-| `--mode MODE` | Training mode: `ground_truth`, `proxy`, `proxy_jammed`, `all`, or comma-separated |
+| `--mode MODE` | Training mode: `ground_truth`, `proxy`, `ground_truth_blinded`, `all`, or comma-separated |
 | `--timesteps N` | Total environment steps (default: from config) |
 | `--updates N` | PPO updates instead of timesteps (more intuitive for long runs) |
 | `-d, --dashboard` | Live training visualization |

@@ -3,6 +3,17 @@ ModeSpec: Central registry for training/behavior modes.
 
 Defines observation format, reward type, and special training flags per mode.
 This enables automatic configuration without hardcoding mode names throughout.
+
+TODO (Goodhart Documentation):
+    Explain how the mode system enables the Goodhart demonstration:
+    - What is the relationship between observation_channels and information access?
+    - How do different reward_types create different optimization pressures?
+    - Why is separating "what you see" from "what you're rewarded for" important?
+    - Walk through each mode and its role in the experimental design:
+        * ground_truth: full information baseline (aligned agent)
+        * proxy: interestingness-only observations AND rewards (Goodhart failure)
+        * ground_truth_blinded: interestingness observations, energy rewards (control)
+        * ground_truth_handhold: shaped rewards for easier learning (curriculum)
 """
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
@@ -328,13 +339,18 @@ class HandholdRewards(RewardComputer):
         return self._calculate_potential_from_target(states, target, self.FOOD_SHAPING_COEF)
 
 
-class ProxyJammedRewards(RewardComputer):
+class GroundTruthBlindedRewards(RewardComputer):
     """
-    Rewards for proxy_jammed mode (information asymmetry).
+    Rewards for ground_truth_blinded mode (information asymmetry control).
 
-    Agent sees interestingness observations but is rewarded for true energy.
-    This tests whether agents can learn to avoid poison when they can't
-    distinguish it from food visually but feel the energy consequences.
+    Agent sees interestingness observations (blinded to true cell types) but
+    is rewarded for true energy. This tests whether agents can learn to avoid
+    poison when they can't distinguish it from food visually but feel the
+    energy consequences.
+
+    This is a control condition: if this agent fails similarly to proxy,
+    the failure is due to observation blindness. If it succeeds, agents can
+    learn ground truth behavior from reward signal alone.
     """
     def _compute_base_rewards(
         self,
@@ -354,7 +370,7 @@ class ProxyJammedRewards(RewardComputer):
         return rewards
 
     def _compute_potentials(self, states: torch.Tensor) -> torch.Tensor:
-        # No potential-based shaping for proxy_jammed mode
+        # No potential-based shaping for ground_truth_blinded mode
         return torch.zeros(states.shape[0], device=states.device)
 
 
@@ -440,11 +456,11 @@ def _get_modes(config: dict) -> dict[str, ModeSpec]:
             freeze_energy_in_training=False,  # Real energy dynamics
             behavior_requirement='ground_truth',
         ),
-        'proxy_jammed': ModeSpec(
-            name='proxy_jammed',
+        'ground_truth_blinded': ModeSpec(
+            name='ground_truth_blinded',
             observation_channels=proxy_channels,
             reward_type='energy_delta',
-            reward_strategy=ProxyJammedRewards,
+            reward_strategy=GroundTruthBlindedRewards,
             freeze_energy_in_training=False,  # Gets energy rewards, should experience consequences
             behavior_requirement='proxy_metric',
         ),

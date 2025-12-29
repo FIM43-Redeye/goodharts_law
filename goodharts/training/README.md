@@ -367,7 +367,7 @@ python main.py --learned
 |------|-------------|--------|----------|
 | `ground_truth` | One-hot cell types | Energy delta | Baseline: full information |
 | `proxy` | Interestingness | Interestingness | **Main Goodhart failure mode** |
-| `proxy_jammed` | Interestingness | Energy delta | Information asymmetry (bonus) |
+| `ground_truth_blinded` | Interestingness | Energy delta | Control: blinded but true rewards |
 
 ---
 

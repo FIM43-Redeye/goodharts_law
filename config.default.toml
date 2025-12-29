@@ -10,6 +10,14 @@
 #   - energy_delta: Energy change when consumed (positive = food, negative = poison)
 #   - interestingness: What proxy-metric agents observe (the misleading signal)
 #   - color: RGB for visualization
+#
+# TODO (Goodhart Documentation):
+#   Explain the design rationale for these interestingness values:
+#   - Why is poison MORE interesting (1.0) than food (0.5)?
+#   - How does this create an "anti-correlated" proxy metric?
+#   - What real-world scenarios does this model? (engagement metrics, clickbait, etc.)
+#   - Why is this a SHARPER demonstration than having similar values?
+#   - What would happen if interestingness perfectly correlated with energy_delta?
 
 [cell_types.empty]
 color = [26, 26, 46]
