@@ -181,6 +181,9 @@ class ModeAggregates:
     reward_std: float
 
     # Efficiency (food / total consumed) - the key Goodhart metric
+    # overall_efficiency uses total consumption across all steps (the TRUE metric)
+    # efficiency_mean/std are per-death averages (can be misleading with few deaths)
+    overall_efficiency: float
     efficiency_mean: float
     efficiency_std: float
 
@@ -298,6 +301,12 @@ class ModelTester:
             device=self.device
         )
 
+        # Always disable energy freezing during evaluation
+        # freeze_energy_in_training exists for training exploration (proxy agents
+        # can't observe energy, so they'd never learn if deaths penalized them).
+        # But during evaluation, we MUST track real energy to measure true survival.
+        self.vec_env.freeze_energy = False
+
         # Disable artificial truncation - agents run until they die
         # Set max_steps very high so truncation never happens
         self.vec_env.max_steps = 1_000_000
@@ -349,6 +358,10 @@ class ModelTester:
 
         # For final energy tracking (captured just before respawn)
         self._last_energy = torch.zeros(cfg.n_envs, device=self.device)
+
+        # Dashboard checkpoint tracking
+        self._checkpoint_survivals: list[int] = []  # Survival times since last checkpoint
+        self._last_checkpoint_step = 0
 
         total_steps_target = cfg.total_timesteps * cfg.n_envs
         print(f"\n[Test] {cfg.mode}: {cfg.n_envs} envs x {cfg.total_timesteps:,} steps = {total_steps_target:,} total")
@@ -428,10 +441,12 @@ class ModelTester:
         for idx in death_indices:
             i = idx.item()
 
+            survival_time = self._survival_times[i].item()
+
             death = DeathEvent(
                 mode=self.config.mode,
                 death_id=self.death_count,
-                survival_time=self._survival_times[i].item(),
+                survival_time=survival_time,
                 food_eaten=self.vec_env.last_episode_food[i].item(),
                 poison_eaten=self.vec_env.last_episode_poison[i].item(),
                 total_reward=self._life_rewards[i].item(),
@@ -440,26 +455,36 @@ class ModelTester:
             self.deaths.append(death)
             self.death_count += 1
 
+            # Track survival time for dashboard checkpoint
+            self._checkpoint_survivals.append(survival_time)
+
             # Reset trackers for this env (agent has respawned)
             self._life_rewards[i] = 0
             self._survival_times[i] = 0
 
-            # Send to dashboard if available
-            if self.dashboard:
-                self.dashboard.send_episode(self.config.mode, death)
-
     def _update_dashboard(self):
-        """Send progress update to dashboard."""
+        """Send checkpoint update to dashboard."""
         if self.dashboard:
-            self.dashboard.send_progress(
-                self.config.mode,
-                self.total_steps,
-                self.death_count
+            # Send cumulative totals and recent survival times
+            self.dashboard.send_checkpoint(
+                mode=self.config.mode,
+                timesteps=self.total_steps,
+                food=self.total_food,
+                poison=self.total_poison,
+                deaths=self.death_count,
+                survival_times=self._checkpoint_survivals,
             )
+            # Clear checkpoint survivals after sending
+            self._checkpoint_survivals = []
 
     def _finalize(self) -> dict:
         """Compute aggregates, save JSON, and return results."""
         elapsed = time.perf_counter() - self.start_time
+
+        # Send final dashboard update and completion signal
+        if self.dashboard:
+            self._update_dashboard()  # Final checkpoint
+            self.dashboard.send_complete(self.config.mode)
 
         # Compute aggregates
         self._compute_aggregates()
@@ -536,6 +561,10 @@ class ModelTester:
             reward_mean=float(np.mean(rewards)),
             reward_std=float(np.std(rewards)),
             # Efficiency (the key Goodhart metric)
+            # Overall efficiency from total consumption (the TRUE metric)
+            overall_efficiency=self.total_food / (self.total_food + self.total_poison)
+                if (self.total_food + self.total_poison) > 0 else 1.0,
+            # Per-death efficiency stats (can be misleading with few deaths)
             efficiency_mean=float(np.mean(efficiencies)),
             efficiency_std=float(np.std(efficiencies)),
         )
@@ -578,7 +607,7 @@ class ModelTester:
         print(f"{'Food per 1k Steps':<25} {agg.food_per_1k_steps:>12.1f}")
         print(f"{'Poison per 1k Steps':<25} {agg.poison_per_1k_steps:>12.1f}")
         print(f"-"*65)
-        print(f"{'Efficiency':<25} {agg.efficiency_mean:>12.1%} {agg.efficiency_std:>10.1%}")
+        print(f"{'Overall Efficiency':<25} {agg.overall_efficiency:>12.1%}")
         print(f"{'='*65}")
 
 

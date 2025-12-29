@@ -1,23 +1,19 @@
 """
-Testing Dashboard for trained Goodhart agents.
+Evaluation Dashboard for trained Goodhart agents.
 
-Uses continuous survival paradigm - tracks death events, not episodes.
+Clean visualization with timestep-synchronized X-axes across all modes.
+Shows efficiency divergence between ground-truth and proxy agents in real time.
 
-Real-time visualization of testing metrics:
-- Survival Time (steps lived before each death)
-- Food per Death
-- Poison per Death
-- Deaths per 1k Steps (population death rate)
-- Efficiency (food / total consumed)
+Layout:
+- Left (75%): 3 stacked line plots (Efficiency, Deaths, Survival) with modes overlaid
+- Right (25%): Live stats panel with per-mode numbers
 
-Uses the same process-isolation pattern as TrainingDashboard for zero overhead.
+Uses process isolation for zero overhead on the evaluation thread.
 """
 
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from matplotlib.widgets import Button
 from matplotlib.animation import FuncAnimation
-from matplotlib.ticker import MaxNLocator
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -31,388 +27,450 @@ from goodharts.evaluation.evaluator import DeathEvent
 
 
 # Dashboard constants
-DASHBOARD_MAX_POINTS = 500        # Maximum data points to display
-EMA_SMOOTHING_ALPHA = 0.9         # Smoothing factor
-ANIMATION_INTERVAL_MS = 200       # Update interval
-QUEUE_POLL_TIMEOUT = 0.05         # Queue poll timeout
-QUEUE_MAX_SIZE = 1000             # Max queue size
+ANIMATION_INTERVAL_MS = 100       # Fast updates for "evolving" feel
+QUEUE_POLL_TIMEOUT = 0.02         # Queue poll timeout
+QUEUE_MAX_SIZE = 2000             # Max queue size
+ROLLING_WINDOW = 20               # Window for rolling average survival
+
+
+# Color scheme for modes (consistent across plots and stats)
+MODE_COLORS = {
+    'ground_truth': '#00ff88',      # Bright green
+    'ground_truth_handhold': '#88ff00',  # Lime
+    'proxy': '#ff4444',             # Red
+    'proxy_jammed': '#ffaa00',      # Orange
+}
+DEFAULT_COLOR = '#00aaff'           # Cyan fallback
+
+
+def get_mode_color(mode: str) -> str:
+    """Get consistent color for a mode."""
+    return MODE_COLORS.get(mode, DEFAULT_COLOR)
 
 
 @dataclass
-class TestRunState:
-    """State for a single testing run.
+class ModeStats:
+    """
+    Live statistics for a single mode, tracked over timesteps.
 
-    Tracks death events with incremental EMA smoothing.
-    In continuous survival paradigm, every recorded event IS a death.
+    All data is indexed by timesteps (shared X-axis), not death count.
     """
     mode: str
+    color: str = field(default_factory=lambda: DEFAULT_COLOR)
 
-    # Death counts
-    n_deaths: int = 0
-    total_steps: int = 0
+    # Timestep checkpoints (X-axis values)
+    timesteps: list = field(default_factory=list)
 
-    # Raw metrics (per death)
-    survival_times: list = field(default_factory=list)
-    food_counts: list = field(default_factory=list)
-    poison_counts: list = field(default_factory=list)
-    rewards: list = field(default_factory=list)
-    efficiencies: list = field(default_factory=list)
+    # Line plot data (Y values at each timestep checkpoint)
+    efficiency_history: list = field(default_factory=list)      # Running efficiency
+    cumulative_deaths: list = field(default_factory=list)       # Total deaths so far
+    survival_rolling: list = field(default_factory=list)        # Rolling avg survival
 
-    # Smoothed metrics (incremental EMA)
-    survival_smoothed: list = field(default_factory=list)
-    food_smoothed: list = field(default_factory=list)
-    poison_smoothed: list = field(default_factory=list)
-    rewards_smoothed: list = field(default_factory=list)
-    efficiency_smoothed: list = field(default_factory=list)
+    # Raw counters for computing metrics
+    total_timesteps: int = 0
+    total_deaths: int = 0
+    total_food: int = 0
+    total_poison: int = 0
 
-    # Deaths per 1k steps tracking (running estimate)
-    deaths_per_1k: list = field(default_factory=list)
+    # Recent survival times for rolling average
+    recent_survivals: list = field(default_factory=list)
 
     # Status
-    is_running: bool = True
-    last_update: float = 0.0
+    is_complete: bool = False
 
-    def add_death(self, death: dict, alpha: float = EMA_SMOOTHING_ALPHA):
-        """Add death event metrics with incremental smoothing."""
-        self.n_deaths += 1
+    def __post_init__(self):
+        self.color = get_mode_color(self.mode)
 
-        # Extract from dict (comes from asdict(DeathEvent))
-        # Handle both old 'episode_length' and new 'survival_time' keys
-        survival = death.get('survival_time', death.get('episode_length', 0))
-        food = death['food_eaten']
-        poison = death['poison_eaten']
-        reward = death['total_reward']
+    def record_checkpoint(self, timesteps: int, food: int, poison: int, deaths: int,
+                          survival_times: list[int]):
+        """
+        Record a checkpoint with current totals.
 
-        # Compute efficiency
-        total = food + poison
-        efficiency = food / total if total > 0 else 1.0
+        Called periodically from the evaluator to update dashboard state.
+        """
+        self.total_timesteps = timesteps
+        self.total_food = food
+        self.total_poison = poison
+        self.total_deaths = deaths
 
-        # Raw values
-        self.survival_times.append(survival)
-        self.food_counts.append(food)
-        self.poison_counts.append(poison)
-        self.rewards.append(reward)
-        self.efficiencies.append(efficiency)
+        # Update recent survivals for rolling average
+        if survival_times:
+            self.recent_survivals.extend(survival_times)
+            # Keep only recent window
+            if len(self.recent_survivals) > ROLLING_WINDOW * 2:
+                self.recent_survivals = self.recent_survivals[-ROLLING_WINDOW:]
 
-        # Deaths per 1k steps (rough estimate based on running totals)
-        # This is approximate since we don't track exact step count per death
-        if self.total_steps > 0:
-            rate = self.n_deaths / (self.total_steps / 1000.0)
-            self.deaths_per_1k.append(rate)
+        # Append to history
+        self.timesteps.append(timesteps)
+
+        # Efficiency: food / (food + poison)
+        total_consumed = food + poison
+        efficiency = food / total_consumed if total_consumed > 0 else 1.0
+        self.efficiency_history.append(efficiency)
+
+        # Cumulative deaths
+        self.cumulative_deaths.append(deaths)
+
+        # Rolling average survival
+        if self.recent_survivals:
+            window = self.recent_survivals[-ROLLING_WINDOW:]
+            self.survival_rolling.append(np.mean(window))
         else:
-            self.deaths_per_1k.append(0.0)
+            # No deaths yet - show 0 (or could show max possible)
+            self.survival_rolling.append(0)
 
-        # Incremental EMA smoothing
-        def ema_append(smoothed: list, raw: float) -> None:
-            if smoothed:
-                prev = smoothed[-1]
-                smoothed.append(alpha * prev + (1 - alpha) * raw)
-            else:
-                smoothed.append(raw)
+    @property
+    def current_efficiency(self) -> float:
+        """Current overall efficiency."""
+        total = self.total_food + self.total_poison
+        return self.total_food / total if total > 0 else 1.0
 
-        ema_append(self.survival_smoothed, survival)
-        ema_append(self.food_smoothed, food)
-        ema_append(self.poison_smoothed, poison)
-        ema_append(self.rewards_smoothed, reward)
-        ema_append(self.efficiency_smoothed, efficiency)
+    @property
+    def current_survival_avg(self) -> float:
+        """Current rolling average survival time."""
+        if self.recent_survivals:
+            return np.mean(self.recent_survivals[-ROLLING_WINDOW:])
+        return 0.0
 
-        # Trim to prevent unbounded growth
-        max_pts = DASHBOARD_MAX_POINTS
-        if len(self.survival_times) > max_pts * 2:
-            trim = len(self.survival_times) - max_pts
-            self.survival_times = self.survival_times[trim:]
-            self.food_counts = self.food_counts[trim:]
-            self.poison_counts = self.poison_counts[trim:]
-            self.rewards = self.rewards[trim:]
-            self.efficiencies = self.efficiencies[trim:]
-            self.deaths_per_1k = self.deaths_per_1k[trim:]
-            self.survival_smoothed = self.survival_smoothed[trim:]
-            self.food_smoothed = self.food_smoothed[trim:]
-            self.poison_smoothed = self.poison_smoothed[trim:]
-            self.rewards_smoothed = self.rewards_smoothed[trim:]
-            self.efficiency_smoothed = self.efficiency_smoothed[trim:]
-
-        self.last_update = time.time()
-
-    # Backwards compatibility alias
-    def add_episode(self, ep: dict, alpha: float = EMA_SMOOTHING_ALPHA):
-        """Backwards compatibility alias for add_death."""
-        self.add_death(ep, alpha)
+    @property
+    def deaths_per_1k(self) -> float:
+        """Deaths per 1000 timesteps."""
+        if self.total_timesteps > 0:
+            return self.total_deaths / (self.total_timesteps / 1000.0)
+        return 0.0
 
 
-class TestingDashboard:
+class EvalDashboard:
     """
-    Real-time visualization dashboard for testing runs.
+    Real-time evaluation dashboard with synchronized timestep axes.
 
-    5 panels per mode (continuous survival paradigm):
-    1. Survival Time (steps lived before death)
-    2. Food per Death
-    3. Poison per Death
-    4. Deaths/1k Steps (population death rate)
-    5. Efficiency (line, key Goodhart metric)
+    Layout:
+    - Left column: 3 stacked plots (Efficiency, Deaths, Survival)
+    - Right column: Live stats panel with numbers
+
+    All modes are overlaid on the same plots for direct comparison.
     """
-    
-    def __init__(self, modes: list[str], stop_event=None):
+
+    def __init__(self, modes: list[str], total_timesteps: int, stop_event=None):
         """
         Args:
-            modes: List of modes being tested
-            stop_event: Optional event to signal testing should stop
+            modes: List of modes being evaluated
+            total_timesteps: Target timesteps (for X-axis scaling)
+            stop_event: Optional event to signal evaluation should stop
         """
         self.modes = modes
-        self.n_runs = len(modes)
+        self.total_timesteps = total_timesteps
         self._stop_event = stop_event
-        
-        # State per run
-        self.runs: dict[str, TestRunState] = {
-            mode: TestRunState(mode=mode) for mode in modes
+
+        # Per-mode stats
+        self.stats: dict[str, ModeStats] = {
+            mode: ModeStats(mode=mode) for mode in modes
         }
-        
-        # Update queue
+
+        # Update queue (from evaluator process)
         self.update_queue: queue.Queue = queue.Queue()
-        
+
         # UI state
-        self.paused = False
-        self.dirty = False
         self.fig = None
-        self.axes: dict[str, dict[str, Any]] = {}
-        self.artists: dict[str, dict[str, Any]] = {}
+        self.axes: dict[str, Any] = {}
+        self.lines: dict[str, dict[str, Any]] = {}  # mode -> plot_name -> line
+        self.stat_texts: dict[str, Any] = {}        # mode -> text artist
         self.running = True
-    
-    def send_death(self, mode: str, death: DeathEvent):
-        """Queue a death event update."""
-        from dataclasses import asdict
+        self.is_complete = False
+        self.dirty = True  # Start dirty to draw initial state
+
+    def send_checkpoint(self, mode: str, timesteps: int, food: int, poison: int,
+                        deaths: int, survival_times: list[int]):
+        """Queue a checkpoint update from evaluator."""
         try:
-            self.update_queue.put_nowait(('death', mode, asdict(death)))
+            self.update_queue.put_nowait((
+                'checkpoint', mode,
+                (timesteps, food, poison, deaths, survival_times)
+            ))
             self.dirty = True
         except queue.Full:
             pass
 
-    # Backwards compatibility alias
-    def send_episode(self, mode: str, episode):
-        """Backwards compatibility alias for send_death."""
-        self.send_death(mode, episode)
-    
-    def send_progress(self, mode: str, steps: int, deaths: int):
-        """Queue a progress update."""
+    def send_complete(self, mode: str):
+        """Signal that a mode has finished evaluation."""
         try:
-            self.update_queue.put_nowait(('progress', mode, (steps, deaths)))
+            self.update_queue.put_nowait(('complete', mode, None))
             self.dirty = True
         except queue.Full:
             pass
 
     def _process_updates(self):
-        """Process pending updates."""
-        max_updates = DASHBOARD_MAX_POINTS
+        """Process pending updates from queue."""
         processed = 0
+        max_updates = 500  # Batch limit per frame
 
         while not self.update_queue.empty() and processed < max_updates:
             try:
-                update_type, mode, data = self.update_queue.get_nowait()
-                run = self.runs.get(mode)
-                if run is None:
+                msg_type, mode, data = self.update_queue.get_nowait()
+                stats = self.stats.get(mode)
+                if stats is None:
                     continue
 
-                if update_type == 'death' or update_type == 'episode':
-                    run.add_death(data)
-                elif update_type == 'progress':
-                    steps, deaths = data
-                    run.total_steps = steps
+                if msg_type == 'checkpoint':
+                    timesteps, food, poison, deaths, survivals = data
+                    stats.record_checkpoint(timesteps, food, poison, deaths, survivals)
+                elif msg_type == 'complete':
+                    stats.is_complete = True
 
                 processed += 1
             except queue.Empty:
                 break
-    
+
+        # Check if all modes complete
+        if all(s.is_complete for s in self.stats.values()):
+            self.is_complete = True
+
     def _create_figure(self):
-        """Create matplotlib figure with 5-panel layout per mode."""
+        """Create matplotlib figure with 3-plot + stats layout."""
         plt.style.use('dark_background')
 
-        rows = self.n_runs
-        cols = 5  # Survival, Food, Poison, Deaths/1k, Efficiency
+        # Figure size
+        self.fig = plt.figure(figsize=(14, 8))
+        self.fig.patch.set_facecolor('#1a1a2e')
 
-        fig_height = 3 * rows + 1
-        self.fig = plt.figure(figsize=(12, fig_height))
-        self.fig.suptitle("Survival Analysis Dashboard", fontsize=14, fontweight='bold', color='white')
+        # GridSpec: 3 rows, 4 columns (3 for plots, 1 for stats)
+        gs = gridspec.GridSpec(3, 4, figure=self.fig,
+                               width_ratios=[3, 3, 3, 2],
+                               hspace=0.3, wspace=0.3,
+                               left=0.06, right=0.98, top=0.92, bottom=0.08)
 
-        gs = gridspec.GridSpec(rows, cols, figure=self.fig,
-                               hspace=0.4, wspace=0.35,
-                               left=0.05, right=0.97, top=0.9, bottom=0.1)
+        # Title
+        self.fig.suptitle('Evaluation Dashboard', fontsize=16,
+                         fontweight='bold', color='white')
 
-        for row_idx, mode in enumerate(self.modes):
-            self._create_run_row(gs, row_idx, mode)
+        # Create the 3 main plots (spanning columns 0-2)
+        self._create_efficiency_plot(gs[0, :3])
+        self._create_deaths_plot(gs[1, :3])
+        self._create_survival_plot(gs[2, :3])
 
-        # Add pause/stop buttons
-        self._add_controls()
-    
-    def _create_run_row(self, gs, row_idx: int, mode: str):
-        """Create 5-panel row for a mode."""
-        self.axes[mode] = {}
-        self.artists[mode] = {}
+        # Create stats panel (column 3, all rows)
+        self._create_stats_panel(gs[:, 3])
 
-        # Column titles (continuous survival paradigm)
-        titles = ['Survival', 'Food/Death', 'Poison/Death', 'Deaths/1k', 'Efficiency']
-        colors = ['cyan', 'lime', 'red', 'magenta', 'cyan']
+        # Initialize lines for each mode
+        self._init_mode_lines()
 
-        for col, (title, color) in enumerate(zip(titles, colors)):
-            ax = self.fig.add_subplot(gs[row_idx, col])
+        # Legend (in efficiency plot)
+        if len(self.modes) > 1:
+            self.axes['efficiency'].legend(loc='lower left', fontsize=9,
+                                           framealpha=0.7, facecolor='#2a2a4e')
 
-            # Mode label only on first column
-            if col == 0:
-                ax.set_title(f"{mode}: {title}", fontsize=10, fontweight='bold', color='white')
-            else:
-                ax.set_title(title, fontsize=10, color='white')
+    def _create_efficiency_plot(self, gs_spec):
+        """Create efficiency over time plot."""
+        ax = self.fig.add_subplot(gs_spec)
+        ax.set_facecolor('#16213e')
+        ax.set_title('Efficiency (food / total consumed)', fontsize=11,
+                    color='white', fontweight='bold')
+        ax.set_ylabel('Efficiency', fontsize=10, color='gray')
+        ax.set_ylim(0, 1.05)
+        ax.set_xlim(0, self.total_timesteps)
+        ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.3, linewidth=1)
+        ax.axhline(y=1.0, color='#00ff88', linestyle='--', alpha=0.2, linewidth=1)
+        ax.grid(True, alpha=0.15, color='gray')
+        ax.tick_params(colors='gray', labelsize=9)
+        self.axes['efficiency'] = ax
 
-            ax.tick_params(colors='gray', labelsize=8)
-            ax.grid(True, alpha=0.2, color='gray')
+    def _create_deaths_plot(self, gs_spec):
+        """Create cumulative deaths plot."""
+        ax = self.fig.add_subplot(gs_spec)
+        ax.set_facecolor('#16213e')
+        ax.set_title('Cumulative Deaths', fontsize=11,
+                    color='white', fontweight='bold')
+        ax.set_ylabel('Deaths', fontsize=10, color='gray')
+        ax.set_xlim(0, self.total_timesteps)
+        ax.grid(True, alpha=0.15, color='gray')
+        ax.tick_params(colors='gray', labelsize=9)
+        self.axes['deaths'] = ax
 
-            self.axes[mode][title] = ax
+    def _create_survival_plot(self, gs_spec):
+        """Create rolling average survival time plot."""
+        ax = self.fig.add_subplot(gs_spec)
+        ax.set_facecolor('#16213e')
+        ax.set_title(f'Survival Time (rolling avg, window={ROLLING_WINDOW})',
+                    fontsize=11, color='white', fontweight='bold')
+        ax.set_ylabel('Steps', fontsize=10, color='gray')
+        ax.set_xlabel('Timesteps', fontsize=10, color='gray')
+        ax.set_xlim(0, self.total_timesteps)
+        ax.grid(True, alpha=0.15, color='gray')
+        ax.tick_params(colors='gray', labelsize=9)
+        self.axes['survival'] = ax
 
-            if title == 'Deaths/1k':
-                # Line plot for death rate
-                line, = ax.plot([], [], color=color, linewidth=1.5, alpha=0.9)
-                ax.set_ylim(0, 10)  # Initial scale, will auto-adjust
-                self.artists[mode][title] = line
-            elif title == 'Efficiency':
-                # Line with reference at 1.0
-                ax.axhline(y=1.0, color='lime', linestyle='--', alpha=0.3, linewidth=1)
-                line, = ax.plot([], [], color=color, linewidth=1.5, alpha=0.9)
-                ax.set_ylim(0, 1.1)
-                self.artists[mode][title] = line
-            else:
-                # Standard line plot
-                line, = ax.plot([], [], color=color, linewidth=1.5, alpha=0.9)
-                self.artists[mode][title] = line
-    
-    def _add_controls(self):
-        """Add pause and stop buttons."""
-        ax_pause = self.fig.add_axes([0.45, 0.02, 0.05, 0.03])
-        ax_stop = self.fig.add_axes([0.51, 0.02, 0.05, 0.03])
-        
-        self.btn_pause = Button(ax_pause, 'Pause', color='dimgray', hovercolor='gray')
-        self.btn_stop = Button(ax_stop, 'Stop', color='darkred', hovercolor='red')
-        
-        self.btn_pause.on_clicked(self._on_pause)
-        self.btn_stop.on_clicked(self._on_stop)
-    
-    def _on_pause(self, event):
-        """Toggle pause."""
-        self.paused = not self.paused
-        self.btn_pause.label.set_text('Resume' if self.paused else 'Pause')
-    
-    def _on_stop(self, event):
-        """Request stop."""
-        if self._stop_event:
-            self._stop_event.set()
-        print("[Dashboard] Stop requested")
-    
+    def _create_stats_panel(self, gs_spec):
+        """Create live stats panel."""
+        ax = self.fig.add_subplot(gs_spec)
+        ax.set_facecolor('#0f0f23')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis('off')
+
+        # Title for stats panel
+        ax.text(0.5, 0.97, 'Live Stats', fontsize=13, fontweight='bold',
+               color='white', ha='center', va='top',
+               transform=ax.transAxes)
+
+        # Create text placeholders for each mode
+        n_modes = len(self.modes)
+        spacing = 0.85 / max(n_modes, 1)
+
+        for i, mode in enumerate(self.modes):
+            y_pos = 0.88 - (i * spacing)
+            color = get_mode_color(mode)
+
+            # Mode name header
+            ax.text(0.1, y_pos, mode, fontsize=11, fontweight='bold',
+                   color=color, ha='left', va='top',
+                   transform=ax.transAxes)
+
+            # Stats text (will be updated)
+            text = ax.text(0.1, y_pos - 0.05, '', fontsize=10,
+                          color='#cccccc', ha='left', va='top',
+                          transform=ax.transAxes, family='monospace',
+                          linespacing=1.4)
+            self.stat_texts[mode] = text
+
+        self.axes['stats'] = ax
+
+    def _init_mode_lines(self):
+        """Initialize line artists for each mode on each plot."""
+        for mode in self.modes:
+            color = get_mode_color(mode)
+            self.lines[mode] = {}
+
+            # Efficiency line
+            line, = self.axes['efficiency'].plot(
+                [], [], color=color, linewidth=2, alpha=0.9, label=mode
+            )
+            self.lines[mode]['efficiency'] = line
+
+            # Deaths line
+            line, = self.axes['deaths'].plot(
+                [], [], color=color, linewidth=2, alpha=0.9
+            )
+            self.lines[mode]['deaths'] = line
+
+            # Survival line
+            line, = self.axes['survival'].plot(
+                [], [], color=color, linewidth=2, alpha=0.9
+            )
+            self.lines[mode]['survival'] = line
+
     def _update_frame(self, frame):
         """Animation update callback."""
         if not self.running:
             return []
 
-        if self.paused:
-            return []
+        # Process any pending updates
+        self._process_updates()
 
-        # Only process if dirty
+        # Skip redraw if nothing changed
         if not self.dirty:
             return []
-
-        self._process_updates()
         self.dirty = False
 
         all_artists = []
+        max_deaths = 0
+        max_survival = 0
 
         for mode in self.modes:
-            run = self.runs[mode]
-            artists = self.artists[mode]
-            axes = self.axes[mode]
+            stats = self.stats[mode]
+            lines = self.lines[mode]
 
-            n = len(run.survival_times)
-            if n == 0:
+            if not stats.timesteps:
                 continue
 
-            x = np.arange(n)
+            x = np.array(stats.timesteps)
 
-            # Update each panel
-            for title, smoothed_attr in [
-                ('Survival', 'survival_smoothed'),
-                ('Food/Death', 'food_smoothed'),
-                ('Poison/Death', 'poison_smoothed'),
-            ]:
-                line = artists[title]
-                data = getattr(run, smoothed_attr)
-                if data:
-                    line.set_data(x[:len(data)], data)
-                    ax = axes[title]
-                    ax.set_xlim(0, max(n, 10))
-                    if data:
-                        ymin, ymax = min(data), max(data)
-                        margin = (ymax - ymin) * 0.1 or 1
-                        ax.set_ylim(max(0, ymin - margin), ymax + margin)
-                all_artists.append(line)
+            # Update efficiency line
+            y_eff = np.array(stats.efficiency_history)
+            lines['efficiency'].set_data(x, y_eff)
+            all_artists.append(lines['efficiency'])
 
-            # Deaths per 1k steps
-            if run.deaths_per_1k:
-                line = artists['Deaths/1k']
-                line.set_data(x[:len(run.deaths_per_1k)], run.deaths_per_1k)
-                ax = axes['Deaths/1k']
-                ax.set_xlim(0, max(n, 10))
-                ymax = max(run.deaths_per_1k) * 1.2 or 10
-                ax.set_ylim(0, ymax)
-                all_artists.append(line)
+            # Update deaths line
+            y_deaths = np.array(stats.cumulative_deaths)
+            lines['deaths'].set_data(x, y_deaths)
+            all_artists.append(lines['deaths'])
+            max_deaths = max(max_deaths, y_deaths[-1] if len(y_deaths) else 0)
 
-            # Efficiency
-            if run.efficiency_smoothed:
-                line = artists['Efficiency']
-                line.set_data(x[:len(run.efficiency_smoothed)], run.efficiency_smoothed)
-                axes['Efficiency'].set_xlim(0, max(n, 10))
-                all_artists.append(line)
+            # Update survival line
+            y_surv = np.array(stats.survival_rolling)
+            lines['survival'].set_data(x, y_surv)
+            all_artists.append(lines['survival'])
+            if len(y_surv) > 0:
+                max_survival = max(max_survival, np.max(y_surv))
+
+            # Update stats text
+            text = self.stat_texts[mode]
+            status = "DONE" if stats.is_complete else "running"
+            text.set_text(
+                f"Efficiency: {stats.current_efficiency:>6.1%}\n"
+                f"Deaths:     {stats.total_deaths:>6,}\n"
+                f"Survival:   {stats.current_survival_avg:>6.0f} steps\n"
+                f"Deaths/1k:  {stats.deaths_per_1k:>6.1f}\n"
+                f"[{status}]"
+            )
+            all_artists.append(text)
+
+        # Auto-scale Y axes
+        if max_deaths > 0:
+            self.axes['deaths'].set_ylim(0, max_deaths * 1.1)
+        if max_survival > 0:
+            self.axes['survival'].set_ylim(0, max_survival * 1.2)
+
+        # Update title if complete
+        if self.is_complete:
+            self.fig.suptitle('Evaluation Complete (close window when done)',
+                            fontsize=16, fontweight='bold', color='#88ff88')
 
         return all_artists
-    
+
     def run(self):
         """Start the dashboard (blocking)."""
         self._create_figure()
-        
+
         self.anim = FuncAnimation(
             self.fig,
             self._update_frame,
             interval=ANIMATION_INTERVAL_MS,
-            blit=True,
+            blit=False,  # Need full redraw for text updates
             cache_frame_data=False
         )
-        
+
         plt.show()
-    
+
     def close(self):
         """Close the dashboard."""
         self.running = False
-        plt.close(self.fig)
+        if self.fig:
+            plt.close(self.fig)
 
 
-def _dashboard_worker(modes: list[str], update_queue: MPQueue, stop_event, testing_stop_event):
+def _dashboard_worker(modes: list[str], total_timesteps: int,
+                      update_queue: MPQueue, stop_event, eval_stop_event):
     """Worker function for dashboard process."""
-    dashboard = TestingDashboard(modes, stop_event=testing_stop_event)
-    
+    dashboard = EvalDashboard(modes, total_timesteps, stop_event=eval_stop_event)
+
     def poll_queue():
+        """Poll multiprocessing queue and forward to dashboard."""
         while not stop_event.is_set():
             try:
                 item = update_queue.get(timeout=QUEUE_POLL_TIMEOUT)
                 if item is None:
+                    # Poison pill - evaluation done
                     dashboard.running = False
                     break
-                update_type, mode, data = item
-                if update_type == 'episode':
-                    dashboard.update_queue.put_nowait(('episode', mode, data))
-                    dashboard.dirty = True
-                elif update_type == 'progress':
-                    dashboard.update_queue.put_nowait(('progress', mode, data))
-                    dashboard.dirty = True
+                msg_type, mode, data = item
+                dashboard.update_queue.put_nowait((msg_type, mode, data))
+                dashboard.dirty = True
             except queue.Empty:
                 pass
-    
+
     poll_thread = threading.Thread(target=poll_queue, daemon=True)
     poll_thread.start()
-    
+
     try:
         dashboard.run()
     except KeyboardInterrupt:
@@ -421,57 +479,74 @@ def _dashboard_worker(modes: list[str], update_queue: MPQueue, stop_event, testi
         stop_event.set()
 
 
-class TestingDashboardProcess:
+class EvalDashboardProcess:
     """
-    Process-isolated testing dashboard.
-    
-    Runs in separate process for zero overhead on testing thread.
+    Process-isolated evaluation dashboard.
+
+    Runs matplotlib in a separate process for zero overhead on evaluation.
+    Survives after evaluation completes so user can inspect results.
     """
-    
-    def __init__(self, modes: list[str]):
+
+    def __init__(self, modes: list[str], total_timesteps: int = 100000):
         self.modes = modes
-        
+        self.total_timesteps = total_timesteps
+
         ctx = mp.get_context('spawn')
         self._queue: MPQueue = ctx.Queue(maxsize=QUEUE_MAX_SIZE)
         self._stop_event = ctx.Event()
-        self._testing_stop_event = ctx.Event()
+        self._eval_stop_event = ctx.Event()
         self._process: Optional[Process] = None
-    
+
     def start(self):
         """Start dashboard process."""
         ctx = mp.get_context('spawn')
         self._process = ctx.Process(
             target=_dashboard_worker,
-            args=(self.modes, self._queue, self._stop_event, self._testing_stop_event),
-            daemon=True
+            args=(self.modes, self.total_timesteps,
+                  self._queue, self._stop_event, self._eval_stop_event),
+            daemon=False  # Don't daemon - we want it to survive
         )
         self._process.start()
-        print(f"[Dashboard] Started testing dashboard (PID {self._process.pid})")
-    
+        print(f"[Dashboard] Started (PID {self._process.pid})")
+
+    def send_checkpoint(self, mode: str, timesteps: int, food: int, poison: int,
+                        deaths: int, survival_times: list[int]):
+        """Send checkpoint to dashboard."""
+        try:
+            self._queue.put_nowait((
+                'checkpoint', mode,
+                (timesteps, food, poison, deaths, survival_times)
+            ))
+        except queue.Full:
+            pass
+
+    def send_complete(self, mode: str):
+        """Signal mode completion."""
+        try:
+            self._queue.put_nowait(('complete', mode, None))
+        except queue.Full:
+            pass
+
+    # Backwards compatibility aliases
     def send_episode(self, mode: str, episode):
-        """Send episode to dashboard."""
+        """Legacy compatibility - convert episode to checkpoint."""
         from dataclasses import asdict
-        try:
-            ep_dict = asdict(episode) if hasattr(episode, '__dataclass_fields__') else episode
-            self._queue.put_nowait(('episode', mode, ep_dict))
-        except queue.Full:
-            pass
-    
-    def send_progress(self, mode: str, steps: int, episodes: int):
-        """Send progress update."""
-        try:
-            self._queue.put_nowait(('progress', mode, (steps, episodes)))
-        except queue.Full:
-            pass
-    
+        ep = asdict(episode) if hasattr(episode, '__dataclass_fields__') else episode
+        # Can't fully reconstruct, but this keeps old code from crashing
+        pass
+
+    def send_progress(self, mode: str, steps: int, deaths: int):
+        """Legacy compatibility."""
+        pass
+
     def is_alive(self) -> bool:
         """Check if dashboard is still running."""
         return self._process is not None and self._process.is_alive()
-    
+
     def should_stop(self) -> bool:
-        """Check if user requested stop."""
-        return self._testing_stop_event.is_set()
-    
+        """Check if user requested stop via dashboard."""
+        return self._eval_stop_event.is_set()
+
     def stop(self, timeout: float = 2.0):
         """Stop dashboard gracefully."""
         self._stop_event.set()
@@ -479,19 +554,20 @@ class TestingDashboardProcess:
             self._queue.put_nowait(None)
         except queue.Full:
             pass
-        
+
         if self._process is not None:
             self._process.join(timeout=timeout)
             if self._process.is_alive():
                 self._process.terminate()
                 self._process.join(timeout=1.0)
-    
+
     def wait(self):
-        """Wait for dashboard to close."""
+        """Wait for dashboard to close (user closes window)."""
         if self._process is not None:
             self._process.join()
 
 
-def create_testing_dashboard(modes: list[str]) -> TestingDashboardProcess:
-    """Factory for process-isolated testing dashboard."""
-    return TestingDashboardProcess(modes)
+def create_testing_dashboard(modes: list[str],
+                             total_timesteps: int = 100000) -> EvalDashboardProcess:
+    """Factory for process-isolated evaluation dashboard."""
+    return EvalDashboardProcess(modes, total_timesteps)

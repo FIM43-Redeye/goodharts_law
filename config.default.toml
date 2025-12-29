@@ -24,12 +24,12 @@ interestingness = 0.0
 [cell_types.food]
 color = [22, 199, 154]
 energy_delta = 1.0
-interestingness = 1.0
+interestingness = 0.5   # Eat your vegetables, kids, or you'll kick yourself later
 
 [cell_types.poison]
 color = [255, 107, 107]
 energy_delta = -2.0
-interestingness = 0.9    # Nearly as "interesting" as food - the trap!
+interestingness = 1.0    # MORE interesting than food!
 
 [cell_types.prey]
 color = [0, 255, 255]
@@ -144,6 +144,10 @@ use_amp = true           # Mixed precision (fp16)
 checkpoint_interval = 0  # Save every N updates (0 = disabled)
 lr_decay = false
 lr_decay_factor = 0.1
+
+# Privileged critic: value function sees episode density (food/poison counts)
+# This improves value estimation without affecting policy behavior
+privileged_critic = true
 
 # Validation
 validation_interval = 0  # Eval every N updates (0 = disabled)

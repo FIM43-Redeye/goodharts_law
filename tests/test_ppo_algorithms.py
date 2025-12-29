@@ -39,12 +39,13 @@ class SimpleValueHead(nn.Module):
         super().__init__()
         self.fc = nn.Linear(hidden, 1)
 
-    def forward(self, features):
+    def forward(self, features, aux=None):
+        # aux is ignored in simple head (no privileged info)
         return self.fc(features)
 
-    def get_training_value(self, features):
+    def get_training_value(self, features, aux=None):
         """Match interface expected by ppo_update."""
-        return self.forward(features)
+        return self.forward(features, aux)
 
     def prepare_targets(self, returns, old_values):
         """No-op for simple head (no normalization)."""

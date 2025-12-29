@@ -613,6 +613,10 @@ class PPOConfig:
     validation_mode: str = "training" # "training" or "fixed"
     validation_food: int = 100        # Fixed mode: food count
     validation_poison: int = 50       # Fixed mode: poison count
+
+    # Privileged critic: value function sees episode density (food/poison counts)
+    # This helps explain variance from episode difficulty without affecting policy
+    privileged_critic: bool = True   # Enable density info for value head
     
     @classmethod
     def from_config(cls, mode: str = 'ground_truth', **overrides) -> 'PPOConfig':
@@ -815,20 +819,26 @@ class PPOTrainer:
 
         for step in range(cfg.steps_per_env):
             with torch.no_grad():
+                # Get density info for privileged critic
+                density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
+
                 # Use compiled functions if available (triggers compilation on first call)
-                if self._compiled_inference is not None:
+                if self._compiled_policy_forward is not None:
                     # Mark step begin for CUDA graph tensor reuse
                     torch.compiler.cudagraph_mark_step_begin()
-                    logits, features, values = self._compiled_inference(states)
+                    logits, features = self._compiled_policy_forward(states)
                     actions, log_probs = self._compiled_sample(logits)
                 else:
                     states_t = states.float()
                     with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                         logits, features = self.policy.forward_with_features(states_t)
-                        values = self.value_head(features).squeeze(-1)
                         dist = Categorical(logits=logits, validate_args=False)
                         actions = dist.sample()
                         log_probs = dist.log_prob(actions)
+
+                # Compute values with density (privileged critic)
+                with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                    values = self.value_head(features, density_info).squeeze(-1)
 
             current_states = states.clone()
             next_states, eating_info, terminated, truncated = self.vec_env.step(actions)
@@ -843,6 +853,8 @@ class PPOTrainer:
             dones_buf[step] = dones
             terminated_buf[step] = terminated
             values_buf[step] = values
+            if self._aux_buf is not None:
+                self._aux_buf[step] = density_info
 
             episode_rewards += shaped_rewards
             episode_rewards *= (~dones)
@@ -852,7 +864,8 @@ class PPOTrainer:
         with torch.no_grad():
             states_t = states.float()
             _, features = self.policy.forward_with_features(states_t)
-            next_value = self.value_head(features).squeeze(-1)
+            bootstrap_density = self.vec_env.get_density_info() if self._aux_buf is not None else None
+            next_value = self.value_head(features, bootstrap_density).squeeze(-1)
 
         # Compute GAE (pass tensors directly, no stacking needed)
         # Use terminated_buf - only zero bootstrap on true death
@@ -1044,12 +1057,21 @@ class PPOTrainer:
         self.policy = create_brain(cfg.brain_type, self.spec, output_size=n_actions).to(self.device)
 
         # Value head - configurable between simple and PopArt
+        # Privileged critic: value head sees density info that policy doesn't
+        num_aux = 2 if cfg.privileged_critic else 0  # (food_density, poison_density)
         if cfg.value_head_type == 'popart':
-            self.value_head = PopArtValueHead(input_size=self.policy.hidden_size).to(self.device)
+            self.value_head = PopArtValueHead(
+                input_size=self.policy.hidden_size,
+                num_aux_inputs=num_aux
+            ).to(self.device)
         elif cfg.value_head_type == 'simple':
-            self.value_head = ValueHead(input_size=self.policy.hidden_size).to(self.device)
+            self.value_head = ValueHead(
+                input_size=self.policy.hidden_size,
+                num_aux_inputs=num_aux
+            ).to(self.device)
         else:
             raise ValueError(f"Unknown value_head_type: {cfg.value_head_type}. Use 'simple' or 'popart'.")
+        self._num_aux_inputs = num_aux
         # Store architecture info before potential torch.compile (for serialization)
         self._policy_arch_info = self.policy.get_architecture_info()
         _vprint("Networks created and moved to device", v)
@@ -1067,7 +1089,7 @@ class PPOTrainer:
         # inference step (forward + sampling) eliminates inter-update gaps by fusing
         # many small kernels into fewer large ones. This reduces kernel launch overhead
         # from ~1ms to ~0.006ms per update.
-        self._compiled_inference = None
+        self._compiled_policy_forward = None
         self._compiled_sample = None
 
         with _COMPILE_LOCK:
@@ -1077,21 +1099,18 @@ class PPOTrainer:
                     # max-autotune-no-cudagraphs is safest for AMD ROCm
                     compile_mode = cfg.compile_mode
 
-                    # Compile the full inference step, not just individual models
-                    # This fuses .float(), autocast, forward, and squeeze into one graph
+                    # Compile policy forward pass (value computed separately for aux support)
                     policy = self.policy
-                    value_head = self.value_head
                     device_type = self.device_type
                     use_amp = cfg.use_amp
 
                     @torch.compile(mode=compile_mode)
-                    def compiled_inference(states):
-                        """Fused inference: policy forward + value head."""
+                    def compiled_policy_forward(states):
+                        """Fused policy forward: CNN + action logits."""
                         # Note: states already float32 from TorchVecEnv._view_buffer
                         with autocast(device_type=device_type, enabled=use_amp):
                             logits, features = policy.forward_with_features(states)
-                            values = value_head(features).squeeze(-1)
-                        return logits, features, values
+                        return logits, features
 
                     @torch.compile(mode=compile_mode)
                     def compiled_sample(logits):
@@ -1101,7 +1120,7 @@ class PPOTrainer:
                         log_probs = dist.log_prob(actions)
                         return actions, log_probs
 
-                    self._compiled_inference = compiled_inference
+                    self._compiled_policy_forward = compiled_policy_forward
                     self._compiled_sample = compiled_sample
 
                     print(f"   [JIT] torch.compile enabled ({compile_mode})")
@@ -1225,6 +1244,13 @@ class PPOTrainer:
         self._dones_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
         self._terminated_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
         self._values_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
+
+        # Privileged critic: density info buffer (food_density, poison_density per step)
+        if self._num_aux_inputs > 0:
+            aux_shape = (cfg.steps_per_env, cfg.n_envs, self._num_aux_inputs)
+            self._aux_buf = torch.zeros(aux_shape, device=self.device, dtype=torch.float32)
+        else:
+            self._aux_buf = None
 
         # Episode tracking buffers (for async logging)
         self._finished_dones_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
@@ -1354,6 +1380,9 @@ class PPOTrainer:
             
             # Collect experience
             with torch.no_grad():
+                # Get density info for privileged critic (cheap GPU op, no sync)
+                density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
+
                 if inference_pending:
                     # Inference was issued on separate stream after previous PPO update
                     # Make default stream wait on inference completion (GPU-level sync, no CPU block)
@@ -1367,20 +1396,23 @@ class PPOTrainer:
 
                     # Use compiled functions if available (fuses many small kernels)
                     with record_function("INFERENCE"):
-                        if self._compiled_inference is not None:
+                        if self._compiled_policy_forward is not None:
                             # Mark step begin for CUDA graph tensor reuse
                             torch.compiler.cudagraph_mark_step_begin()
-                            logits, features, values = self._compiled_inference(states)
+                            logits, features = self._compiled_policy_forward(states)
                             actions, log_probs = self._compiled_sample(logits)
                         else:
                             # Fallback to eager mode
                             states_t = states.float()
                             with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                                 logits, features = self.policy.forward_with_features(states_t)
-                                values = self.value_head(features).squeeze(-1)
                                 dist = Categorical(logits=logits, validate_args=False)
                                 actions = dist.sample()
                                 log_probs = dist.log_prob(actions)
+
+                        # Compute values separately (supports aux inputs for privileged critic)
+                        with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                            values = self.value_head(features, density_info).squeeze(-1)
 
                     # Store last logits for action_probs logging (computed once per update)
                     last_logits = logits
@@ -1410,6 +1442,8 @@ class PPOTrainer:
             dones_buf[step_in_buffer] = dones
             terminated_buf[step_in_buffer] = terminated
             values_buf[step_in_buffer] = values
+            if self._aux_buf is not None:
+                self._aux_buf[step_in_buffer] = density_info
 
             # Track episode stats (defer logging to avoid Sync)
             finished_dones_buf[step_in_buffer] = dones
@@ -1436,7 +1470,9 @@ class PPOTrainer:
                     with torch.no_grad():
                         states_t = states.float()
                         _, features = self.policy.forward_with_features(states_t)
-                        next_value = self.value_head(features).squeeze(-1)
+                        # Get current density for bootstrap value (privileged critic)
+                        bootstrap_density = self.vec_env.get_density_info() if self._aux_buf is not None else None
+                        next_value = self.value_head(features, bootstrap_density).squeeze(-1)
 
                     # Compute GAE (pass pre-allocated tensors directly, no stacking)
                     # Use terminated_buf (not dones_buf) - only zero bootstrap on true death
@@ -1485,6 +1521,11 @@ class PPOTrainer:
                     all_log_probs = log_probs_buf.flatten()
                     all_old_values = values_buf.flatten()
 
+                    # Privileged critic: flatten aux buffer for PPO update
+                    all_aux = None
+                    if self._aux_buf is not None:
+                        all_aux = self._aux_buf.reshape(batch_size, -1)
+
                     # Returns and advantages from compute_gae
                     all_returns = returns.flatten()
                     all_advantages = advantages.flatten()
@@ -1510,8 +1551,9 @@ class PPOTrainer:
                         value_coef=cfg.value_coef,
                         n_minibatches=cfg.n_minibatches,
                         scaler=self.scaler,
-                    verbose=True,
-                )
+                        verbose=True,
+                        aux_inputs=all_aux,
+                    )
                 # Clear progress line
                 print(" " * 40, end='\r')
 
@@ -1557,35 +1599,44 @@ class PPOTrainer:
                     self._ppo_done_event.record()
 
                 with torch.no_grad():
+                    # Get fresh density for prefetched inference (privileged critic)
+                    prefetch_density = self.vec_env.get_density_info() if self._aux_buf is not None else None
+
                     with record_function("INFERENCE"):
                         # Issue inference on separate stream (overlaps kernel scheduling)
                         if self._inference_stream is not None:
                             self._inference_stream.wait_event(self._ppo_done_event)
                             with torch.cuda.stream(self._inference_stream):
-                                if self._compiled_inference is not None:
-                                    logits, features, values = self._compiled_inference(states)
+                                if self._compiled_policy_forward is not None:
+                                    logits, features = self._compiled_policy_forward(states)
                                     actions, log_probs = self._compiled_sample(logits)
                                 else:
                                     states_t = states.float()
                                     with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                                         logits, features = self.policy.forward_with_features(states_t)
-                                        values = self.value_head(features).squeeze(-1)
                                         dist = Categorical(logits=logits, validate_args=False)
                                         actions = dist.sample()
                                         log_probs = dist.log_prob(actions)
+                                # Compute values with density (privileged critic)
+                                with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                                    values = self.value_head(features, prefetch_density).squeeze(-1)
                         else:
                             # CPU/TPU fallback - no streams
-                            if self._compiled_inference is not None:
-                                logits, features, values = self._compiled_inference(states)
+                            if self._compiled_policy_forward is not None:
+                                logits, features = self._compiled_policy_forward(states)
                                 actions, log_probs = self._compiled_sample(logits)
                             else:
                                 states_t = states.float()
                                 with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                                     logits, features = self.policy.forward_with_features(states_t)
-                                    values = self.value_head(features).squeeze(-1)
                                     dist = Categorical(logits=logits, validate_args=False)
                                     actions = dist.sample()
                                     log_probs = dist.log_prob(actions)
+                            # Compute values with density (privileged critic)
+                            with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                                values = self.value_head(features, prefetch_density).squeeze(-1)
+                # Store density for this prefetched step (will be used when buffer stores it)
+                density_info = prefetch_density
                 last_logits = logits
                 inference_pending = True
 

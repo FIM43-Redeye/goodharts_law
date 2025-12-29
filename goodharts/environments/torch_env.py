@@ -837,6 +837,35 @@ class TorchVecEnv:
 
         return self._view_buffer
 
+    def get_density_info(self) -> torch.Tensor:
+        """
+        Get normalized density info for privileged critic.
+
+        Returns density as (n_envs, 2) tensor with [food_density, poison_density].
+        Values are normalized to roughly [-1, 1] based on curriculum ranges.
+
+        This info helps the value function predict returns more accurately
+        without affecting the policy (which only sees the grid).
+        """
+        # Get counts for each env's grid (in independent mode, grid_id == env_id)
+        food_counts = self.grid_food_counts[self.grid_indices].float()
+        poison_counts = self.grid_poison_counts[self.grid_indices].float()
+
+        # Normalize to [-1, 1] based on curriculum ranges
+        # Center on midpoint, scale by half-range
+        food_min, food_max = self.food_range
+        poison_min, poison_max = self.poison_range
+
+        food_mid = (food_min + food_max) / 2
+        food_scale = (food_max - food_min) / 2 if food_max > food_min else 1.0
+        poison_mid = (poison_min + poison_max) / 2
+        poison_scale = (poison_max - poison_min) / 2 if poison_max > poison_min else 1.0
+
+        food_norm = (food_counts - food_mid) / food_scale
+        poison_norm = (poison_counts - poison_mid) / poison_scale
+
+        return torch.stack([food_norm, poison_norm], dim=1)  # (n_envs, 2)
+
 
 def create_torch_vec_env(
     n_envs: int, 
