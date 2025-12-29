@@ -272,7 +272,7 @@ class TestLearnedBehaviorLoading:
         from goodharts.behaviors.learned import create_learned_behavior
 
         # These should not raise errors
-        for preset in ['ground_truth', 'proxy', 'proxy_jammed']:
+        for preset in ['ground_truth', 'proxy', 'ground_truth_blinded']:
             try:
                 behavior = create_learned_behavior(preset)
                 assert behavior is not None

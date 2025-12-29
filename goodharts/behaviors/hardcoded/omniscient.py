@@ -3,6 +3,13 @@ Omniscient behavior that sees ground truth cell types.
 
 Uses one-hot encoded channels derived from CellType for full observability.
 This agent can distinguish food from poison perfectly.
+
+TODO (Goodhart Documentation):
+    Explain why this behavior represents the "aligned" baseline:
+    - What information does this agent have access to?
+    - Why does full observability lead to optimal behavior?
+    - How does this contrast with ProxySeeker's information asymmetry?
+    - What does "ground truth" mean in the context of AI alignment?
 """
 import torch
 from goodharts.behaviors.base import BehaviorStrategy

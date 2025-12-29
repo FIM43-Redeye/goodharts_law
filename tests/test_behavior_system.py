@@ -315,7 +315,7 @@ class TestLearnedBehavior:
         from goodharts.behaviors.learned import create_learned_behavior
 
         # Should be able to create these without errors
-        for preset in ['ground_truth', 'proxy', 'proxy_jammed']:
+        for preset in ['ground_truth', 'proxy', 'ground_truth_blinded']:
             behavior = create_learned_behavior(preset)
             assert behavior is not None
             assert isinstance(behavior, BehaviorStrategy)

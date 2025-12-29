@@ -21,7 +21,7 @@ import numpy as np
 MODE_COLORS = {
     'ground_truth': '#22c79a',       # Green - correct behavior
     'ground_truth_handhold': '#4ecdc4',  # Teal - guided learning
-    'proxy_jammed': '#ffc107',       # Yellow/amber - imperfect info
+    'ground_truth_blinded': '#ffc107',   # Yellow/amber - blinded control
     'proxy': '#ff6b6b',              # Red - Goodhart failure
 }
 
@@ -29,7 +29,7 @@ MODE_COLORS = {
 MODE_NAMES = {
     'ground_truth': 'Ground Truth',
     'ground_truth_handhold': 'Ground Truth (Guided)',
-    'proxy_jammed': 'Proxy (Jammed)',
+    'ground_truth_blinded': 'Ground Truth (Blinded)',
     'proxy': 'Proxy (Goodhart)',
 }
 

@@ -7,12 +7,12 @@ import pytest
 import numpy as np
 
 from goodharts.modes import (
-    ObservationSpec, 
-    ModeSpec, 
+    ObservationSpec,
+    ModeSpec,
     RewardComputer,
     GroundTruthRewards,
     ProxyRewards,
-    ProxyJammedRewards,
+    GroundTruthBlindedRewards,
     HandholdRewards,
     get_all_mode_names,
     get_mode_for_requirement,
@@ -85,9 +85,9 @@ class TestModeSpec:
         """Proxy mode should be in registry."""
         assert 'proxy' in mode_registry
     
-    def test_proxy_jammed_registered(self, mode_registry):
-        """Proxy jammed mode should be in registry."""
-        assert 'proxy_jammed' in mode_registry
+    def test_ground_truth_blinded_registered(self, mode_registry):
+        """Ground truth blinded mode should be in registry."""
+        assert 'ground_truth_blinded' in mode_registry
     
     def test_get_all_mode_names(self, config):
         """get_all_mode_names should return list of mode names."""
@@ -121,10 +121,10 @@ class TestRewardComputer:
         computer = RewardComputer.create('proxy', proxy_spec, config, gamma=0.99)
         assert isinstance(computer, ProxyRewards)
 
-        # proxy_jammed uses ProxyJammedRewards (information asymmetry case)
-        jammed_spec = ObservationSpec.for_mode('proxy_jammed', config)
-        computer = RewardComputer.create('proxy_jammed', jammed_spec, config, gamma=0.99)
-        assert isinstance(computer, ProxyJammedRewards)
+        # ground_truth_blinded uses GroundTruthBlindedRewards (information asymmetry control)
+        blinded_spec = ObservationSpec.for_mode('ground_truth_blinded', config)
+        computer = RewardComputer.create('ground_truth_blinded', blinded_spec, config, gamma=0.99)
+        assert isinstance(computer, GroundTruthBlindedRewards)
     
     def test_reward_computer_compute_returns_tensor(self, config, gt_spec):
         """compute() should return shaped rewards as torch tensor."""

@@ -44,8 +44,8 @@ User → main.py or train_ppo → Load TOML Config → TorchVecEnv (GPU) → Beh
 - **Mode System** (`modes.py`): `ObservationSpec` + `RewardComputer` define training modes:
   - `ground_truth`: One-hot cell types, energy-based reward
   - `ground_truth_handhold`: Ground truth observations with scaled rewards (easier learning)
+  - `ground_truth_blinded`: Proxy observations but real energy reward (control condition)
   - `proxy`: Interestingness values only, interestingness gain as reward
-  - `proxy_jammed`: Proxy observations but real energy reward
 
 - **Neural Network** (`behaviors/brains/base_cnn.py`): 3-layer CNN + 2 FC layers. Dynamic input channels based on observation format. Outputs 8-directional action logits.
 

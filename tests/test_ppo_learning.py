@@ -80,17 +80,41 @@ class TestPPOLearning(unittest.TestCase):
             self.assertFalse(torch.isnan(param).any(), f"NaNs found in model parameter: {name}")
             self.assertFalse(torch.isinf(param).any(), f"Infs found in model parameter: {name}")
 
-        # Basic learning assertions
-        # 1. Entropy should drop (initially high ~1.79 for 6 actions)
-        # 2. Reward *might* not increase much in 10 updates if hard, but shouldn't degrade to -inf.
-        
-        # To strictly test entropy drop, we might need a custom callback or access internal state.
-        # But let's rely on the fact that if it's broken, it stays at max entropy or goes to NaN.
-        
-        # In the user report: "Entropy stays way up high".
-        # So we want to assert entropy < 1.7 (if max is ~1.8).
-        # Actually, let's just create a reproduced failure first.
-        pass
+        # Learning sanity checks:
+        # 1. Weights should not contain NaNs/Infs (checked above)
+        # 2. Policy should have started to specialize (not max entropy)
+
+        # Load the saved model for inference test
+        from goodharts.modes import ObservationSpec
+        from goodharts.behaviors.brains import load_brain
+
+        brain, _ = load_brain(self.model_path, device=torch.device('cuda'))
+        brain.eval()  # Set to inference mode
+
+        # Create a test observation batch
+        spec = ObservationSpec.for_mode('ground_truth', get_simulation_config())
+        test_obs = torch.randn(16, spec.num_channels, spec.view_size, spec.view_size, device='cuda')
+
+        with torch.no_grad():
+            logits = brain(test_obs)
+
+            # Policy should produce valid logits (no NaNs)
+            self.assertFalse(torch.isnan(logits).any(), "Policy produces NaN logits")
+            self.assertFalse(torch.isinf(logits).any(), "Policy produces Inf logits")
+
+            # Entropy check: max entropy for 8 actions is ln(8) ~ 2.08
+            # A uniform policy has high entropy; learning should reduce it
+            probs = torch.softmax(logits, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
+
+            # After 10 updates, entropy should have dropped somewhat from max
+            # We use a generous threshold - just verify SOME learning occurred
+            max_entropy = torch.log(torch.tensor(8.0))  # ln(8) for 8 actions
+            self.assertLess(
+                entropy.item(), max_entropy.item() * 0.98,
+                f"Policy entropy too high ({entropy:.3f} vs max {max_entropy:.3f}) - "
+                f"suggests learning is not occurring"
+            )
 
     def test_ppo_learning_loop_cpu_env(self):
         """Test that PPO trainer runs, updates weights, and saves model (standard VecEnv)."""

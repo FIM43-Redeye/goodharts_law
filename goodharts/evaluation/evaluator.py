@@ -11,6 +11,18 @@ exist, consume resources, and eventually die. The relevant metrics are:
 - How often does it die? (deaths per 1000 steps)
 
 Follows the PPOTrainer pattern for consistency.
+
+TODO (Goodhart Documentation):
+    Explain why continuous survival is the right evaluation paradigm:
+    - Why is this more realistic than fixed-length episodes?
+    - How does it directly measure the TRUE objective (staying alive)?
+    - Why is efficiency the primary thesis metric, not reward?
+    - What does comparing ground_truth vs proxy results tell us about alignment?
+
+    Also document the statistical approach:
+    - What sample sizes are needed for reliable estimates?
+    - How should results be reported (confidence intervals, effect sizes)?
+    - What would FALSIFY the Goodhart thesis? (e.g., proxy matching ground_truth)
 """
 
 import json
