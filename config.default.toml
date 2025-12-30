@@ -124,12 +124,13 @@ k_epochs = 4             # PPO epochs per update
 value_coef = 0.5
 
 # Entropy scheduling: prevents premature collapse while allowing full convergence
-# Decays from initial to final over decay_fraction of training
-# Floor penalty only active during decay period (disabled after to allow determinism)
+# Two-phase approach:
+#   Phase 1 (0-70%): entropy_coef decays, floor stays constant (stable learning)
+#   Phase 2 (70-100%): entropy_coef at final, floor decays to 0 (allow determinism)
 entropy_initial = 0.1    # Strong exploration early
-entropy_final = 0.01    # Minimal when near-optimal
-entropy_decay_fraction = 0.7  # Decay over 70% of training
-entropy_floor = 0.5      # Min entropy during learning (log(8)/4)
+entropy_final = 0.01     # Minimal when near-optimal
+entropy_decay_fraction = 0.7  # Coef decay duration; floor decays AFTER this
+entropy_floor = 0.5      # Min entropy during Phase 1 (log(8)/4)
 entropy_floor_penalty = 0.05  # Penalty coefficient for floor violation
 
 # Learning rate decay: reduces LR over training for fine-tuning

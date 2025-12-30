@@ -9,8 +9,10 @@ description = "Simulation of Goodhart's Law with RL agents"
 requires-python = ">=3.9"
 dependencies = [
     "numpy",
-    "matplotlib",
     "torch",
+    "plotly>=5.0",
+    "dash>=2.0",
+    "matplotlib",  # Still used by: visualization.py, eval_dashboard.py, visualize_saliency.py
     "pytest",
 ]
 
