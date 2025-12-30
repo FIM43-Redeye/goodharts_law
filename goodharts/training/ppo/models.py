@@ -92,7 +92,8 @@ class PopArtValueHead(nn.Module):
     # Class attribute for compile-time branching (no hasattr needed)
     is_popart = True
 
-    def __init__(self, input_size: int, num_aux_inputs: int = 0, beta_min: float = 0.01):
+    def __init__(self, input_size: int, num_aux_inputs: int = 0, beta_min: float = 0.01,
+                 rescale_weights: bool = True):
         """
         Initialize PopArt value head.
 
@@ -100,10 +101,14 @@ class PopArtValueHead(nn.Module):
             input_size: Size of feature vector from policy network
             num_aux_inputs: Number of auxiliary scalar inputs (density info, etc.)
             beta_min: Minimum EMA decay rate (asymptotic value after many updates)
+            rescale_weights: If True, rescale fc weights when stats change to preserve
+                           outputs. If False, only normalize returns (simpler, potentially
+                           more stable but value outputs will drift with stats).
         """
         super().__init__()
         self.num_aux_inputs = num_aux_inputs
         self.beta_min = beta_min
+        self.rescale_weights = rescale_weights
 
         if num_aux_inputs > 0:
             # Small MLP to combine features + aux info
@@ -220,19 +225,23 @@ class PopArtValueHead(nn.Module):
             new_var = old_var * (1 - beta) + batch_var * beta
             self.std.copy_(new_var.sqrt().clamp(min=1e-4))
 
-            # Adjust weights to preserve outputs: output = mean + std * (w @ x + b)
-            # For output preservation: old_mean + old_std * z = new_mean + new_std * z_new
-            # Solution: w_new = w * (old_std / new_std)
-            #           b_new = b * (old_std / new_std) + (old_mean - new_mean) / new_std
-            scale = old_std / (self.std + 1e-8)
-            self.fc.weight.mul_(scale)
-            self.fc.bias.mul_(scale).add_((old_mean - self.mean) / (self.std + 1e-8))
+            # Optionally adjust weights to preserve outputs
+            # When rescale_weights=False, we just normalize returns without touching weights.
+            # This is simpler and avoids accumulating numerical errors from repeated rescaling.
+            if self.rescale_weights:
+                # Adjust weights to preserve outputs: output = mean + std * (w @ x + b)
+                # For output preservation: old_mean + old_std * z = new_mean + new_std * z_new
+                # Solution: w_new = w * (old_std / new_std)
+                #           b_new = b * (old_std / new_std) + (old_mean - new_mean) / new_std
+                scale = old_std / (self.std + 1e-8)
+                self.fc.weight.mul_(scale)
+                self.fc.bias.mul_(scale).add_((old_mean - self.mean) / (self.std + 1e-8))
 
-            # Rescale optimizer momentum to match weight rescaling
-            # Without this, Adam's momentum buffers are misaligned with the new
-            # weight scale, causing unstable updates (the "large bounce" problem)
-            if optimizer is not None:
-                self._rescale_optimizer_state(optimizer, scale)
+                # Rescale optimizer momentum to match weight rescaling
+                # Without this, Adam's momentum buffers are misaligned with the new
+                # weight scale, causing unstable updates (the "large bounce" problem)
+                if optimizer is not None:
+                    self._rescale_optimizer_state(optimizer, scale)
 
     def _rescale_optimizer_state(self, optimizer: torch.optim.Optimizer, scale: torch.Tensor):
         """

@@ -105,6 +105,8 @@ def ppo_update(
     n_minibatches: int = 4,
     verbose: bool = False,
     aux_inputs: torch.Tensor = None,
+    entropy_floor: float = 0.0,
+    entropy_floor_penalty: float = 0.0,
 ) -> tuple[float, float, float, float]:
     """
     Perform PPO clipped objective update with minibatches.
@@ -115,6 +117,8 @@ def ppo_update(
         aux_inputs: Optional auxiliary inputs for privileged critic (batch, num_aux).
                     Passed to value_head but NOT to policy - enables asymmetric
                     actor-critic where value function has more information.
+        entropy_floor: Minimum entropy during learning phase (0 = disabled).
+        entropy_floor_penalty: Penalty coefficient when entropy drops below floor.
     """
     use_amp = scaler is not None
     device_type = 'cuda' if device.type == 'cuda' else 'cpu'
@@ -192,7 +196,14 @@ def ppo_update(
 
                 entropy_bonus = entropy.mean()
 
-                loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus
+                # Entropy floor penalty: only active during learning phase
+                # Penalizes when entropy drops below floor to prevent premature collapse
+                if entropy_floor > 0 and entropy_floor_penalty > 0:
+                    floor_penalty = entropy_floor_penalty * torch.relu(entropy_floor - entropy_bonus)
+                else:
+                    floor_penalty = 0.0
+
+                loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus + floor_penalty
             
             # Backward pass
             optimizer.zero_grad()

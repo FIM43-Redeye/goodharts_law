@@ -118,20 +118,34 @@ freeze_energy = true     # Keep energy constant for cleaner visualization
 learning_rate = 0.0003
 gamma = 0.99             # Discount factor
 gae_lambda = 0.95        # GAE bias-variance tradeoff
-eps_clip = 0.2           # PPO clipping
+eps_clip = 0.2           # PPO clipping (initial, decays to eps_clip_final)
+eps_clip_final = 0.1     # Final clip (tighter trust region late in training)
 k_epochs = 4             # PPO epochs per update
-entropy_coef = 0.001
 value_coef = 0.5
+
+# Entropy scheduling: prevents premature collapse while allowing full convergence
+# Decays from initial to final over decay_fraction of training
+# Floor penalty only active during decay period (disabled after to allow determinism)
+entropy_initial = 0.1    # Strong exploration early
+entropy_final = 0.01    # Minimal when near-optimal
+entropy_decay_fraction = 0.7  # Decay over 70% of training
+entropy_floor = 0.5      # Min entropy during learning (log(8)/4)
+entropy_floor_penalty = 0.05  # Penalty coefficient for floor violation
+
+# Learning rate decay: reduces LR over training for fine-tuning
+lr_decay = true          # Enable LR decay
+lr_final = 0.0001       # Final LR (10x lower than initial 0.0003)
 
 # Batching
 n_envs = 192             # Parallel environments
-n_minibatches = 1        # 1 = full batch gradient descent
+n_minibatches = 1        # Full batch gradient descent (fits in VRAM)
 steps_per_env = 128      # Rollout length (horizon)
 steps_per_episode = 512  # Max steps before forced reset
 
 # Architecture
 brain_type = "base_cnn"
 value_head_type = "popart"
+popart_rescale_weights = true   # Rescale fc weights when stats change (required for correct values)
 action_space_type = "discrete_grid"
 
 # Environment curriculum
@@ -151,8 +165,6 @@ use_amp = true           # Mixed precision (fp16)
 
 # Checkpointing
 checkpoint_interval = 0  # Save every N updates (0 = disabled)
-lr_decay = false
-lr_decay_factor = 0.1
 
 # Privileged critic: value function sees episode density (food/poison counts)
 # This improves value estimation without affecting policy behavior
