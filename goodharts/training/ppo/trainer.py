@@ -898,8 +898,9 @@ class PPOTrainer:
         )
 
         # Update PopArt statistics for value normalization
+        # Pass optimizer so PopArt can rescale momentum buffers after weight adjustment
         if hasattr(self.value_head, 'update_stats'):
-            self.value_head.update_stats(returns.flatten())
+            self.value_head.update_stats(returns.flatten(), self.optimizer)
 
         # PPO update (this triggers backward pass lazy init)
         # Reshape pre-allocated buffers (no torch.cat needed)
@@ -1661,8 +1662,9 @@ class PPOTrainer:
                     )
 
                     # Update PopArt statistics for value normalization
+                    # Pass optimizer so PopArt can rescale momentum buffers after weight adjustment
                     if hasattr(self.value_head, 'update_stats'):
-                        self.value_head.update_stats(returns.flatten())
+                        self.value_head.update_stats(returns.flatten(), self.optimizer)
 
                 self.profiler.tick("GAE Calc")
 

@@ -174,7 +174,7 @@ class PopArtValueHead(nn.Module):
         """Normalize targets for PopArt value loss."""
         return self.normalize_targets(returns), self.normalize_targets(old_values)
 
-    def update_stats(self, returns: torch.Tensor):
+    def update_stats(self, returns: torch.Tensor, optimizer: torch.optim.Optimizer = None):
         """
         Update running statistics and adjust weights to preserve outputs.
 
@@ -184,6 +184,12 @@ class PopArtValueHead(nn.Module):
 
         IMPORTANT: All operations stay on GPU - no .item() or CPU transfers.
         Uses tensor ops (not Python ints) for CUDA graph compatibility.
+
+        Args:
+            returns: Batch of returns to update statistics from
+            optimizer: If provided, rescales Adam momentum buffers to match
+                       the weight rescaling. This prevents instability from
+                       misaligned momentum after PopArt weight adjustment.
         """
         with torch.no_grad():
             # Increment count (tensor op, not Python int)
@@ -221,6 +227,37 @@ class PopArtValueHead(nn.Module):
             scale = old_std / (self.std + 1e-8)
             self.fc.weight.mul_(scale)
             self.fc.bias.mul_(scale).add_((old_mean - self.mean) / (self.std + 1e-8))
+
+            # Rescale optimizer momentum to match weight rescaling
+            # Without this, Adam's momentum buffers are misaligned with the new
+            # weight scale, causing unstable updates (the "large bounce" problem)
+            if optimizer is not None:
+                self._rescale_optimizer_state(optimizer, scale)
+
+    def _rescale_optimizer_state(self, optimizer: torch.optim.Optimizer, scale: torch.Tensor):
+        """
+        Rescale Adam optimizer momentum buffers after weight rescaling.
+
+        When PopArt rescales weights by `scale`, the optimizer's momentum
+        buffers (exp_avg, exp_avg_sq) must also be rescaled to stay aligned.
+        Without this, the next gradient step uses stale momentum calibrated
+        to the old weight scale, causing large unstable updates.
+
+        For Adam:
+        - exp_avg (first moment): scale by `scale` (linear with weights)
+        - exp_avg_sq (second moment): scale by `scale^2` (squared)
+        """
+        scale_val = scale.item()  # Need scalar for in-place ops
+        scale_sq = scale_val * scale_val
+
+        for param in [self.fc.weight, self.fc.bias]:
+            if param not in optimizer.state:
+                continue
+            state = optimizer.state[param]
+            if 'exp_avg' in state:
+                state['exp_avg'].mul_(scale_val)
+            if 'exp_avg_sq' in state:
+                state['exp_avg_sq'].mul_(scale_sq)
 
 
 class Profiler:
