@@ -34,7 +34,7 @@ from goodharts.behaviors.action_space import get_action_labels, DISCRETE_8
 # CONSTANTS
 # =============================================================================
 
-DASHBOARD_MAX_POINTS = 1024       # Maximum data points to display in graphs
+DASHBOARD_MAX_POINTS = 10000      # Maximum data points to display in graphs
 EMA_SMOOTHING_ALPHA = 0.9         # Exponential moving average smoothing factor
 UPDATE_INTERVAL_MS = 100          # Milliseconds between dashboard updates
 QUEUE_POLL_TIMEOUT = 0.05         # Seconds to wait when polling update queue
