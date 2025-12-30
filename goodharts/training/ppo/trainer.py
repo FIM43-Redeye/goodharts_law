@@ -593,6 +593,7 @@ class PPOConfig:
     use_amp: bool = False
     compile_models: bool = True
     compile_mode: str = 'max-autotune-no-cudagraphs'  # reduce-overhead, max-autotune, max-autotune-no-cudagraphs
+    compile_env: bool = True  # torch.compile the environment step for better GPU utilization
     tensorboard: bool = False
     skip_warmup: bool = False
     use_torch_env: bool = True
@@ -660,6 +661,7 @@ class PPOConfig:
             'use_amp': train_cfg['use_amp'],
             'compile_models': train_cfg['compile_models'],
             'compile_mode': train_cfg.get('compile_mode', 'max-autotune-no-cudagraphs'),
+            'compile_env': train_cfg.get('compile_env', True),  # Compile env.step() by default
             # Validation
             'validation_interval': train_cfg['validation_interval'],
             'validation_episodes': train_cfg['validation_episodes'],
@@ -823,23 +825,19 @@ class PPOTrainer:
                 # Get density info for privileged critic
                 density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
 
-                # Use compiled functions if available (triggers compilation on first call)
-                if self._compiled_policy_forward is not None:
-                    # Mark step begin for CUDA graph tensor reuse
+                # Use fused compiled inference if available
+                # This combines policy forward + sampling + value head in one graph
+                if self._compiled_inference is not None:
                     torch.compiler.cudagraph_mark_step_begin()
-                    logits, features = self._compiled_policy_forward(states)
-                    actions, log_probs = self._compiled_sample(logits)
+                    actions, log_probs, values, _, features = self._compiled_inference(states, density_info)
                 else:
-                    states_t = states.float()
+                    # Eager mode fallback
                     with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                        logits, features = self.policy.forward_with_features(states_t)
+                        logits, features = self.policy.forward_with_features(states.float())
                         dist = Categorical(logits=logits, validate_args=False)
                         actions = dist.sample()
                         log_probs = dist.log_prob(actions)
-
-                # Compute values with density (privileged critic)
-                with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                    values = self.value_head(features, density_info).squeeze(-1)
+                        values = self.value_head(features, density_info).squeeze(-1)
 
             current_states = states.clone()
             next_states, eating_info, terminated, truncated = self.vec_env.step(actions)
@@ -1057,6 +1055,12 @@ class PPOTrainer:
         print(f"   Env: {env_type}")
         _vprint("Environment created", v)
         print(f"   View: {self.vec_env.view_size}x{self.vec_env.view_size}, Channels: {self.vec_env.n_channels}")
+
+        # Compile environment step for better GPU utilization (reduces CPU dispatch overhead)
+        if cfg.compile_env:
+            _vprint("Compiling environment step...", v)
+            self.vec_env.compile_step(mode=cfg.compile_mode, fullgraph=True)
+            print(f"   Env compile: {cfg.compile_mode} (fullgraph=True)")
         
         # Networks
         _vprint("Creating networks...", v)
@@ -1091,12 +1095,11 @@ class PPOTrainer:
         # Skip on TPU - XLA uses its own JIT compilation
         # Note: Actual warmup happens in _training_loop via _run_warmup_update()
         #
-        # Key insight: Compiling just the models helps, but compiling the ENTIRE
-        # inference step (forward + sampling) eliminates inter-update gaps by fusing
-        # many small kernels into fewer large ones. This reduces kernel launch overhead
-        # from ~1ms to ~0.006ms per update.
-        self._compiled_policy_forward = None
-        self._compiled_sample = None
+        # Key insight: Compiling the ENTIRE inference step (policy forward + sampling
+        # + value head) into ONE function eliminates graph boundaries between operations.
+        # This fuses many small kernels into fewer large ones, reducing kernel launch
+        # overhead and eliminating ~200ms of GPU gaps per training run.
+        self._compiled_inference = None
         self._compiled_ppo_update = None
 
         with _COMPILE_LOCK:
@@ -1106,34 +1109,49 @@ class PPOTrainer:
                     # max-autotune-no-cudagraphs is safest for AMD ROCm
                     compile_mode = cfg.compile_mode
 
-                    # Compile policy forward pass (value computed separately for aux support)
+                    # Capture references for closure
                     policy = self.policy
+                    value_head = self.value_head
                     device_type = self.device_type
                     use_amp = cfg.use_amp
 
+                    # Fused inference: policy forward + sampling + value prediction
+                    # This eliminates 3 separate compiled regions -> 1 fused region
                     @torch.compile(mode=compile_mode)
-                    def compiled_policy_forward(states):
-                        """Fused policy forward: CNN + action logits."""
-                        # Note: states already float32 from TorchVecEnv._view_buffer
+                    def compiled_inference(states, density_info):
+                        """
+                        Fused inference: CNN -> logits -> sample -> value.
+
+                        Eliminates graph boundaries between policy and value head,
+                        allowing maximum kernel fusion.
+
+                        Returns:
+                            actions: Sampled actions
+                            log_probs: Log probabilities of sampled actions
+                            values: Value predictions
+                            logits: Raw action logits (for logging)
+                            features: Policy features (for aux buffer)
+                        """
                         with autocast(device_type=device_type, enabled=use_amp):
+                            # Policy forward
                             logits, features = policy.forward_with_features(states)
-                        return logits, features
 
-                    @torch.compile(mode=compile_mode)
-                    def compiled_sample(logits):
-                        """Fused sampling: distribution + sample + log_prob."""
-                        dist = Categorical(logits=logits, validate_args=False)
-                        actions = dist.sample()
-                        log_probs = dist.log_prob(actions)
-                        return actions, log_probs
+                            # Sample actions
+                            dist = Categorical(logits=logits, validate_args=False)
+                            actions = dist.sample()
+                            log_probs = dist.log_prob(actions)
 
-                    self._compiled_policy_forward = compiled_policy_forward
-                    self._compiled_sample = compiled_sample
+                            # Value prediction (includes privileged critic aux inputs)
+                            values = value_head(features, density_info).squeeze(-1)
+
+                        return actions, log_probs, values, logits, features
+
+                    self._compiled_inference = compiled_inference
 
                     # Compile PPO update function (~9% speedup on PPO update)
                     self._compiled_ppo_update = torch.compile(ppo_update, mode=compile_mode)
 
-                    print(f"   [JIT] torch.compile enabled ({compile_mode})")
+                    print(f"   [JIT] torch.compile enabled ({compile_mode}) - fused inference")
                 except RuntimeError as e:
                     if "FX" in str(e) or "dynamo" in str(e).lower():
                         print(f"   [JIT] Warning: torch.compile failed ({e}). Using eager mode.")
@@ -1371,6 +1389,36 @@ class PPOTrainer:
         # GPU runs inference while CPU does bookkeeping (overlap)
         inference_pending = False
 
+        # ============================================================
+        # STEP-THEN-INFER PATTERN
+        # ============================================================
+        # Unlike traditional Infer-Then-Step, we run inference AFTER env.step()
+        # to get next step's actions. This makes ENV_STEP → REWARD_SHAPE → INFERENCE
+        # adjacent and fusable.
+        #
+        # Initial inference: get first actions before entering the loop.
+        # After first iteration, actions come from the previous step's inference.
+        # ============================================================
+
+        # Initial potentials for reward shaping
+        potentials = self.reward_computer.get_initial_potentials(states)
+
+        # Initial inference to get first actions (will be skipped if prefetch active)
+        density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
+        with torch.no_grad():
+            with record_function("INFERENCE"):
+                if self._compiled_inference is not None:
+                    torch.compiler.cudagraph_mark_step_begin()
+                    actions, log_probs, values, logits, features = self._compiled_inference(states, density_info)
+                else:
+                    with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                        logits, features = self.policy.forward_with_features(states.float())
+                        dist = Categorical(logits=logits, validate_args=False)
+                        actions = dist.sample()
+                        log_probs = dist.log_prob(actions)
+                        values = self.value_head(features, density_info).squeeze(-1)
+        last_logits = logits
+
         while self.total_steps < cfg.total_timesteps:
             self.profiler.start()
             
@@ -1387,90 +1435,93 @@ class PPOTrainer:
             
             if v:
                 _vprint(f"Step {self.total_steps}: collecting experience...", v)
-            
-            # Collect experience
-            with torch.no_grad():
-                # Get density info for privileged critic (cheap GPU op, no sync)
-                density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
 
-                if inference_pending:
-                    # Inference was issued on separate stream after previous PPO update
-                    # Make default stream wait on inference completion (GPU-level sync, no CPU block)
-                    if self._inference_stream is not None:
-                        torch.cuda.current_stream().wait_event(self._inference_done_event)
-                    inference_pending = False
-                else:
-                    # Normal inference path
-                    if v:
-                        _vprint(f"Step {self.total_steps}: running inference...", v)
+            # ============================================================
+            # STEP-THEN-INFER: Use current actions, then infer next ones
+            # ============================================================
+            # At this point we have: states, actions, log_probs, values, potentials
+            # (from initial inference or previous iteration's inference)
 
-                    # Use compiled functions if available (fuses many small kernels)
-                    with record_function("INFERENCE"):
-                        if self._compiled_policy_forward is not None:
-                            # Mark step begin for CUDA graph tensor reuse
-                            torch.compiler.cudagraph_mark_step_begin()
-                            logits, features = self._compiled_policy_forward(states)
-                            actions, log_probs = self._compiled_sample(logits)
-                        else:
-                            # Fallback to eager mode
-                            states_t = states.float()
-                            with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                                logits, features = self.policy.forward_with_features(states_t)
-                                dist = Categorical(logits=logits, validate_args=False)
-                                actions = dist.sample()
-                                log_probs = dist.log_prob(actions)
+            # If prefetch is pending (after PPO update), wait for it
+            if inference_pending:
+                if self._inference_stream is not None:
+                    torch.cuda.current_stream().wait_event(self._inference_done_event)
+                inference_pending = False
+                # Prefetched values are already in: actions, log_probs, values, potentials, density_info
 
-                        # Compute values separately (supports aux inputs for privileged critic)
-                        with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                            values = self.value_head(features, density_info).squeeze(-1)
-
-                    # Store last logits for action_probs logging (computed once per update)
-                    last_logits = logits
-
-                    self.profiler.tick("Inference")
-
-            # Environment step
-            # GPU-native path: everything stays on GPU
+            # Environment step using CURRENT actions
             # CRITICAL: Snapshot state BEFORE step because env may mutate it in-place!
             with record_function("ENV_STEP"):
                 current_states = states.clone()
                 next_states, eating_info, terminated, truncated = self.vec_env.step(actions)
                 dones = terminated | truncated  # Combined for episode tracking
 
-            # Compute shaped rewards (torch-native, stays on GPU)
+            # Compute shaped rewards (stateless - caller manages potentials)
             # Pass terminated (not dones) - truncation is neutral, not failure
             with record_function("REWARD_SHAPE"):
-                shaped_rewards = self.reward_computer.compute(
-                    eating_info, current_states, next_states, terminated
+                shaped_rewards, next_potentials = self.reward_computer.compute_stateless(
+                    eating_info, current_states, next_states, terminated, potentials
                 )
 
-            # Store experience in pre-allocated tensor buffers (no torch.cat needed)
-            states_buf[step_in_buffer] = current_states
-            actions_buf[step_in_buffer] = actions
-            log_probs_buf[step_in_buffer] = log_probs.detach()
-            rewards_buf[step_in_buffer] = shaped_rewards
-            dones_buf[step_in_buffer] = dones
-            terminated_buf[step_in_buffer] = terminated
-            values_buf[step_in_buffer] = values
-            if self._aux_buf is not None:
-                self._aux_buf[step_in_buffer] = density_info
+            # Store experience in pre-allocated tensor buffers
+            # Note: Each indexed write triggers CPU dispatch + GPU DtoD copy
+            # This is ~200us/step of overhead that could be reduced by compiling
+            with record_function("BUFFER_STORE"):
+                states_buf[step_in_buffer] = current_states
+                actions_buf[step_in_buffer] = actions
+                log_probs_buf[step_in_buffer] = log_probs.detach()
+                rewards_buf[step_in_buffer] = shaped_rewards
+                dones_buf[step_in_buffer] = dones
+                terminated_buf[step_in_buffer] = terminated
+                values_buf[step_in_buffer] = values
+                if self._aux_buf is not None:
+                    self._aux_buf[step_in_buffer] = density_info
 
-            # Track episode stats (defer logging to avoid Sync)
-            finished_dones_buf[step_in_buffer] = dones
-            finished_rewards_buf[step_in_buffer] = episode_rewards
+                # Track episode stats (defer logging to avoid Sync)
+                finished_dones_buf[step_in_buffer] = dones
+                finished_rewards_buf[step_in_buffer] = episode_rewards
 
             step_in_buffer += 1
             self.total_steps += cfg.n_envs
-            episode_rewards += shaped_rewards  # Tensor addition
 
-            self.profiler.tick("Env Step")
+            # Episode tracking (tensor ops, not compiled)
+            with record_function("EPISODE_TRACK"):
+                episode_rewards += shaped_rewards
+                episode_rewards *= (~dones)  # Reset for done agents
 
-            # Reset rewards for done agents (Sync-free)
-            # episode_rewards = episode_rewards * (1 - dones)
-            episode_rewards *= (~dones)
-            
+            # ============================================================
+            # INFERENCE for NEXT step (Step-Then-Infer pattern)
+            # ============================================================
+            # Get density info after env.step (for privileged critic)
+            next_density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
+
+            with torch.no_grad():
+                with record_function("INFERENCE"):
+                    if self._compiled_inference is not None:
+                        torch.compiler.cudagraph_mark_step_begin()
+                        next_actions, next_log_probs, next_values, logits, features = self._compiled_inference(
+                            next_states, next_density_info
+                        )
+                    else:
+                        with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                            logits, features = self.policy.forward_with_features(next_states.float())
+                            dist = Categorical(logits=logits, validate_args=False)
+                            next_actions = dist.sample()
+                            next_log_probs = dist.log_prob(next_actions)
+                            next_values = self.value_head(features, next_density_info).squeeze(-1)
+
+            # Store logits for action_probs logging
+            last_logits = logits
+            self.profiler.tick("Inference")
+
+            # Carry forward for next iteration
             states = next_states
-            
+            actions = next_actions
+            log_probs = next_log_probs
+            values = next_values
+            potentials = next_potentials
+            density_info = next_density_info
+
             # PPO Update (when buffer is full)
             if step_in_buffer >= cfg.steps_per_env:
                 self.profiler.tick("Collection")
@@ -1592,7 +1643,7 @@ class PPOTrainer:
                     val_metrics = self._run_validation_episodes()
                     if cfg.validation_mode == "training":
                         states = self.vec_env.reset()
-                        self.reward_computer.initialize(states)
+                        potentials = self.reward_computer.get_initial_potentials(states)
                         episode_rewards.zero_()
 
                 # ============================================================
@@ -1619,36 +1670,30 @@ class PPOTrainer:
                         if self._inference_stream is not None:
                             self._inference_stream.wait_event(self._ppo_done_event)
                             with torch.cuda.stream(self._inference_stream):
-                                if self._compiled_policy_forward is not None:
-                                    logits, features = self._compiled_policy_forward(states)
-                                    actions, log_probs = self._compiled_sample(logits)
+                                if self._compiled_inference is not None:
+                                    actions, log_probs, values, logits, features = self._compiled_inference(states, prefetch_density)
                                 else:
-                                    states_t = states.float()
                                     with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                                        logits, features = self.policy.forward_with_features(states_t)
+                                        logits, features = self.policy.forward_with_features(states.float())
                                         dist = Categorical(logits=logits, validate_args=False)
                                         actions = dist.sample()
                                         log_probs = dist.log_prob(actions)
-                                # Compute values with density (privileged critic)
-                                with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                                    values = self.value_head(features, prefetch_density).squeeze(-1)
+                                        values = self.value_head(features, prefetch_density).squeeze(-1)
                         else:
                             # CPU/TPU fallback - no streams
-                            if self._compiled_policy_forward is not None:
-                                logits, features = self._compiled_policy_forward(states)
-                                actions, log_probs = self._compiled_sample(logits)
+                            if self._compiled_inference is not None:
+                                actions, log_probs, values, logits, features = self._compiled_inference(states, prefetch_density)
                             else:
-                                states_t = states.float()
                                 with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                                    logits, features = self.policy.forward_with_features(states_t)
+                                    logits, features = self.policy.forward_with_features(states.float())
                                     dist = Categorical(logits=logits, validate_args=False)
                                     actions = dist.sample()
                                     log_probs = dist.log_prob(actions)
-                            # Compute values with density (privileged critic)
-                            with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                                values = self.value_head(features, prefetch_density).squeeze(-1)
-                # Store density for this prefetched step (will be used when buffer stores it)
+                                    values = self.value_head(features, prefetch_density).squeeze(-1)
+                # Store prefetched values for next rollout's first step
+                # Step-Then-Infer: these become the initial (actions, values, potentials)
                 density_info = prefetch_density
+                potentials = self.reward_computer.get_initial_potentials(states)
                 last_logits = logits
                 inference_pending = True
 

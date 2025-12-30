@@ -273,8 +273,9 @@ class TestTorchEnv(unittest.TestCase):
         action = torch.tensor([1], dtype=torch.long, device=self.device)
         dx, dy = env.action_deltas[1]
         
-        target_y = (y + dy) % env.height if env.loop else torch.clamp(y + dy, 0, env.height - 1)
-        target_x = (x + dx) % env.width if env.loop else torch.clamp(x + dx, 0, env.width - 1)
+        # TorchVecEnv always uses toroidal wrapping (edges connect)
+        target_y = (y + dy) % env.height
+        target_x = (x + dx) % env.width
         
         env.grids[grid_id, target_y, target_x] = env.CellType.FOOD.value
         
