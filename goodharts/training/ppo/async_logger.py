@@ -62,12 +62,10 @@ class AsyncLogger:
     
     def __init__(
         self,
-        trainer_logger,  # TrainingLogger instance
-        tb_writer,       # TensorBoard SummaryWriter or None
+        tb_writer,       # TensorBoard SummaryWriter (unified logging target)
         dashboard,       # Training dashboard or None
         mode: str,
     ):
-        self.trainer_logger = trainer_logger
         self.tb_writer = tb_writer
         self.dashboard = dashboard
         self.mode = mode
@@ -75,6 +73,8 @@ class AsyncLogger:
         self._queue: queue.Queue[Optional[LogPayload]] = queue.Queue()
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        self._console_counter = 0
+        self._console_interval = 10  # Print to console every N updates
     
     def start(self):
         """Start the background logging thread."""
@@ -108,43 +108,24 @@ class AsyncLogger:
     
     def _process_payload(self, p: LogPayload):
         """Do I/O work for one update (no GPU access here)."""
-        # Console output - show instant sps prominently, rolling/global in brackets
-        print(f"   [{p.mode}] Step {p.total_steps:,}: {p.sps_instant:,.0f} sps [{p.sps_rolling:,.0f}/{p.sps_global:,.0f}] | Best R={p.best_reward:.0f} | Ent={p.entropy:.3f} | ValL={p.value_loss:.4f} | ExpV={p.explained_var:.4f}")
-        if p.profiler_summary and p.profiler_summary != "No data":
-            print(f"   [Profile] {p.profiler_summary}")
+        # Console output - throttled to reduce spam
+        self._console_counter += 1
+        if self._console_counter >= self._console_interval:
+            self._console_counter = 0
+            print(f"   [{p.mode}] Step {p.total_steps:,}: {p.sps_instant:,.0f} sps [{p.sps_rolling:,.0f}/{p.sps_global:,.0f}] | Best R={p.best_reward:.0f} | Ent={p.entropy:.3f} | ValL={p.value_loss:.4f} | ExpV={p.explained_var:.4f}")
+            if p.profiler_summary and p.profiler_summary != "No data":
+                print(f"   [Profile] {p.profiler_summary}")
         
-        # File logging - aggregates computed on GPU, passed directly (5 floats)
-        if self.trainer_logger:
-            # Compute means from sums (avoid div-by-zero)
-            n = p.episodes_count if p.episodes_count > 0 else 1
-            food_mean = p.food_sum / n
-            poison_mean = p.poison_sum / n
-            reward_mean = p.reward_sum / n
+        # Compute derived metrics for logging
+        n = p.episodes_count if p.episodes_count > 0 else 1
+        food_mean = p.food_sum / n
+        poison_mean = p.poison_sum / n
+        reward_mean = p.reward_sum / n
+        total_consumed = food_mean + poison_mean
+        food_ratio = food_mean / total_consumed if total_consumed > 0 else 0.5
+        reward_per_consumed = reward_mean / total_consumed if total_consumed > 0 else 0.0
 
-            # Derived curriculum-invariant metrics
-            total_consumed = food_mean + poison_mean
-            food_ratio = food_mean / total_consumed if total_consumed > 0 else 0.5
-            reward_per_consumed = reward_mean / total_consumed if total_consumed > 0 else 0.0
-
-            self.trainer_logger.log_update(
-                update_num=p.update_count,
-                total_steps=p.total_steps,
-                policy_loss=p.policy_loss,
-                value_loss=p.value_loss,
-                entropy=p.entropy,
-                explained_variance=p.explained_var,
-                action_probs=p.action_probs,
-                episodes_count=p.episodes_count,
-                reward_mean=reward_mean,
-                reward_min=p.reward_min if p.episodes_count > 0 else 0.0,
-                reward_max=p.reward_max if p.episodes_count > 0 else 0.0,
-                food_mean=food_mean,
-                poison_mean=poison_mean,
-                food_ratio=food_ratio,
-                reward_per_consumed=reward_per_consumed,
-            )
-        
-        # TensorBoard logging
+        # TensorBoard logging (unified logging target)
         if self.tb_writer:
             self.tb_writer.add_scalar('loss/policy', p.policy_loss, p.total_steps)
             self.tb_writer.add_scalar('loss/value', p.value_loss, p.total_steps)
@@ -164,9 +145,17 @@ class AsyncLogger:
         
         # Dashboard update
         if self.dashboard:
-            payload_dict = {
-                'ppo': (p.policy_loss, p.value_loss, p.entropy, p.action_probs, p.explained_var),
-                'episodes': p.episode_stats,
-                'steps': p.total_steps
+            # Flat dictionary format expected by dashboard._process_updates()
+            payload = {
+                'policy_loss': p.policy_loss,
+                'value_loss': p.value_loss,
+                'entropy': p.entropy,
+                'explained_var': p.explained_var,
+                'action_probs': p.action_probs,
+                'total_steps': p.total_steps,
+                # Episode stats (if available)
+                'reward': p.episode_stats.get('reward', 0) if p.episode_stats else 0,
+                'food': p.episode_stats.get('food', 0) if p.episode_stats else 0,
+                'poison': p.episode_stats.get('poison', 0) if p.episode_stats else 0,
             }
-            self.dashboard.update(p.mode, 'update', payload_dict)
+            self.dashboard.update(p.mode, 'update', payload)

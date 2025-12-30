@@ -25,7 +25,7 @@ from goodharts.utils.seed import set_seed
 from goodharts.behaviors.brains import create_brain, save_brain, _clean_state_dict
 from goodharts.behaviors.action_space import create_action_space, ActionSpace
 from goodharts.environments.torch_env import create_torch_vec_env
-from goodharts.training.process_logger import ProcessLogger
+from datetime import datetime
 from goodharts.modes import RewardComputer
 
 from .models import Profiler, ValueHead, PopArtValueHead
@@ -607,7 +607,7 @@ class PPOConfig:
     compile_models: bool = True
     compile_mode: str = 'max-autotune'  # reduce-overhead, max-autotune, max-autotune-no-cudagraphs
     compile_env: bool = True  # torch.compile the environment step for better GPU utilization
-    tensorboard: bool = False
+    # TensorBoard is always enabled (unified logging)
     skip_warmup: bool = False
     use_torch_env: bool = True
     hyper_verbose: bool = False
@@ -751,7 +751,7 @@ class PPOTrainer:
         self.policy = None
         self.value_head = None
         self.optimizer = None
-        self.logger = None
+        self.tb_log_dir = None
         self.reward_computer = None
         self.profiler = None
         self.async_logger = None
@@ -1330,46 +1330,24 @@ class PPOTrainer:
                     else:
                         raise e
 
-        # Logger (skip in benchmark mode)
-        # Uses process-isolated logging to completely escape the GIL
-        if cfg.log_to_file and not cfg.benchmark_mode:
-            self.logger = ProcessLogger(mode=cfg.mode, output_dir=cfg.log_dir)
-            self.logger.start()  # Start writer process
-            self.logger.set_hyperparams(
-                mode=cfg.mode,
-                brain_type=cfg.brain_type,
-                n_envs=cfg.n_envs,
-                total_timesteps=cfg.total_timesteps,
-                lr=cfg.lr,
-                gamma=cfg.gamma,
-                gae_lambda=cfg.gae_lambda,
-                eps_clip=cfg.eps_clip,
-                k_epochs=cfg.k_epochs,
-                steps_per_env=cfg.steps_per_env,
-                n_minibatches=cfg.n_minibatches,
-                entropy_initial=cfg.entropy_initial,
-                entropy_final=cfg.entropy_final,
-                entropy_decay_fraction=cfg.entropy_decay_fraction,
-                vectorized=True,
-            )
-        
-        # TensorBoard (optional - works on Colab without display server)
+        # TensorBoard logging (always enabled, unified logging target)
         self.tb_writer = None
-        if cfg.tensorboard:
+        if cfg.log_to_file and not cfg.benchmark_mode:
             try:
                 from torch.utils.tensorboard import SummaryWriter
-                tb_dir = os.path.join(cfg.log_dir, 'tensorboard', cfg.mode)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                tb_dir = os.path.join(cfg.log_dir, f"{cfg.mode}_{timestamp}")
                 self.tb_writer = SummaryWriter(log_dir=tb_dir)
-                print(f"   TensorBoard: {tb_dir}")
+                self.tb_log_dir = tb_dir
+                print(f"   Logging: {tb_dir}")
             except ImportError:
-                print("   TensorBoard: Not available (install tensorboard package)")
+                print("   Warning: TensorBoard not available (install tensorboard package)")
         
         # Profiler (disable with --no-profile to remove GPU sync overhead)
         self.profiler = Profiler(self.device, enabled=cfg.profile_enabled)
         
         # Async logger - handles all I/O in background thread to avoid GPU stalls
         self.async_logger = AsyncLogger(
-            trainer_logger=self.logger,
             tb_writer=self.tb_writer,
             dashboard=self.dashboard,
             mode=cfg.mode
@@ -2165,34 +2143,6 @@ class PPOTrainer:
             }
             torch.save(checkpoint, cfg.output_path)
             print(f"\n[PPO] Training complete: {cfg.output_path} (seed={self.seed})")
-
-            if self.logger:
-                self.logger.finalize(best_efficiency=best_reward, final_model_path=cfg.output_path)
-
-                # Wire analysis infrastructure: generate research-ready output
-                try:
-                    from goodharts.training.train_log import analyze_training_log
-                    from goodharts.analysis.receiver import AnalysisReceiver
-
-                    analysis = analyze_training_log(self.logger.summary_path)
-                    receiver = AnalysisReceiver(output_dir=cfg.log_dir)
-                    receiver.receive(
-                        mode=cfg.mode,
-                        reward_stats={
-                            'best': best_reward,
-                            'final_mean': analysis['diagnostics'].get('avg_final_reward', 0.0),
-                        },
-                        episode_stats={
-                            'food_mean': analysis['diagnostics'].get('avg_final_food', 0.0),
-                            'poison_mean': analysis['diagnostics'].get('avg_final_poison', 0.0),
-                        },
-                        diagnostics=analysis['diagnostics'],
-                        issues=analysis['issues'],
-                        recommendations=analysis['recommendations'],
-                    )
-                except Exception as e:
-                    # Analysis is optional - don't fail training if it errors
-                    print(f"[Analysis] Warning: Could not generate analysis: {e}")
 
         # Close TensorBoard writer to flush all data
         if self.tb_writer:

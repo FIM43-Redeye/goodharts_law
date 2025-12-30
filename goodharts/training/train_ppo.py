@@ -165,8 +165,6 @@ def main():
     monitor = parser.add_argument_group('Monitoring')
     monitor.add_argument('-d', '--dashboard', action='store_true',
                          help='Show live training dashboard')
-    monitor.add_argument('-tb', '--tensorboard', action='store_true',
-                         help='Enable TensorBoard logging')
     monitor.add_argument('-v', '--verbose', action='store_true', dest='hyper_verbose',
                          help='Debug mode: print at every major step')
     monitor.add_argument('--log', action='store_true', dest='force_log',
@@ -211,8 +209,6 @@ def main():
         overrides['entropy_coef'] = args.entropy
     if args.minibatches:
         overrides['n_minibatches'] = args.minibatches
-    if args.tensorboard:
-        overrides['tensorboard'] = True
     if args.hyper_verbose:
         overrides['hyper_verbose'] = True
     if args.clean_cache:
@@ -280,14 +276,14 @@ def main():
     _reset_signal_state()
     reset_training_state()  # Clear any stale global state from previous runs
 
-    # Determine file logging: --log forces on, --no-log forces off, otherwise auto
+    # Determine file logging: --log enables, --no-log disables
     if args.force_log:
         log_to_file = True
     elif args.no_log:
         log_to_file = False
     else:
-        # Default: log when training multiple modes
-        log_to_file = len(modes_to_train) > 1
+        # Default: logging disabled (use --log to enable TensorBoard logging)
+        log_to_file = False
 
     # Handle --profile-trace separately (requires special profiler setup)
     if args.profile_trace:

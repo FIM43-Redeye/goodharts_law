@@ -12,6 +12,8 @@ dependencies = [
     "torch",
     "plotly>=5.0",
     "dash>=2.0",
+    "dash-extensions>=1.0",
+    "flask-sock>=0.6",
     "matplotlib",  # Still used by: main.py, visualization.py (main grid display)
     "pytest",
 ]
