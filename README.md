@@ -135,12 +135,7 @@ goodharts_law/
 ├── tests/                      # pytest test suite
 ├── docs/                       # Additional documentation
 ├── models/                     # Saved model weights
-├── logs/                       # Training logs (CSV/JSON)
-│
-├── Dockerfile.rocm             # AMD GPU (ROCm) container
-├── Dockerfile.cuda             # NVIDIA GPU (CUDA) container
-├── Dockerfile.cpu              # CPU-only container
-└── compose.yaml                # Docker Compose with profiles
+└── logs/                       # Training logs (CSV/JSON)
 ```
 
 ---
@@ -487,31 +482,6 @@ This accidental demonstration of Goodhart's Law on ourselves is documented in `d
 - [ ] Resource competition under scarcity
 - [ ] Agents that "game" the proxy metric
 - [ ] Adversarial inspector/gamer co-evolution
-
----
-
-## Docker Support
-
-### AMD GPUs (ROCm)
-```bash
-docker compose --profile rocm up -d --build
-docker compose exec -it dev-rocm bash
-python main.py
-```
-
-### NVIDIA GPUs (CUDA)
-```bash
-docker compose --profile cuda up -d --build
-docker compose exec -it dev-cuda bash
-python main.py
-```
-
-### CPU Only
-```bash
-docker compose --profile cpu up -d --build
-docker compose exec -it dev-cpu bash
-python main.py
-```
 
 ---
 
