@@ -64,32 +64,33 @@ class TestObservationShape:
 
 
 class TestGroundTruthEncoding:
-    """Tests for ground truth mode observation encoding."""
+    """Tests for ground truth mode observation encoding.
 
-    def test_ground_truth_is_one_hot(self, config, device):
-        """Ground truth observations should be one-hot encoded."""
+    Ground truth uses 2-channel binary encoding:
+    - Channel 0: is_food (1.0 where food, 0.0 elsewhere)
+    - Channel 1: is_poison (1.0 where poison, 0.0 elsewhere)
+    - Empty cells: [0, 0]
+    - Food cells: [1, 0]
+    - Poison cells: [0, 1]
+    """
+
+    def test_ground_truth_is_binary_encoding(self, config, device):
+        """Ground truth observations should be binary (0 or 1) per channel."""
         spec = ObservationSpec.for_mode('ground_truth', config)
         env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
 
         obs = env.reset()
 
-        # Sum across channels should be 1 for each spatial position
-        # (except center which is blanked out)
-        channel_sum = obs[0].sum(dim=0)
+        # All values should be 0 or 1
+        assert obs.min().item() >= 0.0, "Observation values should be >= 0"
+        assert obs.max().item() <= 1.0, "Observation values should be <= 1"
 
-        # Check non-center positions
-        r = spec.view_size // 2
-        mask = torch.ones_like(channel_sum, dtype=torch.bool)
-        mask[r, r] = False
-
-        non_center_sums = channel_sum[mask]
-
-        # Each position should have exactly one active channel
-        assert torch.allclose(non_center_sums, torch.ones_like(non_center_sums)), \
-            f"One-hot encoding violated: some positions have sum != 1"
+        # Check that values are binary
+        unique_vals = torch.unique(obs)
+        assert len(unique_vals) <= 2, f"Expected binary values, got {unique_vals}"
 
     def test_ground_truth_channels_match_cell_types(self, config, device):
-        """Each channel should correspond to a cell type."""
+        """Channel 0=food, Channel 1=poison in 2-channel encoding."""
         spec = ObservationSpec.for_mode('ground_truth', config)
         env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
 
@@ -106,15 +107,13 @@ class TestGroundTruthEncoding:
 
         r = spec.view_size // 2
 
-        # Check food position (relative: +2 in x direction)
-        food_channel = CellType.FOOD.channel_index
-        assert obs[0, food_channel, r, r + 2].item() == 1.0, \
-            f"Food not detected in channel {food_channel}"
+        # Check food position: channel 0 = 1, channel 1 = 0
+        assert obs[0, 0, r, r + 2].item() == 1.0, "Food not detected in channel 0"
+        assert obs[0, 1, r, r + 2].item() == 0.0, "Food shouldn't be in channel 1"
 
-        # Check poison position (relative: -2 in x direction)
-        poison_channel = CellType.POISON.channel_index
-        assert obs[0, poison_channel, r, r - 2].item() == 1.0, \
-            f"Poison not detected in channel {poison_channel}"
+        # Check poison position: channel 0 = 0, channel 1 = 1
+        assert obs[0, 0, r, r - 2].item() == 0.0, "Poison shouldn't be in channel 0"
+        assert obs[0, 1, r, r - 2].item() == 1.0, "Poison not detected in channel 1"
 
     def test_ground_truth_center_is_blank(self, config, device):
         """Center of observation (agent's position) should be zeroed."""
@@ -132,24 +131,48 @@ class TestGroundTruthEncoding:
 
 
 class TestProxyEncoding:
-    """Tests for proxy mode observation encoding."""
+    """Tests for proxy mode observation encoding.
 
-    def test_proxy_has_interestingness_channels(self, config, device):
-        """Proxy mode should have interestingness in channels 2+."""
+    Proxy mode uses 2-channel encoding with identical interestingness values:
+    - Both channels contain the same interestingness value for each cell
+    - Agent cannot distinguish food from poison, only sees magnitude
+    - Empty: [0, 0], Food: [i, i], Poison: [i, i] where i = interestingness
+    """
+
+    def test_proxy_has_interestingness_values(self, config, device):
+        """Proxy mode should have interestingness values in both channels."""
         spec = ObservationSpec.for_mode('proxy', config)
         env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
 
         obs = env.reset()
 
-        # Channels 2+ should contain interestingness values
-        interestingness_channels = obs[:, 2:, :, :]
+        # Should have 2 channels
+        assert obs.shape[1] == 2, f"Expected 2 channels, got {obs.shape[1]}"
 
         # Should have non-zero values (food/poison have interestingness)
-        assert interestingness_channels.max().item() > 0, \
+        assert obs.max().item() > 0, \
             "Proxy observations should contain interestingness values"
 
-    def test_proxy_food_has_high_interestingness(self, config, device):
-        """Food should have high interestingness in proxy mode."""
+    def test_proxy_both_channels_identical(self, config, device):
+        """Both proxy channels should contain identical values."""
+        spec = ObservationSpec.for_mode('proxy', config)
+        env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
+
+        # Place food in known location
+        env.agent_x[0] = 10
+        env.agent_y[0] = 10
+        env.grids[0, 5:16, 5:16] = CellType.EMPTY.value
+        env.grids[0, 10, 12] = CellType.FOOD.value
+        env.grids[0, 10, 8] = CellType.POISON.value
+
+        obs = env._get_observations()
+
+        # Both channels should be identical
+        assert torch.allclose(obs[0, 0], obs[0, 1]), \
+            "Proxy channels should be identical (same interestingness in both)"
+
+    def test_proxy_food_interestingness(self, config, device):
+        """Food should have correct interestingness in proxy mode."""
         spec = ObservationSpec.for_mode('proxy', config)
         env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
 
@@ -162,13 +185,14 @@ class TestProxyEncoding:
         obs = env._get_observations()
 
         r = spec.view_size // 2
-        food_interestingness = obs[0, 2, r, r + 2].item()
+        # Check channel 0 (both channels have same value)
+        food_interestingness = obs[0, 0, r, r + 2].item()
 
-        assert food_interestingness == CellType.FOOD.interestingness, \
+        assert abs(food_interestingness - CellType.FOOD.interestingness) < 0.001, \
             f"Food interestingness wrong: {food_interestingness} != {CellType.FOOD.interestingness}"
 
-    def test_proxy_poison_has_high_interestingness(self, config, device):
-        """Poison should have similar interestingness to food in proxy mode."""
+    def test_proxy_poison_interestingness(self, config, device):
+        """Poison should have correct interestingness in proxy mode."""
         spec = ObservationSpec.for_mode('proxy', config)
         env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
 
@@ -181,9 +205,9 @@ class TestProxyEncoding:
         obs = env._get_observations()
 
         r = spec.view_size // 2
-        poison_interestingness = obs[0, 2, r, r + 2].item()
+        # Check channel 0 (both channels have same value)
+        poison_interestingness = obs[0, 0, r, r + 2].item()
 
-        # Use approximate comparison for float32 precision
         assert abs(poison_interestingness - CellType.POISON.interestingness) < 0.001, \
             f"Poison interestingness wrong: {poison_interestingness} != {CellType.POISON.interestingness}"
 
@@ -245,7 +269,8 @@ class TestViewExtraction:
         obs = env._get_observations()
 
         r = spec.view_size // 2
-        food_channel = CellType.FOOD.channel_index
+        # Channel 0 is food in 2-channel encoding
+        food_channel = 0
 
         # Check positions relative to center
         assert obs[0, food_channel, r, r + 1].item() == 1.0, "Food at +x not at expected position"
@@ -269,7 +294,8 @@ class TestViewExtraction:
         obs = env._get_observations()
 
         r = spec.view_size // 2
-        food_channel = CellType.FOOD.channel_index
+        # Channel 0 is food in 2-channel encoding
+        food_channel = 0
 
         # Food at (0, width-1) should appear at (r, r-1) in view
         # (one cell left of agent in wrapped space)

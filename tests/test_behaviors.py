@@ -18,89 +18,76 @@ class MockAgent:
 
 
 class TestOmniscientSeeker:
-    """Tests for OmniscientSeeker behavior."""
-    
+    """Tests for OmniscientSeeker behavior.
+
+    Uses 2-channel encoding: channel 0 = food, channel 1 = poison.
+    """
+
     def test_moves_toward_food(self, config):
         """OmniscientSeeker should move toward visible food."""
         from goodharts.behaviors import OmniscientSeeker
-        from goodharts.configs.default_config import CellType
-        
+
         behavior = OmniscientSeeker()
         agent = MockAgent(sight_radius=5)
-        
-        # Create a view (num_channels, 2r+1, 2r+1)
-        # Channels: empty, wall, food, poison... (depends on implementation)
-        # OmniscientSeeker expects channels mapped by CellType indices
-        # We need to ensure we construct a view valid for the logic
-        
+
+        # 2-channel view: channel 0 = food, channel 1 = poison
         r = 5
-        size = 2*r + 1
-        num_channels = len(CellType.all_types()) # Roughly
-        # Actually OmniscientSeeker uses view[CellType.FOOD.channel_index]
-        # We must ensure the view has enough channels
-        
-        max_channel = max(ct.channel_index for ct in CellType.all_types())
-        view = torch.zeros((max_channel + 1, size, size), dtype=torch.float32)
-        
-        # Place food relative to center (r, r)
-        # Agent at (3, 5), Food at (5, 5) -> dx=2, dy=0
-        # In local view: center is (r, r). Target is at (r, r+2)
-        view[CellType.FOOD.channel_index, r, r+2] = 1.0
-        
+        size = 2 * r + 1
+        view = torch.zeros((2, size, size), dtype=torch.float32)
+
+        # Place food to the right of center (channel 0)
+        view[0, r, r + 2] = 1.0
+
         dx, dy = behavior.decide_action(agent, view)
-        
+
         # Should move toward food (positive x direction)
         assert dx == 1 and dy == 0
-    
+
     def test_avoids_poison(self, config):
         """OmniscientSeeker should not move toward poison."""
         from goodharts.behaviors import OmniscientSeeker
-        from goodharts.configs.default_config import CellType
-        
+
         behavior = OmniscientSeeker()
         agent = MockAgent(sight_radius=5)
-        
+
+        # 2-channel view: channel 0 = food, channel 1 = poison
         r = 5
-        size = 2*r + 1
-        max_channel = max(ct.channel_index for ct in CellType.all_types())
-        view = torch.zeros((max_channel + 1, size, size), dtype=torch.float32)
-        
-        # Place poison directly to the right (r, r+1)
-        view[CellType.POISON.channel_index, r, r+1] = 1.0
-        
+        size = 2 * r + 1
+        view = torch.zeros((2, size, size), dtype=torch.float32)
+
+        # Place poison directly to the right (channel 1)
+        view[1, r, r + 1] = 1.0
+
         dx, dy = behavior.decide_action(agent, view)
-        
-        # Should not move right
+
+        # Should not move right into poison
         assert not (dx == 1 and dy == 0)
 
 
 class TestProxySeeker:
-    """Tests for ProxySeeker behavior."""
-    
+    """Tests for ProxySeeker behavior.
+
+    Uses 2-channel encoding with identical interestingness in both channels.
+    """
+
     def test_moves_toward_interestingness(self, config):
         """ProxySeeker should move toward high interestingness."""
         from goodharts.behaviors import ProxySeeker
-        
+
         behavior = ProxySeeker()
         agent = MockAgent(sight_radius=5)
-        
-        # ProxySeeker expects a view with 'interestingness' channel?
-        # Actually ProxySeeker requirements=['proxy_metric']
-        # which usually maps to a specific index or channel.
-        # But wait, ProxySeeker logic is: view[0] is the proxy metric (usually)
-        # Let's check ProxySeeker implementation? 
-        # Requirement is 'proxy_metric'. 
-        # Standard implementation expects 1 channel (if requirements=['proxy_metric'])
-        
+
+        # 2-channel view with identical interestingness
         r = 5
-        size = 2*r + 1
-        view = torch.zeros((1, size, size), dtype=torch.float32)
-        
-        # High interestingness to the right
-        view[0, r, r+2] = 1.0
-        
+        size = 2 * r + 1
+        view = torch.zeros((2, size, size), dtype=torch.float32)
+
+        # High interestingness to the right (same value in both channels)
+        view[0, r, r + 2] = 1.0
+        view[1, r, r + 2] = 1.0
+
         dx, dy = behavior.decide_action(agent, view)
-        
+
         # Should move toward it
         assert dx == 1 and dy == 0
 

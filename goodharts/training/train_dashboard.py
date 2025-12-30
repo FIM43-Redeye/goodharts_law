@@ -526,25 +526,35 @@ class TrainingDashboard:
 
         app = Dash(__name__)
 
-        # Dark theme for entire page
-        app.index_string = '''
+        # Dark theme - override ALL Dash containers
+        bg = COLORS['background']
+        app.index_string = f'''
 <!DOCTYPE html>
-<html>
+<html style="background: {bg} !important;">
     <head>
-        {%metas%}
+        {{%metas%}}
         <title>Training Dashboard</title>
-        {%favicon%}
-        {%css%}
+        {{%favicon%}}
+        {{%css%}}
         <style>
-            body { background-color: ''' + COLORS['background'] + '''; margin: 0; }
+            html, body, #react-entry-point, ._dash-loading {{
+                background-color: {bg} !important;
+                background: {bg} !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                min-height: 100vh !important;
+            }}
+            body > div, #react-entry-point > div {{
+                background-color: {bg} !important;
+            }}
         </style>
     </head>
-    <body>
-        {%app_entry%}
+    <body style="background: {bg} !important;">
+        {{%app_entry%}}
         <footer>
-            {%config%}
-            {%scripts%}
-            {%renderer%}
+            {{%config%}}
+            {{%scripts%}}
+            {{%renderer%}}
         </footer>
     </body>
 </html>
@@ -871,7 +881,27 @@ def view_logs(log_prefixes: list[str] = None, log_dir: str = 'generated/logs', m
         from IPython.display import display
         display(dashboard.fig)
     else:
-        dashboard.fig.show()
+        # Write to temp HTML with dark background wrapper
+        import tempfile
+        import webbrowser
+        bg = COLORS['background']
+        html_content = f'''
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        html, body {{ background-color: {bg}; margin: 0; padding: 10px; }}
+    </style>
+</head>
+<body>
+{dashboard.fig.to_html(full_html=False, include_plotlyjs='cdn')}
+</body>
+</html>
+'''
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as f:
+            f.write(html_content)
+            temp_path = f.name
+        webbrowser.open(f'file://{temp_path}')
 
 
 # =============================================================================

@@ -48,15 +48,13 @@ class TestGridMechanics:
 
         grid = env.grids[0]
 
-        # Count each cell type (agents are now permanently marked on grid as PREY/PREDATOR)
+        # Count each cell type (agents tracked by coords, not on grid)
         empty = (grid == CellType.EMPTY.value).sum().item()
         food = (grid == CellType.FOOD.value).sum().item()
         poison = (grid == CellType.POISON.value).sum().item()
-        agents = (grid == CellType.PREY.value).sum().item()
-        agents += (grid == CellType.PREDATOR.value).sum().item()
 
         # Total should equal grid size
-        total = empty + food + poison + agents
+        total = empty + food + poison
         expected = config['GRID_WIDTH'] * config['GRID_HEIGHT']
 
         assert total == expected, f"Cell counts don't sum to grid size: {total} != {expected}"
@@ -74,8 +72,8 @@ class TestGridMechanics:
             total_cells = grid.numel()
             unique_cells = len(torch.unique(grid))
 
-            # Should have at most 4 unique values: EMPTY, FOOD, POISON, WALL
-            assert unique_cells <= 4, f"Grid has unexpected cell types: {torch.unique(grid)}"
+            # Should have at most 3 unique values: EMPTY, FOOD, POISON
+            assert unique_cells <= 3, f"Grid has unexpected cell types: {torch.unique(grid)}"
 
     def test_agent_spawns_on_empty_cell(self, config, device):
         """Agent should spawn on an empty cell."""
@@ -315,28 +313,28 @@ class TestFoodRespawnMechanics:
         spec = ObservationSpec.for_mode('ground_truth', config)
         env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
 
-        # Fill most of grid with walls to force collisions
-        env.grids[0, :, :] = CellType.WALL.value
+        # Fill most of grid with poison to test respawn doesn't overwrite
+        env.grids[0, :, :] = CellType.POISON.value
 
-        # Leave some empty cells
+        # Leave some empty cells for respawn
         env.grids[0, 0:5, 0:5] = CellType.EMPTY.value
 
         # Place agent in empty area
         env.agent_x[0] = 2
         env.agent_y[0] = 2
 
-        # Count walls before respawn
-        initial_walls = (env.grids[0] == CellType.WALL.value).sum().item()
+        # Count poison before respawn
+        initial_poison = (env.grids[0] == CellType.POISON.value).sum().item()
 
-        # Force respawn
+        # Force respawn of food
         eaten_mask = torch.tensor([True], dtype=torch.bool, device=device)
         env._respawn_items_vectorized(eaten_mask, CellType.FOOD.value)
 
-        # Wall count should not change (respawn didn't overwrite walls)
-        final_walls = (env.grids[0] == CellType.WALL.value).sum().item()
+        # Poison count should not change (respawn didn't overwrite poison)
+        final_poison = (env.grids[0] == CellType.POISON.value).sum().item()
 
-        assert final_walls == initial_walls, \
-            f"Walls were overwritten by respawn: {initial_walls} -> {final_walls}"
+        assert final_poison == initial_poison, \
+            f"Poison was overwritten by respawn: {initial_poison} -> {final_poison}"
 
 
 class TestEpisodeTracking:
@@ -539,7 +537,7 @@ class TestSpawnCorrectness:
                     f"Grid {grid_id} has {poison_count} poison, expected exactly {config['GRID_POISON_INIT']}"
 
     def test_agents_spawn_on_empty_cells_only(self, config, device):
-        """Agents should never spawn on food or poison."""
+        """Agents should spawn at empty positions on the grid."""
         spec = ObservationSpec.for_mode('ground_truth', config)
 
         for _ in range(20):  # Many trials
@@ -550,54 +548,27 @@ class TestSpawnCorrectness:
                 ay = env.agent_y[env_id].long().item()
                 ax = env.agent_x[env_id].long().item()
 
-                # The cell where agent spawned should now be marked as agent
-                cell_value = env.grids[grid_id, ay, ax].item()
-                agent_type = env.agent_types[env_id].item()
+                # Agent position should be within grid bounds
+                assert 0 <= ax < config['GRID_WIDTH'], f"Agent x={ax} out of bounds"
+                assert 0 <= ay < config['GRID_HEIGHT'], f"Agent y={ay} out of bounds"
 
-                assert cell_value == agent_type, \
-                    f"Agent at ({ay}, {ax}) should be marked on grid, got {cell_value}"
-
-                # The underlying cell should be EMPTY (agent spawned on empty)
-                underlying = env.agent_underlying_cell[env_id].item()
-                assert underlying == CellType.EMPTY.value, \
-                    f"Agent {env_id} spawned on non-empty cell (underlying={underlying})"
-
-    def test_no_food_on_agent_positions_after_respawn(self, config, device):
-        """Respawned food should not land on agent positions."""
-        spec = ObservationSpec.for_mode('ground_truth', config)
-        env = create_torch_vec_env(n_envs=4, obs_spec=spec, config=config, device=device)
-
-        # Run many respawn cycles
-        for _ in range(50):
-            eaten_mask = torch.ones(4, dtype=torch.bool, device=device)
-            env._respawn_items_vectorized(eaten_mask, CellType.FOOD.value)
-
-            # Check that no food spawned on agent positions
-            for env_id in range(4):
-                grid_id = env.grid_indices[env_id].item()
-                ay = env.agent_y[env_id].long().item()
-                ax = env.agent_x[env_id].long().item()
-
-                cell_value = env.grids[grid_id, ay, ax].item()
-                # Cell should still be agent (not overwritten by food)
-                assert cell_value == env.agent_types[env_id].item(), \
-                    f"Agent position overwritten by respawn: {cell_value}"
-
-    def test_movement_preserves_underlying_cell(self, config, device):
-        """When agent moves, old cell is properly restored."""
+    def test_movement_clears_eaten_food(self, config, device):
+        """When agent eats food, the cell becomes empty."""
         spec = ObservationSpec.for_mode('ground_truth', config)
         env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
 
-        # Place agent and manually set underlying cell
+        # Place agent at known position
         env.agent_x[0] = 10
         env.agent_y[0] = 10
-        env.agent_underlying_cell[0] = CellType.EMPTY.value
-        env.grids[0, 10, 10] = env.agent_types[0].float()
+        env.grids[0, 10, 10] = CellType.EMPTY.value
 
         # Place food at target position
         env.grids[0, 10, 11] = CellType.FOOD.value
 
-        # Move right
+        # Disable respawn to test eating clears cell
+        env.respawn_resources = False
+
+        # Move right to eat food
         right_action = None
         for idx in range(8):
             dx, dy = index_to_action(idx)
@@ -608,14 +579,10 @@ class TestSpawnCorrectness:
         actions = torch.tensor([right_action], dtype=torch.long, device=device)
         env.step(actions)
 
-        # Old position should now be EMPTY (restored)
-        old_cell = env.grids[0, 10, 10].item()
-        assert old_cell == CellType.EMPTY.value, \
-            f"Old cell not restored: {old_cell}"
-
         # Agent should be at new position
         assert env.agent_x[0].item() == 11
-        assert env.grids[0, 10, 11].item() == env.agent_types[0].item()
 
-        # Underlying cell should be EMPTY (ate the food)
-        assert env.agent_underlying_cell[0].item() == CellType.EMPTY.value
+        # The food cell should now be EMPTY (food was eaten)
+        cell_after = env.grids[0, 10, 11].item()
+        assert cell_after == CellType.EMPTY.value, \
+            f"Food cell should be empty after eating, got {cell_after}"

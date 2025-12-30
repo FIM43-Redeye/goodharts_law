@@ -12,7 +12,7 @@ dependencies = [
     "torch",
     "plotly>=5.0",
     "dash>=2.0",
-    "matplotlib",  # Still used by: visualization.py, eval_dashboard.py, visualize_saliency.py
+    "matplotlib",  # Still used by: main.py, visualization.py (main grid display)
     "pytest",
 ]
 

@@ -1,7 +1,7 @@
 """
 Proxy-optimizing behavior that only sees interestingness signals.
 
-In proxy mode, all channels contain the same interestingness values,
+In proxy mode, both channels contain the same interestingness values,
 so this agent cannot distinguish food from poison based on cell type.
 With poison being MORE interesting (1.0) than food (0.5), this agent
 will actively PREFER poison. This is the Goodhart's Law trap.
@@ -22,10 +22,9 @@ from goodharts.behaviors.utils import RANDOM_WALK_MOVES, sign_scalar, create_cir
 class ProxySeeker(BehaviorStrategy):
     """
     Behavior that optimizes for proxy signal (interestingness).
-    
-    Receives the same (num_channels, H, W) shape as OmniscientSeeker,
-    but all channels contain identical interestingness values.
-    Cannot distinguish food from poison - will eat both!
+
+    Uses 2-channel encoding where both channels contain identical
+    interestingness values. Cannot distinguish food from poison.
     """
     
     # Distinct color for visualization (magenta)
@@ -38,21 +37,19 @@ class ProxySeeker(BehaviorStrategy):
     def decide_action(self, agent, view: torch.Tensor) -> tuple[int, int]:
         """
         Decide action based on proxy signal only.
-        
+
         Args:
             agent: The organism instance
-            view: Shape (num_channels, H, W) tensor - all channels have same interestingness
-            
+            view: Shape (2, H, W) tensor - both channels have same interestingness
+
         Returns:
             (dx, dy) movement vector
         """
-        # Ensure view is on correct device (it should be, but good to be safe if moved)
-        # view is (C, H, W)
         device = view.device
         center = agent.sight_radius
-        
-        # In proxy mode, all channels are identical interestingness values
-        # Just use channel 0 (they're all the same)
+
+        # In proxy mode, both channels have identical interestingness values
+        # Just use channel 0 (they're the same)
         proxy_signal = view[0]  # (H, W)
         
         # We need to find the specific (dx, dy) with the max value.

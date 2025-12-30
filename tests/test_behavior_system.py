@@ -99,18 +99,6 @@ class TestBehaviorInterface:
         assert isinstance(omni.requirements, list)
         assert isinstance(proxy.requirements, list)
 
-    def test_behavior_has_role(self):
-        """All behaviors should have a role property."""
-        from goodharts.behaviors import OmniscientSeeker, ProxySeeker
-
-        omni = OmniscientSeeker()
-        proxy = ProxySeeker()
-
-        assert hasattr(omni, 'role')
-        assert hasattr(proxy, 'role')
-        assert omni.role in ['prey', 'predator']
-        assert proxy.role in ['prey', 'predator']
-
     def test_behavior_has_color(self):
         """All behaviors should have a color property."""
         from goodharts.behaviors import OmniscientSeeker, ProxySeeker
@@ -199,14 +187,14 @@ class TestOmniscientSeekerBehavior:
 
         behavior = OmniscientSeeker()
 
-        # Create mock view with food to the right
+        # Create mock 2-channel view with food to the right
+        # Channel 0 = food, Channel 1 = poison
         r = 5
         size = 2 * r + 1
-        max_channel = max(ct.channel_index for ct in CellType.all_types())
-        view = torch.zeros((max_channel + 1, size, size), dtype=torch.float32)
+        view = torch.zeros((2, size, size), dtype=torch.float32)
 
-        # Place food 2 cells to the right of center
-        view[CellType.FOOD.channel_index, r, r + 2] = 1.0
+        # Place food 2 cells to the right of center (channel 0)
+        view[0, r, r + 2] = 1.0
 
         class MockAgent:
             x = 0
@@ -225,13 +213,13 @@ class TestOmniscientSeekerBehavior:
 
         behavior = OmniscientSeeker()
 
+        # 2-channel view: Channel 0 = food, Channel 1 = poison
         r = 5
         size = 2 * r + 1
-        max_channel = max(ct.channel_index for ct in CellType.all_types())
-        view = torch.zeros((max_channel + 1, size, size), dtype=torch.float32)
+        view = torch.zeros((2, size, size), dtype=torch.float32)
 
-        # Place poison 1 cell to the right
-        view[CellType.POISON.channel_index, r, r + 1] = 1.0
+        # Place poison 1 cell to the right (channel 1)
+        view[1, r, r + 1] = 1.0
 
         class MockAgent:
             x = 0
@@ -250,14 +238,14 @@ class TestOmniscientSeekerBehavior:
 
         behavior = OmniscientSeeker()
 
+        # 2-channel view: Channel 0 = food, Channel 1 = poison
         r = 5
         size = 2 * r + 1
-        max_channel = max(ct.channel_index for ct in CellType.all_types())
-        view = torch.zeros((max_channel + 1, size, size), dtype=torch.float32)
+        view = torch.zeros((2, size, size), dtype=torch.float32)
 
-        # Food to the right, poison to the left
-        view[CellType.FOOD.channel_index, r, r + 2] = 1.0
-        view[CellType.POISON.channel_index, r, r - 2] = 1.0
+        # Food to the right (channel 0), poison to the left (channel 1)
+        view[0, r, r + 2] = 1.0
+        view[1, r, r - 2] = 1.0
 
         class MockAgent:
             x = 0
@@ -279,12 +267,14 @@ class TestProxySeekerBehavior:
 
         behavior = ProxySeeker()
 
+        # 2-channel view with identical interestingness values in both channels
         r = 5
         size = 2 * r + 1
-        view = torch.zeros((1, size, size), dtype=torch.float32)
+        view = torch.zeros((2, size, size), dtype=torch.float32)
 
-        # High interestingness to the right
+        # High interestingness to the right (both channels same value)
         view[0, r, r + 2] = 1.0
+        view[1, r, r + 2] = 1.0
 
         class MockAgent:
             x = 0

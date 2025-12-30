@@ -59,7 +59,6 @@ class TorchVecEnv(nn.Module):
         obs_spec: ObservationSpec,
         config: dict = None,
         device: Optional[torch.device] = None,
-        agent_types: list[int] = None
     ):
         """
         Initialize GPU-native vectorized environment.
@@ -69,7 +68,6 @@ class TorchVecEnv(nn.Module):
             obs_spec: Observation specification
             config: Optional config override
             device: Torch device (auto-detect if None)
-            agent_types: Optional list of agent types
         """
         super().__init__()
 
@@ -99,7 +97,7 @@ class TorchVecEnv(nn.Module):
         
         # Mode-aware observation encoding
         # Detect proxy mode: uses 'interestingness' instead of cell-type one-hot
-        self.is_proxy_mode = 'interestingness' in self.channel_names
+        self.is_proxy_mode = any('interestingness' in ch for ch in self.channel_names)
 
         # Freeze energy during training: agents don't die, enabling exploration
         # Used for proxy mode where agents can't learn from energy consequences
@@ -137,17 +135,12 @@ class TorchVecEnv(nn.Module):
         # (Descriptors cause graph breaks, plain values don't)
         self.CellType = config['CellType']
         self._cell_empty = self.CellType.EMPTY.value
-        self._cell_wall = self.CellType.WALL.value
         self._cell_food = self.CellType.FOOD.value
         self._cell_poison = self.CellType.POISON.value
-        self._cell_prey = self.CellType.PREY.value
         self.food_reward = self.CellType.FOOD.energy_reward
+        self.poison_reward = self.CellType.FOOD.interestingness  # For proxy mode
         self.poison_penalty = self.CellType.POISON.energy_penalty
-        
-        # Agent types (constant, but register as buffer for CUDA graph address stability)
-        if agent_types is None:
-            agent_types = [self.CellType.PREY.value] * n_envs
-        self.register_buffer('agent_types', torch.tensor(agent_types, dtype=torch.int32, device=device), persistent=False)
+        self.poison_interestingness = self.CellType.POISON.interestingness  # For proxy mode
 
         # Action deltas - must match policy's action space (constant)
         self.max_move_distance = config.get('MAX_MOVE_DISTANCE', 1)
@@ -170,10 +163,6 @@ class TorchVecEnv(nn.Module):
         self.register_buffer('agent_energy', torch.full((n_envs,), self.initial_energy, dtype=torch.float32, device=device), persistent=False)
         self.register_buffer('agent_steps', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
 
-        # Track what cell type is "under" each agent (for restoration when moving)
-        # Agents are permanently marked on grid - this tracks the original cell value
-        self.register_buffer('agent_underlying_cell', torch.zeros(n_envs, dtype=torch.float32, device=device), persistent=False)
-
         # Pre-allocated view buffer (mutable - written each step)
         self.register_buffer('_view_buffer', torch.zeros(
             (n_envs, self.n_channels, self.view_size, self.view_size),
@@ -186,8 +175,6 @@ class TorchVecEnv(nn.Module):
         self.register_buffer('dones', torch.zeros(n_envs, dtype=torch.bool, device=device), persistent=False)
 
         # Pre-allocated temporaries for step() to avoid per-step allocations
-        self.register_buffer('_old_y', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
-        self.register_buffer('_old_x', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
         self.register_buffer('_dones_return', torch.zeros(n_envs, dtype=torch.bool, device=device), persistent=False)
         self.register_buffer('_terminated_return', torch.zeros(n_envs, dtype=torch.bool, device=device), persistent=False)
         self.register_buffer('_truncated_return', torch.zeros(n_envs, dtype=torch.bool, device=device), persistent=False)
@@ -200,7 +187,6 @@ class TorchVecEnv(nn.Module):
         self.register_buffer('_zero_int32', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
         self.register_buffer('_zero_bool', torch.zeros(n_envs, dtype=torch.bool, device=device), persistent=False)
         self.register_buffer('_initial_energy_tensor', torch.full((n_envs,), self.initial_energy, dtype=torch.float32, device=device), persistent=False)
-        self.register_buffer('_empty_cell_tensor', torch.full((n_envs,), self._cell_empty, dtype=torch.float32, device=device), persistent=False)
 
         # Stats tracking (mutable)
         self.register_buffer('current_episode_food', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
@@ -473,34 +459,19 @@ class TorchVecEnv(nn.Module):
         return y, x
 
     def _reset_agent(self, env_id: int):
-        """Reset a single agent's state and mark on grid.
+        """Reset a single agent's state.
 
+        Agents are tracked by coordinates only (not marked on grid).
         Uses tensor operations throughout to avoid CPU-GPU sync points.
         """
         grid_id = self.grid_indices[env_id]  # Keep as tensor, no .item()
 
-        # Clear old position (restore underlying cell) - only if agent is actually there
-        old_y = self.agent_y[env_id]
-        old_x = self.agent_x[env_id]
-        old_cell_value = self.grids[grid_id, old_y, old_x]
-        agent_type = self.agent_types[env_id].float()
-
-        # Conditional restore using torch.where (no Python branching on GPU values)
-        is_agent_marked = (old_cell_value == agent_type)
-        self.grids[grid_id, old_y, old_x] = torch.where(
-            is_agent_marked,
-            self.agent_underlying_cell[env_id],
-            old_cell_value
-        )
-
         # Select random empty position
         new_y, new_x = self._random_empty_positions(self.grids[grid_id])
 
-        # Update position and mark on grid
+        # Update position
         self.agent_y[env_id] = new_y
         self.agent_x[env_id] = new_x
-        self.agent_underlying_cell[env_id] = self._cell_empty
-        self.grids[grid_id, new_y, new_x] = self.agent_types[env_id].float()
 
         self.agent_energy[env_id] = self.initial_energy
         self.agent_steps[env_id] = 0
@@ -518,6 +489,8 @@ class TorchVecEnv(nn.Module):
         Uses _random_empty_positions to select random empty cells without
         any CPU-GPU synchronization. Each agent has its own grid, so
         spawns are independent and can be fully parallelized.
+
+        Agents are tracked by coordinates only (not marked on grid).
         """
         n_reset = len(env_ids)
         if n_reset == 0:
@@ -531,10 +504,6 @@ class TorchVecEnv(nn.Module):
         # Update agent positions (vectorized)
         self.agent_y[env_ids] = new_y
         self.agent_x[env_ids] = new_x
-        self.agent_underlying_cell[env_ids] = self._cell_empty
-
-        # Mark agents on grids (vectorized advanced indexing)
-        self.grids[grid_ids, new_y, new_x] = self.agent_types[env_ids].float()
 
     def _reset_agents_masked(self, done_mask: torch.Tensor):
         """
@@ -546,13 +515,11 @@ class TorchVecEnv(nn.Module):
         This runs operations on ALL agents but only applies changes where
         done_mask is True. Slightly more compute but zero sync overhead.
 
+        Agents are tracked by coordinates only (not marked on grid).
+
         Args:
             done_mask: Boolean tensor (n_envs,) indicating which agents are done
         """
-        # Expand mask for broadcasting where needed
-        done_f = done_mask.float()  # For numeric operations
-        done_int = done_mask.int()
-
         # Update episode stats (only where done)
         # Use copy_() to preserve buffer memory address for CUDA graph compatibility
         self.last_episode_food.copy_(torch.where(
@@ -568,23 +535,6 @@ class TorchVecEnv(nn.Module):
             done_mask, self._zero_int32, self.current_episode_poison
         ))
 
-        # Restore old cells where done (clear agent markers)
-        old_y = self.agent_y
-        old_x = self.agent_x
-        grid_ids = self.grid_indices
-        old_cell_values = self.grids[grid_ids, old_y, old_x]
-        agent_types_f = self.agent_types.float()
-
-        # Only restore where agent is marked AND agent is done
-        actually_marked = (old_cell_values == agent_types_f)
-        should_restore = done_mask & actually_marked
-        restore_values = torch.where(
-            should_restore,
-            self.agent_underlying_cell,
-            old_cell_values
-        )
-        self._grid_scatter(grid_ids, old_y, old_x, restore_values)
-
         # Reset energy, steps, dones where done (using pre-allocated constants)
         # Use copy_() to preserve buffer memory address for CUDA graph compatibility
         self.agent_energy.copy_(torch.where(
@@ -598,27 +548,13 @@ class TorchVecEnv(nn.Module):
         ))
 
         # Spawn new positions for ALL agents (cheap), only apply where done
+        grid_ids = self.grid_indices
         new_y, new_x = self._random_empty_positions(self.grids[grid_ids])
 
         # Only update positions where done
         # Use copy_() to preserve buffer memory address for CUDA graph compatibility
         self.agent_y.copy_(torch.where(done_mask, new_y, self.agent_y))
         self.agent_x.copy_(torch.where(done_mask, new_x, self.agent_x))
-        self.agent_underlying_cell.copy_(torch.where(
-            done_mask, self._empty_cell_tensor, self.agent_underlying_cell
-        ))
-
-        # Mark agents on grids where done
-        # Need to use scatter or advanced indexing carefully
-        # The new positions for done agents need to be marked
-        new_positions_y = torch.where(done_mask, new_y, old_y)
-        new_positions_x = torch.where(done_mask, new_x, old_x)
-
-        # Get current values at new positions
-        current_at_new = self.grids[grid_ids, new_positions_y, new_positions_x]
-        # Only mark where done (set to agent type)
-        new_values = torch.where(done_mask, agent_types_f, current_at_new)
-        self._grid_scatter(grid_ids, new_positions_y, new_positions_x, new_values)
     
     def _place_items(self, grid_id: int, cell_type: int, count):
         """Place items at random empty positions using noise-based selection.
@@ -670,14 +606,6 @@ class TorchVecEnv(nn.Module):
         if actions.device != self.device:
             actions = actions.to(self.device)
 
-        # Store old positions (reuse pre-allocated buffers)
-        self._old_y.copy_(self.agent_y)
-        self._old_x.copy_(self.agent_x)
-
-        # Restore old cells (clear agent markers before moving)
-        # Use scatter_ to avoid CUDA graph "mutated inputs" warning
-        self._grid_scatter(self.grid_indices, self._old_y, self._old_x, self.agent_underlying_cell)
-
         # Get movement deltas
         dx = self.action_deltas[actions, 0]
         dy = self.action_deltas[actions, 1]
@@ -691,11 +619,8 @@ class TorchVecEnv(nn.Module):
         # -= is in-place so address is preserved
         self.agent_energy -= self.energy_move_cost * self._energy_enabled
 
-        # Eating (updates energy unless frozen, plus underlying_cell and item clearing)
+        # Eating (updates energy unless frozen, clears consumed items from grid)
         food_mask, poison_mask = self._eat_batch()
-
-        # Mark agents at new positions
-        self._grid_scatter(self.grid_indices, self.agent_y, self.agent_x, self.agent_types.float())
 
         # Step count and done check
         # Separate terminated (real death) from truncated (time limit)
@@ -724,7 +649,7 @@ class TorchVecEnv(nn.Module):
     
     def _eat_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Vectorized eating logic with underlying cell tracking.
+        Vectorized eating logic.
 
         Returns:
             (food_mask, poison_mask): Boolean tensors indicating what each agent ate.
@@ -750,16 +675,11 @@ class TorchVecEnv(nn.Module):
         self.current_episode_food.copy_(torch.where(food_mask, self.current_episode_food + 1, self.current_episode_food))
         self.current_episode_poison.copy_(torch.where(poison_mask, self.current_episode_poison + 1, self.current_episode_poison))
 
-        # Determine what the cell becomes after eating
-        # If ate food or poison -> EMPTY, otherwise keep original
+        # Clear eaten items from grid (set to EMPTY)
         ate_something = food_mask | poison_mask
-        final_cell_values = torch.where(ate_something, self._empty_value, cell_values)
-
-        # Update underlying cell (what's "under" the agent after this step)
-        self.agent_underlying_cell.copy_(final_cell_values)
-
-        # Clear eaten items from grid
-        self._grid_scatter(self.grid_indices, self.agent_y, self.agent_x, final_cell_values)
+        current_grid_vals = self.grids[self.grid_indices, self.agent_y, self.agent_x]
+        new_grid_vals = torch.where(ate_something, self._empty_value, current_grid_vals)
+        self._grid_scatter(self.grid_indices, self.agent_y, self.agent_x, new_grid_vals)
 
         # Respawn eaten items
         self._respawn_items_vectorized(food_mask, self._cell_food)
@@ -810,11 +730,14 @@ class TorchVecEnv(nn.Module):
     def _get_observations(self) -> torch.Tensor:
         """Get batched observations (fully vectorized on GPU).
 
-        Mode-aware encoding:
-        - Ground truth: One-hot encoding of cell types (channels = cell types)
-        - Proxy modes: Channels 0-1 are empty/wall, channels 2+ are interestingness
+        2-channel encoding for both modes (same CNN architecture):
+        - Ground truth: Food=[1,0], Poison=[0,1], Empty=[0,0]
+        - Proxy: Food=[i,i], Poison=[i,i], Empty=[0,0]
+                 where i = cell's interestingness value
 
-        Note: Agents are permanently marked on the grid, so no temp mark/restore needed.
+        The proxy agent sees the same value in both channels, making
+        food and poison indistinguishable - only magnitude matters.
+        Poison has higher interestingness (1.0 > 0.5), creating the Goodhart trap.
         """
         r = self.view_radius
         vs = self.view_size
@@ -827,32 +750,23 @@ class TorchVecEnv(nn.Module):
 
         # Index by agent positions to get each agent's view
         views = windows[self.grid_indices, self.agent_y, self.agent_x]  # (n_envs, vs, vs)
+        views_int = views.int()
 
         if self.is_proxy_mode:
-            # PROXY MODE: Hide ground truth, show interestingness
-            # Channel 0: is_empty (binary)
-            # Channel 1: is_wall (binary)
-            # Channels 2+: interestingness value (same across all these channels)
-
-            views_int = views.int()  # int32 for TPU-friendly indexing
-
-            # Binary channels for empty/wall
-            self._view_buffer[:, 0, :, :] = (views_int == self._cell_empty).float()
-            self._view_buffer[:, 1, :, :] = (views_int == self._cell_wall).float()
-
-            # Interestingness channel (lookup from cell values)
-            # Clamp to valid indices to avoid index errors
+            # PROXY MODE: Both channels get the same interestingness value
+            # Agent cannot distinguish food from poison, only sees magnitude
+            # Lookup interestingness from cell values
             clamped_views = views_int.clamp(0, len(self._interestingness_lut) - 1)
             interestingness = self._interestingness_lut[clamped_views]  # (n_envs, vs, vs)
 
-            # Fill channels 2+ with interestingness (single vectorized op, no loop)
-            n_interest_channels = self.n_channels - 2
-            # Expand interestingness to (n_envs, n_interest_channels, vs, vs) and write
-            self._view_buffer[:, 2:, :, :] = interestingness.unsqueeze(1).expand(-1, n_interest_channels, -1, -1)
+            # Both channels get the same value
+            self._view_buffer[:, 0, :, :] = interestingness
+            self._view_buffer[:, 1, :, :] = interestingness
         else:
-            # GROUND TRUTH MODE: One-hot encoding of cell types
-            one_hot = F.one_hot(views.long(), num_classes=self.n_channels)
-            self._view_buffer[:] = one_hot.permute(0, 3, 1, 2).float()
+            # GROUND TRUTH MODE: Binary encoding
+            # Channel 0: is_food, Channel 1: is_poison
+            self._view_buffer[:, 0, :, :] = (views_int == self._cell_food).float()
+            self._view_buffer[:, 1, :, :] = (views_int == self._cell_poison).float()
 
         # Blank center (agent's own cell)
         self._view_buffer[:, :, r, r] = 0.0
@@ -890,7 +804,6 @@ def create_torch_vec_env(
     obs_spec: ObservationSpec,
     config: dict = None,
     device: Optional[torch.device] = None,
-    agent_types: list[int] = None
 ) -> TorchVecEnv:
     """Factory function to create a GPU-native vectorized environment."""
     return TorchVecEnv(
@@ -898,5 +811,4 @@ def create_torch_vec_env(
         obs_spec=obs_spec,
         config=config,
         device=device,
-        agent_types=agent_types
     )

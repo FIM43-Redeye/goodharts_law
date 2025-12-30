@@ -94,19 +94,16 @@ class Simulation:
         self.device = get_device()
         
         # 1. Setup Agents Configuration
-        agents_setup = []
         behaviors = []
-        agent_types = []  # For visibility
-        CellType = config['CellType']
-        
+
         for setup in config['AGENTS_SETUP']:
             b_class_name = setup['behavior_class']
             count = setup['count']
-            
+
             # Extract kwargs
-            behavior_kwargs = {k: v for k, v in setup.items() 
+            behavior_kwargs = {k: v for k, v in setup.items()
                              if k not in ('behavior_class', 'count')}
-            
+
             for _ in range(count):
                 if b_class_name in LEARNED_PRESETS:
                     behavior = create_learned_behavior(b_class_name, **behavior_kwargs)
@@ -115,29 +112,22 @@ class Simulation:
                 else:
                     BehaviorClass = get_behavior(b_class_name)
                     behavior = BehaviorClass(**behavior_kwargs)
-                
+
                 behaviors.append(behavior)
-                
-                # Determine Agent Type for Visibility
-                role = getattr(behavior, 'role', 'prey')
-                a_type = CellType.PREDATOR.value if role == 'predator' else CellType.PREY.value
-                agent_types.append(a_type)
-        
+
         num_agents = len(behaviors)
-        
+
         # 2. Initialize VecEnv
         req = 'ground_truth'
         mode = get_mode_for_requirement(req, config)
         spec = ObservationSpec.for_mode(mode, config)
-        
+
         # Uses TorchVecEnv via the updated import
-        # NOTE: Previously used shared_grid=True for visualization, but that mode
-        # was removed for training optimization. Each agent now has its own grid.
+        # Agents are tracked by coordinates only (not marked on grid)
         self.vec_env = create_vec_env(
             n_envs=num_agents,
             obs_spec=spec,
             config=config,
-            agent_types=agent_types
         )
         
         # 3. Create Agent Wrappers
