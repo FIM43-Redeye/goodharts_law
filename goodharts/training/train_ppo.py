@@ -340,6 +340,9 @@ def _run_with_profiling(mode: str, overrides: dict, n_updates: int):
         'total_timesteps': total_timesteps,
         'validation_interval': 0,  # Skip validation during profiling
         'profile_enabled': False,  # Disable internal profiler (we use our own)
+        # Force no-cudagraphs: CUDA graph capture + profiler = segfault on ROCm
+        # (graph fallback due to mutated inputs conflicts with profiler event tracking)
+        'compile_mode': 'max-autotune-no-cudagraphs',
     }
 
     print(f"\n[Profile] Configuration:")
