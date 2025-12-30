@@ -1090,74 +1090,12 @@ class PPOTrainer:
         self.device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
         self.scaler = GradScaler(enabled=cfg.use_amp) if cfg.use_amp else None
 
-        # Compile models for extra speed if torch.compile is available (PyTorch 2.0+)
-        # Use lock to serialize compilation - Dynamo's global state is not thread-safe
-        # Skip on TPU - XLA uses its own JIT compilation
-        # Note: Actual warmup happens in _training_loop via _run_warmup_update()
-        #
-        # Key insight: Compiling the ENTIRE inference step (policy forward + sampling
-        # + value head) into ONE function eliminates graph boundaries between operations.
-        # This fuses many small kernels into fewer large ones, reducing kernel launch
-        # overhead and eliminating ~200ms of GPU gaps per training run.
+        # Compiled function placeholders - actual compilation happens after
+        # all components (including reward_computer) are created
         self._compiled_inference = None
+        self._compiled_rollout_step = None
         self._compiled_ppo_update = None
 
-        with _COMPILE_LOCK:
-            if cfg.compile_models and hasattr(torch, 'compile') and not is_tpu(self.device):
-                try:
-                    # Use configured compile mode
-                    # max-autotune-no-cudagraphs is safest for AMD ROCm
-                    compile_mode = cfg.compile_mode
-
-                    # Capture references for closure
-                    policy = self.policy
-                    value_head = self.value_head
-                    device_type = self.device_type
-                    use_amp = cfg.use_amp
-
-                    # Fused inference: policy forward + sampling + value prediction
-                    # This eliminates 3 separate compiled regions -> 1 fused region
-                    @torch.compile(mode=compile_mode)
-                    def compiled_inference(states, density_info):
-                        """
-                        Fused inference: CNN -> logits -> sample -> value.
-
-                        Eliminates graph boundaries between policy and value head,
-                        allowing maximum kernel fusion.
-
-                        Returns:
-                            actions: Sampled actions
-                            log_probs: Log probabilities of sampled actions
-                            values: Value predictions
-                            logits: Raw action logits (for logging)
-                            features: Policy features (for aux buffer)
-                        """
-                        with autocast(device_type=device_type, enabled=use_amp):
-                            # Policy forward
-                            logits, features = policy.forward_with_features(states)
-
-                            # Sample actions
-                            dist = Categorical(logits=logits, validate_args=False)
-                            actions = dist.sample()
-                            log_probs = dist.log_prob(actions)
-
-                            # Value prediction (includes privileged critic aux inputs)
-                            values = value_head(features, density_info).squeeze(-1)
-
-                        return actions, log_probs, values, logits, features
-
-                    self._compiled_inference = compiled_inference
-
-                    # Compile PPO update function (~9% speedup on PPO update)
-                    self._compiled_ppo_update = torch.compile(ppo_update, mode=compile_mode)
-
-                    print(f"   [JIT] torch.compile enabled ({compile_mode}) - fused inference")
-                except RuntimeError as e:
-                    if "FX" in str(e) or "dynamo" in str(e).lower():
-                        print(f"   [JIT] Warning: torch.compile failed ({e}). Using eager mode.")
-                    else:
-                        raise e
-        
         # Optimizer - use fused=True on CUDA to eliminate .item() sync overhead
         # Fused runs entirely on GPU, avoiding 384 CPU round-trips per update
         use_fused = self.device.type == 'cuda'
@@ -1186,7 +1124,114 @@ class PPOTrainer:
             gamma=cfg.gamma,
             device=self.device
         )
-        
+
+        # Compile models for extra speed if torch.compile is available (PyTorch 2.0+)
+        # Use lock to serialize compilation - Dynamo's global state is not thread-safe
+        # Skip on TPU - XLA uses its own JIT compilation
+        # Note: Actual warmup happens in _training_loop via _run_warmup_update()
+        #
+        # Key insight: Compiling ENV_STEP + REWARD_SHAPE + INFERENCE into ONE function
+        # eliminates graph boundaries between all three operations. This fuses many
+        # small kernels into fewer large ones, reducing kernel launch overhead.
+        with _COMPILE_LOCK:
+            if cfg.compile_models and hasattr(torch, 'compile') and not is_tpu(self.device):
+                try:
+                    compile_mode = cfg.compile_mode
+
+                    # Capture references for closure - all must exist before this point
+                    policy = self.policy
+                    value_head = self.value_head
+                    vec_env = self.vec_env
+                    reward_computer = self.reward_computer
+                    device_type = self.device_type
+                    use_amp = cfg.use_amp
+                    privileged_critic = cfg.privileged_critic
+
+                    # ============================================================
+                    # FUSED ROLLOUT STEP: ENV_STEP + REWARD_SHAPE + INFERENCE
+                    # ============================================================
+                    # This is the Step-Then-Infer pattern compiled as ONE graph.
+                    # All three operations are fused, eliminating graph breaks
+                    # between env stepping, reward shaping, and inference.
+                    @torch.compile(mode=compile_mode)
+                    def compiled_rollout_step(actions, states, potentials):
+                        """
+                        Fused rollout step: ENV_STEP -> REWARD_SHAPE -> INFERENCE.
+
+                        Args:
+                            actions: Current actions to execute
+                            states: Current observations (before step)
+                            potentials: Current potential values for reward shaping
+
+                        Returns:
+                            Tuple of (for_buffer, for_next_iter):
+                            - current_states: States before step (for buffer)
+                            - shaped_rewards: Rewards from this step (for buffer)
+                            - dones: Episode done flags (for buffer)
+                            - terminated: True termination flags (for buffer)
+                            - next_states: States after step (for next iter)
+                            - next_actions: Actions for next step
+                            - next_log_probs: Log probs for next step
+                            - next_values: Values for next step
+                            - next_potentials: Potentials for next step
+                            - density_info: Density info (for aux buffer)
+                            - logits: Raw logits (for logging)
+                        """
+                        # Snapshot current states before env mutates them
+                        current_states = states.clone()
+
+                        # ENV_STEP
+                        next_states, eating_info, terminated, truncated = vec_env.step(actions)
+                        dones = terminated | truncated
+
+                        # Get density info for privileged critic (after step)
+                        density_info = vec_env.get_density_info() if privileged_critic else None
+
+                        # REWARD_SHAPE (stateless)
+                        shaped_rewards, next_potentials = reward_computer.compute_stateless(
+                            eating_info, current_states, next_states, terminated, potentials
+                        )
+
+                        # INFERENCE (for next step)
+                        with autocast(device_type=device_type, enabled=use_amp):
+                            logits, features = policy.forward_with_features(next_states)
+                            dist = Categorical(logits=logits, validate_args=False)
+                            next_actions = dist.sample()
+                            next_log_probs = dist.log_prob(next_actions)
+                            next_values = value_head(features, density_info).squeeze(-1)
+
+                        return (
+                            current_states, shaped_rewards, dones, terminated,
+                            next_states, next_actions, next_log_probs, next_values,
+                            next_potentials, density_info, logits
+                        )
+
+                    self._compiled_rollout_step = compiled_rollout_step
+
+                    # Keep standalone inference for warmup/prefetch (simpler, already works)
+                    @torch.compile(mode=compile_mode)
+                    def compiled_inference(states, density_info):
+                        """Standalone inference for warmup and prefetch."""
+                        with autocast(device_type=device_type, enabled=use_amp):
+                            logits, features = policy.forward_with_features(states)
+                            dist = Categorical(logits=logits, validate_args=False)
+                            actions = dist.sample()
+                            log_probs = dist.log_prob(actions)
+                            values = value_head(features, density_info).squeeze(-1)
+                        return actions, log_probs, values, logits, features
+
+                    self._compiled_inference = compiled_inference
+
+                    # Compile PPO update function
+                    self._compiled_ppo_update = torch.compile(ppo_update, mode=compile_mode)
+
+                    print(f"   [JIT] torch.compile enabled ({compile_mode}) - fused rollout step")
+                except RuntimeError as e:
+                    if "FX" in str(e) or "dynamo" in str(e).lower():
+                        print(f"   [JIT] Warning: torch.compile failed ({e}). Using eager mode.")
+                    else:
+                        raise e
+
         # Logger (skip in benchmark mode)
         # Uses process-isolated logging to completely escape the GIL
         if cfg.log_to_file and not cfg.benchmark_mode:
@@ -1449,23 +1494,47 @@ class PPOTrainer:
                 inference_pending = False
                 # Prefetched values are already in: actions, log_probs, values, potentials, density_info
 
-            # Environment step using CURRENT actions
-            # CRITICAL: Snapshot state BEFORE step because env may mutate it in-place!
-            with record_function("ENV_STEP"):
-                current_states = states.clone()
-                next_states, eating_info, terminated, truncated = self.vec_env.step(actions)
-                dones = terminated | truncated  # Combined for episode tracking
+            # ============================================================
+            # FUSED ROLLOUT STEP: ENV_STEP + REWARD_SHAPE + INFERENCE
+            # ============================================================
+            # All three operations compiled into ONE graph for maximum fusion.
+            with torch.no_grad():
+                if self._compiled_rollout_step is not None:
+                    with record_function("ROLLOUT_STEP"):
+                        torch.compiler.cudagraph_mark_step_begin()
+                        (
+                            current_states, shaped_rewards, dones, terminated,
+                            next_states, next_actions, next_log_probs, next_values,
+                            next_potentials, next_density_info, logits
+                        ) = self._compiled_rollout_step(actions, states, potentials)
+                else:
+                    # Fallback to separate calls (eager mode)
+                    with record_function("ENV_STEP"):
+                        current_states = states.clone()
+                        next_states, eating_info, terminated, truncated = self.vec_env.step(actions)
+                        dones = terminated | truncated
 
-            # Compute shaped rewards (stateless - caller manages potentials)
-            # Pass terminated (not dones) - truncation is neutral, not failure
-            with record_function("REWARD_SHAPE"):
-                shaped_rewards, next_potentials = self.reward_computer.compute_stateless(
-                    eating_info, current_states, next_states, terminated, potentials
-                )
+                    with record_function("REWARD_SHAPE"):
+                        shaped_rewards, next_potentials = self.reward_computer.compute_stateless(
+                            eating_info, current_states, next_states, terminated, potentials
+                        )
+
+                    next_density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
+
+                    with record_function("INFERENCE"):
+                        with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                            logits, features = self.policy.forward_with_features(next_states.float())
+                            dist = Categorical(logits=logits, validate_args=False)
+                            next_actions = dist.sample()
+                            next_log_probs = dist.log_prob(next_actions)
+                            next_values = self.value_head(features, next_density_info).squeeze(-1)
+
+            # Store logits for action_probs logging
+            last_logits = logits
+            self.profiler.tick("Inference")
 
             # Store experience in pre-allocated tensor buffers
             # Note: Each indexed write triggers CPU dispatch + GPU DtoD copy
-            # This is ~200us/step of overhead that could be reduced by compiling
             with record_function("BUFFER_STORE"):
                 states_buf[step_in_buffer] = current_states
                 actions_buf[step_in_buffer] = actions
@@ -1475,7 +1544,7 @@ class PPOTrainer:
                 terminated_buf[step_in_buffer] = terminated
                 values_buf[step_in_buffer] = values
                 if self._aux_buf is not None:
-                    self._aux_buf[step_in_buffer] = density_info
+                    self._aux_buf[step_in_buffer] = next_density_info
 
                 # Track episode stats (defer logging to avoid Sync)
                 finished_dones_buf[step_in_buffer] = dones
@@ -1488,31 +1557,6 @@ class PPOTrainer:
             with record_function("EPISODE_TRACK"):
                 episode_rewards += shaped_rewards
                 episode_rewards *= (~dones)  # Reset for done agents
-
-            # ============================================================
-            # INFERENCE for NEXT step (Step-Then-Infer pattern)
-            # ============================================================
-            # Get density info after env.step (for privileged critic)
-            next_density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
-
-            with torch.no_grad():
-                with record_function("INFERENCE"):
-                    if self._compiled_inference is not None:
-                        torch.compiler.cudagraph_mark_step_begin()
-                        next_actions, next_log_probs, next_values, logits, features = self._compiled_inference(
-                            next_states, next_density_info
-                        )
-                    else:
-                        with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                            logits, features = self.policy.forward_with_features(next_states.float())
-                            dist = Categorical(logits=logits, validate_args=False)
-                            next_actions = dist.sample()
-                            next_log_probs = dist.log_prob(next_actions)
-                            next_values = self.value_head(features, next_density_info).squeeze(-1)
-
-            # Store logits for action_probs logging
-            last_logits = logits
-            self.profiler.tick("Inference")
 
             # Carry forward for next iteration
             states = next_states
