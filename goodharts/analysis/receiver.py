@@ -12,7 +12,31 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..training.train_log import ExtendedJSONEncoder
+
+class ExtendedJSONEncoder(json.JSONEncoder):
+    """JSON Encoder that handles NumPy and PyTorch types."""
+    def default(self, obj):
+        try:
+            import numpy as np
+            if isinstance(obj, (np.integer, np.int64, np.int32)):
+                return int(obj)
+            if isinstance(obj, (np.floating, np.float32, np.float64)):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+        except ImportError:
+            pass
+
+        try:
+            import torch
+            if isinstance(obj, torch.Tensor):
+                if obj.numel() == 1:
+                    return obj.item()
+                return obj.tolist()
+        except ImportError:
+            pass
+
+        return super().default(obj)
 
 
 @dataclass

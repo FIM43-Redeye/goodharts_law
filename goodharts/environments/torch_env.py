@@ -702,10 +702,14 @@ class TorchVecEnv(nn.Module):
         rand_y = torch.randint(0, self.height, (N, K), device=self.device)
         rand_x = torch.randint(0, self.width, (N, K), device=self.device)
 
-        # Check which candidates are empty
+        # Check which candidates are empty AND not on agent positions
         grid_read_ids = self.grid_indices.unsqueeze(1)  # (N, 1)
         vals = self.grids[grid_read_ids, rand_y, rand_x]  # (N, K)
         is_empty = (vals == self._cell_empty)  # (N, K) bool
+
+        # Exclude agent positions (agents aren't marked on grid anymore)
+        is_agent_pos = (rand_y == self.agent_y.unsqueeze(1)) & (rand_x == self.agent_x.unsqueeze(1))
+        is_empty = is_empty & ~is_agent_pos
 
         # Select first valid candidate (argmax returns index of first True)
         first_valid_idx = is_empty.int().argmax(dim=1)  # (N,)
