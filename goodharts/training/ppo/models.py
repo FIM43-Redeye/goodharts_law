@@ -123,7 +123,10 @@ class PopArtValueHead(nn.Module):
 
         # Count-based adaptive beta: starts at 1.0 and decays to beta_min
         # This naturally handles cold start without needing special init logic
-        self._update_count = 0
+        # IMPORTANT: Must be a buffer (not Python int) for:
+        # 1. Proper save/restore with state_dict (fixes warmup restoration)
+        # 2. CUDA graph compatibility (no Python int increment)
+        self.register_buffer('_update_count', torch.zeros(1, dtype=torch.long))
 
     def _combine_features(self, features: torch.Tensor, aux: torch.Tensor = None) -> torch.Tensor:
         """Combine features with auxiliary inputs if present."""
@@ -180,13 +183,17 @@ class PopArtValueHead(nn.Module):
         cold start without needing special init logic.
 
         IMPORTANT: All operations stay on GPU - no .item() or CPU transfers.
+        Uses tensor ops (not Python ints) for CUDA graph compatibility.
         """
         with torch.no_grad():
-            self._update_count += 1
+            # Increment count (tensor op, not Python int)
+            self._update_count.add_(1)
 
             # Adaptive beta: 1/count decays from 1.0 toward 0, clamped at beta_min
             # First update: beta=1.0 (full init), second: 0.5, third: 0.33, etc.
-            beta = max(1.0 / self._update_count, self.beta_min)
+            # Use tensor ops to stay on GPU and be graph-compatible
+            count_float = self._update_count.float()
+            beta = torch.clamp(1.0 / count_float, min=self.beta_min)
 
             # Compute batch statistics (stays on GPU)
             batch_mean = returns.mean()
@@ -198,7 +205,8 @@ class PopArtValueHead(nn.Module):
 
             # Update running statistics with adaptive EMA
             # mean = (1 - beta) * mean + beta * batch_mean
-            self.mean.mul_(1 - beta).add_(batch_mean, alpha=beta)
+            # Use explicit multiplication (not alpha=) since beta is a tensor
+            self.mean.mul_(1 - beta).add_(batch_mean * beta)
 
             # For std, we EMA the variance then sqrt
             old_var = old_std * old_std
