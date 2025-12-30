@@ -20,56 +20,76 @@ def test_proxy_observations_contain_interestingness(config):
     """Proxy mode observations should have interestingness values, not zeros."""
     spec = ObservationSpec.for_mode('proxy', config)
     env = create_torch_vec_env(n_envs=4, obs_spec=spec, config=config)
-    
+
     obs = env.reset()
-    
-    # Channels 2-5 are interestingness in proxy mode
-    interestingness_channels = obs[:, 2:, :, :]
-    
-    # Should NOT be all zeros
-    assert interestingness_channels.max().item() > 0, \
-        "Interestingness channels are all zeros - proxy encoding is broken!"
-    
-    # Food has interestingness 1.0, poison 0.9
+
+    # Both channels contain interestingness values
+    assert obs.shape[1] == 2, "Proxy mode should have 2 channels"
+
+    # Should have non-zero values (food/poison have interestingness)
+    assert obs.max().item() > 0, \
+        "Proxy observations are all zeros - encoding is broken!"
+
+    # Food has interestingness 0.5, poison 1.0
     # We should see these values in the observations
-    nonzero_mask = interestingness_channels > 0
-    unique_values = torch.unique(interestingness_channels[nonzero_mask])
+    nonzero_mask = obs > 0
+    unique_values = torch.unique(obs[nonzero_mask])
     assert len(unique_values) > 0, "No non-zero interestingness values found"
 
 
-def test_proxy_food_poison_nearly_identical(config):
-    """In proxy mode, food and poison should have similar interestingness."""
+def test_proxy_channels_identical(config):
+    """In proxy mode, both channels should have identical values."""
     spec = ObservationSpec.for_mode('proxy', config)
     env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config)
-    
+
     obs = env.reset()
-    
-    # Get interestingness channel (channel 2)
-    interestingness = obs[0, 2, :, :]
-    
-    # Find cells with high interestingness (>0.8) 
-    # Both food (1.0) and poison (0.9) qualify
-    high_interest = interestingness > 0.8
-    
-    # Should have multiple high-interest cells (mix of food and poison)
-    assert high_interest.sum().item() > 0, "No high-interestingness cells visible"
+
+    # Both channels should be identical (same interestingness in both)
+    assert torch.allclose(obs[0, 0], obs[0, 1]), \
+        "Proxy channels should be identical (food/poison indistinguishable)"
+
+
+def test_proxy_food_poison_indistinguishable(config):
+    """In proxy mode, food and poison should look identical to the agent."""
+    spec = ObservationSpec.for_mode('proxy', config)
+    env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config)
+
+    # Place food and poison in known locations
+    env.agent_x[0] = 10
+    env.agent_y[0] = 10
+    env.grids[0, 5:16, 5:16] = CellType.EMPTY.value
+    env.grids[0, 10, 12] = CellType.FOOD.value    # +2 in x
+    env.grids[0, 10, 8] = CellType.POISON.value   # -2 in x
+
+    obs = env._get_observations()
+    r = 5  # view radius
+
+    # Get values at food and poison positions
+    food_ch0 = obs[0, 0, r, r + 2].item()
+    food_ch1 = obs[0, 1, r, r + 2].item()
+    poison_ch0 = obs[0, 0, r, r - 2].item()
+    poison_ch1 = obs[0, 1, r, r - 2].item()
+
+    # Both channels should have same value for each position
+    assert abs(food_ch0 - food_ch1) < 0.001, "Food channels differ"
+    assert abs(poison_ch0 - poison_ch1) < 0.001, "Poison channels differ"
 
 
 def test_ground_truth_food_poison_distinguishable(config):
     """In ground_truth mode, food and poison should be in separate channels."""
     spec = ObservationSpec.for_mode('ground_truth', config)
     env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config)
-    
+
     obs = env.reset()
-    
-    # Channel 2 is food (one-hot), channel 3 is poison (one-hot)
-    food_channel = obs[0, 2, :, :]
-    poison_channel = obs[0, 3, :, :]
-    
+
+    # Channel 0 is food, channel 1 is poison (2-channel encoding)
+    food_channel = obs[0, 0, :, :]
+    poison_channel = obs[0, 1, :, :]
+
     # Food and poison should be mutually exclusive
     overlap = (food_channel > 0.5) & (poison_channel > 0.5)
     assert overlap.sum().item() == 0, "Food and poison overlap in ground_truth mode"
-    
+
     # Both should have some cells
     assert food_channel.sum().item() > 0, "No food visible in ground_truth mode"
     assert poison_channel.sum().item() > 0, "No poison visible in ground_truth mode"
@@ -78,11 +98,9 @@ def test_ground_truth_food_poison_distinguishable(config):
 def test_property_based_encoding_extensible(config):
     """Any CellTypeInfo property should be usable as an observation channel."""
     # This tests extensibility - energy_reward is another property
-    # ObservationSpec is already imported at the top from goodharts.modes
-    
+
     # Verify that property_names includes expected properties
     property_names = CellType.FOOD.property_names()
     assert 'interestingness' in property_names
     assert 'energy_reward' in property_names
     assert 'energy_penalty' in property_names
-

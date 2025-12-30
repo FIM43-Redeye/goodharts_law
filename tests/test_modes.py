@@ -34,21 +34,23 @@ def mode_registry(config):
 
 class TestObservationSpec:
     """Tests for ObservationSpec configuration."""
-    
+
     def test_ground_truth_spec_channels(self, config):
-        """Ground truth mode should have one-hot channels."""
+        """Ground truth mode should have 2 channels (food, poison)."""
         spec = ObservationSpec.for_mode('ground_truth', config)
-        
-        # Should have channels for each cell type
-        assert spec.num_channels == CellType.num_types()
-    
+
+        # 2-channel encoding: [food, poison]
+        assert spec.num_channels == 2
+        assert 'food' in spec.channel_names
+        assert 'poison' in spec.channel_names
+
     def test_proxy_spec_channels(self, config):
-        """Proxy mode should have interestingness channels."""
+        """Proxy mode should have 2 interestingness channels."""
         spec = ObservationSpec.for_mode('proxy', config)
-        
-        # Proxy uses: empty, wall, then interestingness (replicated)
-        # Exact count depends on implementation, but should match ground_truth
-        assert spec.num_channels >= 2
+
+        # 2-channel encoding with identical interestingness values
+        assert spec.num_channels == 2
+        assert any('interestingness' in ch for ch in spec.channel_names)
     
     def test_spec_view_size_from_config(self, config):
         """View size should be derived from agent view_range."""

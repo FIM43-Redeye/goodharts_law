@@ -383,33 +383,26 @@ def update_brain_frame(frame, sim, viz, args):
     else:
         obs_cpu = obs
     
-    # Initialize RGB image (White background for empty? No, black typically)
+    # Initialize RGB image (black background for empty)
     c, h, w = obs_cpu.shape
-    rgb_img = np.full((h, w, 3), 0, dtype=np.uint8) 
-    
+    rgb_img = np.full((h, w, 3), 0, dtype=np.uint8)
+
     # Dynamic Legend tracking
     legend_elements = []
-    seen_types = set()
-    
-    # Iterate CellTypes to overlay colors
     CellType = sim.config['CellType']
-    render_order = [CellType.WALL, CellType.FOOD, CellType.POISON, CellType.PREDATOR, CellType.PREY]
-    
-    for c_type in render_order:
-        # Find explicit channel index for this type
-        # Naming convention provided by vec_env: "cell_{name}"
-        channel_name = f"cell_{c_type.name.lower()}"
-        
-        if channel_name in channel_names:
-            idx = channel_names.index(channel_name)
-            # Use CPU observation for masking
-            mask = obs_cpu[idx] > 0.5
-            if mask.any():
-                rgb_img[mask] = c_type.color
-                
-                if c_type.name not in seen_types:
-                    seen_types.add(c_type.name)
-                    legend_elements.append(Patch(facecolor='#%02x%02x%02x' % c_type.color, label=f"{c_type.name}"))
+
+    # 2-channel encoding: channel 0 = food, channel 1 = poison
+    # Ground truth: Food=[1,0], Poison=[0,1], Empty=[0,0]
+    food_mask = obs_cpu[0] > 0.5
+    poison_mask = obs_cpu[1] > 0.5
+
+    if food_mask.any():
+        rgb_img[food_mask] = CellType.FOOD.color
+        legend_elements.append(Patch(facecolor='#%02x%02x%02x' % CellType.FOOD.color, label="Food"))
+
+    if poison_mask.any():
+        rgb_img[poison_mask] = CellType.POISON.color
+        legend_elements.append(Patch(facecolor='#%02x%02x%02x' % CellType.POISON.color, label="Poison"))
                     
     # Paint Self (Center)
     cx, cy = h // 2, w // 2

@@ -78,21 +78,15 @@ _cell_types_cache: dict[str, CellTypeInfo] | None = None
 # Mapping from uppercase class attribute names to TOML section names
 _CELL_TYPE_NAMES = {
     'EMPTY': 'empty',
-    'WALL': 'wall',
     'FOOD': 'food',
     'POISON': 'poison',
-    'PREY': 'prey',
-    'PREDATOR': 'predator',
 }
 
 # Integer values for each cell type (these are structural, not config)
 _CELL_TYPE_VALUES = {
     'empty': 0,
-    'wall': 1,
-    'food': 2,
-    'poison': 3,
-    'prey': 4,
-    'predator': 5,
+    'food': 1,
+    'poison': 2,
 }
 
 
@@ -151,21 +145,18 @@ class CellType:
     Registry of all cell types with their intrinsic properties.
 
     Properties are loaded lazily from TOML config on first access.
-    The integer values (0-5) are structural and defined in code.
+    The integer values (0-2) are structural and defined in code.
 
     Usage:
-        CellType.FOOD.value          # 2
-        CellType.FOOD.energy_delta   # 5.0 (from config)
-        CellType.FOOD.interestingness # 1.0 (from config)
+        CellType.FOOD.value          # 1
+        CellType.FOOD.energy_delta   # 1.0 (from config)
+        CellType.FOOD.interestingness # 0.5 (from config)
         CellType.all_types()         # List of all CellTypeInfo
     """
     # Descriptors for lazy-loading from TOML
     EMPTY = _CellTypeDescriptor('empty')
-    WALL = _CellTypeDescriptor('wall')
     FOOD = _CellTypeDescriptor('food')
     POISON = _CellTypeDescriptor('poison')
-    PREY = _CellTypeDescriptor('prey')
-    PREDATOR = _CellTypeDescriptor('predator')
 
     @classmethod
     def by_value(cls, value: int) -> CellTypeInfo | None:

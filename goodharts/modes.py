@@ -394,8 +394,8 @@ class HandholdRewards(RewardComputer):
         return rewards
 
     def _compute_potentials(self, states: torch.Tensor) -> torch.Tensor:
-        # Potential-based shaping toward food (channel 2 in ground truth obs)
-        target = states[:, 2, :, :] > 0.5
+        # Potential-based shaping toward food (channel 0 in ground truth obs)
+        target = states[:, 0, :, :] > 0.5
         return self._calculate_potential_from_target(states, target, self.FOOD_SHAPING_COEF)
 
 
@@ -491,14 +491,21 @@ class ModeSpec:
 # =============================================================================
 
 def _get_modes(config: dict) -> dict[str, ModeSpec]:
-    """Build mode registry from config. Called once at startup."""
-    CellType = config['CellType']
-    gt_channels = [f"cell_{ct.name.lower()}" for ct in CellType.all_types()]
-    gt_count = len(gt_channels)
-    
-    # Proxy channels: empty, wall, then interestingness repeated to match count
-    proxy_channels = ['cell_empty', 'cell_wall'] + ['interestingness'] * (gt_count - 2)
-    
+    """
+    Build mode registry from config. Called once at startup.
+
+    Observation encoding (2 channels for all modes):
+        Ground truth: Food=[1,0], Poison=[0,1], Empty=[0,0]
+        Proxy:        Food=[i,i], Poison=[i,i], Empty=[0,0]
+                      where i = cell's interestingness value
+
+    The proxy agent sees the same interestingness value in both channels,
+    so it cannot distinguish food from poison - only magnitude matters.
+    """
+    # Fixed 2-channel design (same shape for all modes)
+    gt_channels = ['food', 'poison']
+    proxy_channels = ['interestingness_0', 'interestingness_1']
+
     return {
         'ground_truth': ModeSpec(
             name='ground_truth',

@@ -10,13 +10,21 @@ while ground-truth-trained models avoid it.
 import torch
 import torch.nn.functional as F
 import numpy as np
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from pathlib import Path
-from typing import Callable
 
 from goodharts.behaviors.brains import load_brain
-from goodharts.behaviors import LearnedBehavior
 from goodharts.utils.device import get_device
+
+
+# Dark theme colors
+COLORS = {
+    'background': '#1a1a2e',
+    'paper': '#16213e',
+    'text': '#e0e0e0',
+    'grid': 'rgba(128, 128, 128, 0.15)',
+}
 
 
 def compute_gradient_saliency(
@@ -26,40 +34,40 @@ def compute_gradient_saliency(
 ) -> np.ndarray:
     """
     Compute gradient-based saliency map.
-    
+
     The saliency shows how much each input pixel affects the output.
     Higher values = more important for the decision.
-    
+
     Args:
         model: Neural network model
-        input_tensor: Input of shape (1, 1, H, W) with requires_grad=True
+        input_tensor: Input of shape (1, C, H, W) with requires_grad=True
         target_action: Action index to compute saliency for.
                       If None, uses the model's predicted action.
-    
+
     Returns:
-        Saliency map as numpy array of shape (H, W)
+        Saliency map as numpy array of shape (H, W) or (C, H, W)
     """
     model.eval()
-    
+
     # Ensure input requires grad
     input_tensor = input_tensor.clone().detach().requires_grad_(True)
-    
+
     # Forward pass
     output = model(input_tensor)
-    
+
     if target_action is None:
         target_action = output.argmax(dim=1).item()
-    
+
     # Backward pass to get gradients
     model.zero_grad()
     output[0, target_action].backward()
-    
+
     # Get gradient w.r.t. input
     grad = input_tensor.grad.data.abs()
-    
-    # Remove batch and channel dims: (1, 1, H, W) -> (H, W)
-    saliency = grad.squeeze().cpu().numpy()
-    
+
+    # Remove batch dim: (1, C, H, W) -> (C, H, W) or (H, W)
+    saliency = grad.squeeze(0).cpu().numpy()
+
     return saliency
 
 
@@ -70,44 +78,44 @@ def compute_guided_backprop_saliency(
 ) -> np.ndarray:
     """
     Compute Guided Backpropagation saliency.
-    
+
     This variant only backpropagates positive gradients through ReLUs,
     producing cleaner, more focused saliency maps.
-    
+
     Works with arbitrary model architectures that use ReLU.
     """
     model.eval()
-    
+
     # Store hooks to modify gradients
     handles = []
-    
+
     def relu_backward_hook(module, grad_in, grad_out):
         # Only allow positive gradients
         return (F.relu(grad_in[0]),)
-    
+
     # Register hooks on all ReLU layers
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.ReLU):
             handle = module.register_full_backward_hook(relu_backward_hook)
             handles.append(handle)
-    
+
     try:
         input_tensor = input_tensor.clone().detach().requires_grad_(True)
         output = model(input_tensor)
-        
+
         if target_action is None:
             target_action = output.argmax(dim=1).item()
-        
+
         model.zero_grad()
         output[0, target_action].backward()
-        
+
         grad = input_tensor.grad.data.abs()
-        saliency = grad.squeeze().cpu().numpy()
+        saliency = grad.squeeze(0).cpu().numpy()
     finally:
         # Remove hooks
         for handle in handles:
             handle.remove()
-    
+
     return saliency
 
 
@@ -120,57 +128,64 @@ def compute_integrated_gradients(
 ) -> np.ndarray:
     """
     Compute Integrated Gradients attribution.
-    
+
     This is a more principled attribution method that satisfies
     desirable axioms like sensitivity and implementation invariance.
-    
+
     Integrates gradients along the path from a baseline (default: zeros)
     to the actual input.
     """
     model.eval()
-    
+
     if baseline is None:
         baseline = torch.zeros_like(input_tensor)
-    
+
     # Determine target action from original input
     with torch.no_grad():
         output = model(input_tensor)
         if target_action is None:
             target_action = output.argmax(dim=1).item()
-    
+
     # Compute integrated gradients
     scaled_inputs = [
         baseline + (float(i) / steps) * (input_tensor - baseline)
         for i in range(1, steps + 1)
     ]
-    
+
     gradients = []
     for scaled_input in scaled_inputs:
         scaled_input = scaled_input.clone().detach().requires_grad_(True)
         output = model(scaled_input)
-        
+
         model.zero_grad()
         output[0, target_action].backward()
-        
+
         gradients.append(scaled_input.grad.data.clone())
-    
+
     # Average gradients and multiply by (input - baseline)
     avg_gradients = torch.stack(gradients).mean(dim=0)
     integrated_grad = (input_tensor - baseline) * avg_gradients
-    
-    saliency = integrated_grad.abs().squeeze().cpu().numpy()
-    
+
+    saliency = integrated_grad.abs().squeeze(0).cpu().numpy()
+
     return saliency
+
+
+def _aggregate_channels(arr: np.ndarray) -> np.ndarray:
+    """Aggregate multi-channel array to 2D for visualization."""
+    if arr.ndim == 3:
+        return arr.sum(axis=0)
+    return arr
 
 
 def visualize_saliency(
     model: torch.nn.Module,
     view: np.ndarray,
     method: str = 'gradient',
-    figsize: tuple[int, int] = (12, 4),
     save_path: str | None = None,
     title_prefix: str = '',
-) -> plt.Figure:
+    show: bool = True,
+) -> go.Figure:
     """
     Create a visualization of input view alongside saliency map.
 
@@ -178,12 +193,12 @@ def visualize_saliency(
         model: Trained neural network
         view: Agent's view as numpy array (H, W) or (C, H, W)
         method: 'gradient', 'guided', or 'integrated'
-        figsize: Figure size
         save_path: If provided, save figure to this path
         title_prefix: Prefix for plot title (e.g., "Ground Truth Model")
+        show: If True, display the figure
 
     Returns:
-        matplotlib Figure object
+        Plotly Figure object
     """
     device = next(model.parameters()).device
 
@@ -195,8 +210,8 @@ def visualize_saliency(
     elif view.ndim == 3:
         # Multi-channel: (C, H, W) -> (1, C, H, W)
         input_tensor = torch.from_numpy(view).float().unsqueeze(0).to(device)
-        # For display, sum channels or use first channel
-        view_display = view.sum(axis=0)  # Aggregate for visualization
+        # For display, sum channels
+        view_display = view.sum(axis=0)
     else:
         raise ValueError(f"Expected 2D or 3D view, got shape {view.shape}")
 
@@ -217,37 +232,64 @@ def visualize_saliency(
     else:
         raise ValueError(f"Unknown method: {method}")
 
-    # Handle multi-channel saliency output
-    if saliency.ndim == 3:
-        saliency = saliency.sum(axis=0)  # Aggregate across channels
+    # Aggregate multi-channel saliency to 2D
+    saliency = _aggregate_channels(saliency)
 
-    # Create figure
-    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    # Create subplot figure
+    fig = make_subplots(
+        rows=1, cols=3,
+        subplot_titles=["Agent's View", f"Saliency ({method})",
+                       f"Overlay (action={action_idx}, conf={confidence:.2f})"],
+        horizontal_spacing=0.08,
+    )
 
-    # Original view
-    im0 = axes[0].imshow(view_display, cmap='viridis')
-    axes[0].set_title("Agent's View")
-    plt.colorbar(im0, ax=axes[0], fraction=0.046)
+    # Plot 1: Original view (viridis colorscale)
+    fig.add_trace(
+        go.Heatmap(z=view_display, colorscale='Viridis', showscale=True,
+                   colorbar=dict(x=0.28, len=0.9)),
+        row=1, col=1
+    )
 
-    # Saliency map
-    im1 = axes[1].imshow(saliency, cmap='hot')
-    axes[1].set_title(f"Saliency ({method})")
-    plt.colorbar(im1, ax=axes[1], fraction=0.046)
+    # Plot 2: Saliency map (hot colorscale)
+    fig.add_trace(
+        go.Heatmap(z=saliency, colorscale='Hot', showscale=True,
+                   colorbar=dict(x=0.63, len=0.9)),
+        row=1, col=2
+    )
 
-    # Overlay
-    axes[2].imshow(view_display, cmap='viridis', alpha=0.5)
-    axes[2].imshow(saliency, cmap='hot', alpha=0.5)
-    axes[2].set_title(f"Overlay (action={action_idx}, conf={confidence:.2f})")
+    # Plot 3: Overlay - normalize and blend
+    view_norm = (view_display - view_display.min()) / (view_display.max() - view_display.min() + 1e-8)
+    sal_norm = (saliency - saliency.min()) / (saliency.max() - saliency.min() + 1e-8)
+    overlay = 0.5 * view_norm + 0.5 * sal_norm
 
-    for ax in axes:
-        ax.axis('off')
+    fig.add_trace(
+        go.Heatmap(z=overlay, colorscale='Turbo', showscale=True,
+                   colorbar=dict(x=0.98, len=0.9)),
+        row=1, col=3
+    )
 
-    fig.suptitle(f"{title_prefix} - {method.title()} Saliency" if title_prefix else f"{method.title()} Saliency")
-    plt.tight_layout()
+    # Update layout
+    title = f"{title_prefix} - {method.title()} Saliency" if title_prefix else f"{method.title()} Saliency"
+    fig.update_layout(
+        title=dict(text=title, x=0.5, font=dict(size=16, color=COLORS['text'])),
+        plot_bgcolor=COLORS['paper'],
+        paper_bgcolor=COLORS['background'],
+        font=dict(color=COLORS['text']),
+        height=400,
+        width=1200,
+    )
+
+    # Make axes square and hide ticks
+    for i in range(1, 4):
+        fig.update_xaxes(showticklabels=False, showgrid=False, row=1, col=i)
+        fig.update_yaxes(showticklabels=False, showgrid=False, autorange='reversed', row=1, col=i)
 
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        fig.write_image(save_path, scale=2)
         print(f"Saved: {save_path}")
+
+    if show:
+        fig.show()
 
     return fig
 
@@ -258,17 +300,23 @@ def compare_models_saliency(
     view: np.ndarray,
     method: str = 'gradient',
     save_path: str | None = None,
-) -> plt.Figure:
+    show: bool = True,
+) -> go.Figure:
     """
     Side-by-side comparison of saliency from ground-truth vs proxy models.
-    
+
     This is the key visualization for demonstrating Goodhart's Law:
     show that the proxy model attends to poison (high interestingness)
     while the ground-truth model avoids it.
     """
     device = next(ground_truth_model.parameters()).device
-    input_tensor = torch.from_numpy(view).float().unsqueeze(0).unsqueeze(0).to(device)
-    
+
+    # Handle different input shapes
+    if view.ndim == 2:
+        input_tensor = torch.from_numpy(view).float().unsqueeze(0).unsqueeze(0).to(device)
+    else:
+        input_tensor = torch.from_numpy(view).float().unsqueeze(0).to(device)
+
     # Compute saliencies
     if method == 'gradient':
         sal_gt = compute_gradient_saliency(ground_truth_model, input_tensor)
@@ -279,39 +327,73 @@ def compare_models_saliency(
     else:
         sal_gt = compute_integrated_gradients(ground_truth_model, input_tensor)
         sal_proxy = compute_integrated_gradients(proxy_model, input_tensor.clone())
-    
-    # Create figure
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-    
-    # Original view
-    im0 = axes[0].imshow(view, cmap='viridis')
-    axes[0].set_title("Agent's View")
-    
-    # Ground truth saliency
-    im1 = axes[1].imshow(sal_gt, cmap='hot')
-    axes[1].set_title("Ground Truth Model")
-    
-    # Proxy saliency
-    im2 = axes[2].imshow(sal_proxy, cmap='hot')
-    axes[2].set_title("Proxy Model")
-    
-    # Difference (proxy - ground_truth)
+
+    # Aggregate to 2D
+    sal_gt = _aggregate_channels(sal_gt)
+    sal_proxy = _aggregate_channels(sal_proxy)
+    view_display = _aggregate_channels(view)
+
+    # Difference map
     diff = sal_proxy - sal_gt
     max_abs = max(abs(diff.min()), abs(diff.max())) or 1
-    im3 = axes[3].imshow(diff, cmap='RdBu_r', vmin=-max_abs, vmax=max_abs)
-    axes[3].set_title("Difference (Proxy - GT)")
-    
-    for ax in axes:
-        ax.axis('off')
-    
-    plt.colorbar(im3, ax=axes[3], fraction=0.046)
-    fig.suptitle("Saliency Comparison: Ground Truth vs Proxy Training")
-    plt.tight_layout()
-    
+
+    # Create figure
+    fig = make_subplots(
+        rows=1, cols=4,
+        subplot_titles=["Agent's View", "Ground Truth Model",
+                       "Proxy Model", "Difference (Proxy - GT)"],
+        horizontal_spacing=0.06,
+    )
+
+    # Plot 1: Original view
+    fig.add_trace(
+        go.Heatmap(z=view_display, colorscale='Viridis', showscale=False),
+        row=1, col=1
+    )
+
+    # Plot 2: Ground truth saliency
+    fig.add_trace(
+        go.Heatmap(z=sal_gt, colorscale='Hot', showscale=False),
+        row=1, col=2
+    )
+
+    # Plot 3: Proxy saliency
+    fig.add_trace(
+        go.Heatmap(z=sal_proxy, colorscale='Hot', showscale=False),
+        row=1, col=3
+    )
+
+    # Plot 4: Difference (diverging colorscale)
+    fig.add_trace(
+        go.Heatmap(z=diff, colorscale='RdBu_r', zmid=0,
+                   zmin=-max_abs, zmax=max_abs, showscale=True,
+                   colorbar=dict(x=1.02, len=0.9)),
+        row=1, col=4
+    )
+
+    # Update layout
+    fig.update_layout(
+        title=dict(text="Saliency Comparison: Ground Truth vs Proxy Training",
+                  x=0.5, font=dict(size=16, color=COLORS['text'])),
+        plot_bgcolor=COLORS['paper'],
+        paper_bgcolor=COLORS['background'],
+        font=dict(color=COLORS['text']),
+        height=400,
+        width=1400,
+    )
+
+    # Make axes square and hide ticks
+    for i in range(1, 5):
+        fig.update_xaxes(showticklabels=False, showgrid=False, row=1, col=i)
+        fig.update_yaxes(showticklabels=False, showgrid=False, autorange='reversed', row=1, col=i)
+
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        fig.write_image(save_path, scale=2)
         print(f"Saved comparison to {save_path}")
-    
+
+    if show:
+        fig.show()
+
     return fig
 
 
@@ -345,17 +427,17 @@ def load_model_from_path(model_path: str, device: torch.device = None) -> tuple[
 def find_default_model() -> str:
     """Find the first available model in the models directory."""
     models_dir = Path(__file__).parent.parent.parent / 'models'
-    
+
     # Prefer ground_truth.pth if it exists
     preferred = models_dir / 'ground_truth.pth'
     if preferred.exists():
         return str(preferred)
-    
+
     # Otherwise, find any .pth file
     pth_files = list(models_dir.glob('*.pth'))
     if pth_files:
         return str(pth_files[0])
-    
+
     raise FileNotFoundError(f"No .pth files found in {models_dir}")
 
 
@@ -368,7 +450,7 @@ def analyze_model_attention(
 ):
     """
     Load a model and generate saliency visualizations on sample views.
-    
+
     Args:
         model_path: Path to model weights. If None, auto-detects from models/
         config: Simulation config. If None, uses default config.
@@ -421,34 +503,23 @@ def analyze_model_attention(
     # Generate visualizations
     print(f"Generating saliency maps...")
     for i in range(min(num_samples, len(all_views))):
-        view = all_views[i]  # Shape: (C, H, W)
-        
-        # Handle multi-channel views for saliency - aggregate across channels
-        if view.ndim == 3:
-            # Sum across channels for visualization (shows overall attention)
-            view_2d = view.sum(axis=0)
-        else:
-            view_2d = view
-        
+        view = all_views[i].cpu().numpy()  # Shape: (C, H, W) or (H, W)
+
         save_path = f"{output_dir}/{model_name}_saliency_{i}.png"
-        fig = visualize_saliency(
-            model, view, 
-            method='gradient', 
-            save_path=save_path, 
-            title_prefix=model_name
+        visualize_saliency(
+            model, view,
+            method='gradient',
+            save_path=save_path,
+            title_prefix=model_name,
+            show=show,
         )
-        
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
-    
+
     print(f"Generated {num_samples} saliency visualizations in {output_dir}/")
 
 
 if __name__ == "__main__":
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Generate saliency visualizations for trained models")
     parser.add_argument('--model', type=str, default=None,
                         help='Path to trained model (default: auto-detect from models/)')
@@ -459,12 +530,10 @@ if __name__ == "__main__":
     parser.add_argument('--no-show', action='store_true',
                         help='Save images without displaying')
     args = parser.parse_args()
-    
+
     analyze_model_attention(
         model_path=args.model,
         output_dir=args.output,
         num_samples=args.samples,
         show=not args.no_show,
     )
-
-

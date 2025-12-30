@@ -1,5 +1,5 @@
 """
-Evaluation Dashboard for trained Goodhart agents.
+Testing Dashboard for trained Goodhart agents.
 
 Clean visualization with timestep-synchronized X-axes across all modes.
 Shows efficiency divergence between ground-truth and proxy agents in real time.
@@ -8,26 +8,25 @@ Layout:
 - Left (75%): 3 stacked line plots (Efficiency, Deaths, Survival) with modes overlaid
 - Right (25%): Live stats panel with per-mode numbers
 
-Uses process isolation for zero overhead on the evaluation thread.
+Uses process isolation for zero overhead on the testing thread.
 """
 
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from matplotlib.animation import FuncAnimation
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional
 import queue
-import time
 import multiprocessing as mp
 from multiprocessing import Process, Queue as MPQueue
 import threading
 
-from goodharts.evaluation.evaluator import DeathEvent
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from dash import Dash, dcc, html
+from dash.dependencies import Input, Output
 
 
 # Dashboard constants
-ANIMATION_INTERVAL_MS = 100       # Fast updates for "evolving" feel
+UPDATE_INTERVAL_MS = 100          # Fast updates for "evolving" feel
 QUEUE_POLL_TIMEOUT = 0.02         # Queue poll timeout
 QUEUE_MAX_SIZE = 2000             # Max queue size
 ROLLING_WINDOW = 20               # Window for rolling average survival
@@ -41,6 +40,14 @@ MODE_COLORS = {
     'ground_truth_blinded': '#ffaa00',   # Orange
 }
 DEFAULT_COLOR = '#00aaff'           # Cyan fallback
+
+# Dark theme
+THEME = {
+    'background': '#1a1a2e',
+    'paper': '#16213e',
+    'text': '#e0e0e0',
+    'grid': 'rgba(128, 128, 128, 0.15)',
+}
 
 
 def get_mode_color(mode: str) -> str:
@@ -140,9 +147,9 @@ class ModeStats:
         return 0.0
 
 
-class EvalDashboard:
+class TestingDashboard:
     """
-    Real-time evaluation dashboard with synchronized timestep axes.
+    Real-time testing dashboard with synchronized timestep axes.
 
     Layout:
     - Left column: 3 stacked plots (Efficiency, Deaths, Survival)
@@ -154,9 +161,9 @@ class EvalDashboard:
     def __init__(self, modes: list[str], total_timesteps: int, stop_event=None):
         """
         Args:
-            modes: List of modes being evaluated
+            modes: List of modes being tested
             total_timesteps: Target timesteps (for X-axis scaling)
-            stop_event: Optional event to signal evaluation should stop
+            stop_event: Optional event to signal testing should stop
         """
         self.modes = modes
         self.total_timesteps = total_timesteps
@@ -171,13 +178,12 @@ class EvalDashboard:
         self.update_queue: queue.Queue = queue.Queue()
 
         # UI state
-        self.fig = None
-        self.axes: dict[str, Any] = {}
-        self.lines: dict[str, dict[str, Any]] = {}  # mode -> plot_name -> line
-        self.stat_texts: dict[str, Any] = {}        # mode -> text artist
         self.running = True
         self.is_complete = False
-        self.dirty = True  # Start dirty to draw initial state
+        self.dirty = True
+
+        # Trace indices for updating
+        self._trace_indices: dict[str, dict[str, int]] = {}
 
     def send_checkpoint(self, mode: str, timesteps: int, food: int, poison: int,
                         deaths: int, survival_times: list[int]):
@@ -192,7 +198,7 @@ class EvalDashboard:
             pass
 
     def send_complete(self, mode: str):
-        """Signal that a mode has finished evaluation."""
+        """Signal that a mode has finished testing."""
         try:
             self.update_queue.put_nowait(('complete', mode, None))
             self.dirty = True
@@ -225,233 +231,254 @@ class EvalDashboard:
         if all(s.is_complete for s in self.stats.values()):
             self.is_complete = True
 
-    def _create_figure(self):
-        """Create matplotlib figure with 3-plot + stats layout."""
-        plt.style.use('dark_background')
+    def _create_figure(self) -> go.Figure:
+        """Create Plotly figure with 3 subplots + annotations for stats."""
+        # Create subplots: 3 rows for plots
+        fig = make_subplots(
+            rows=3, cols=1,
+            subplot_titles=['Efficiency (food / total consumed)',
+                           'Cumulative Deaths',
+                           f'Survival Time (rolling avg, window={ROLLING_WINDOW})'],
+            vertical_spacing=0.12,
+            row_heights=[0.33, 0.33, 0.34],
+        )
 
-        # Figure size
-        self.fig = plt.figure(figsize=(14, 8))
-        self.fig.patch.set_facecolor('#1a1a2e')
+        trace_idx = 0
 
-        # GridSpec: 3 rows, 4 columns (3 for plots, 1 for stats)
-        gs = gridspec.GridSpec(3, 4, figure=self.fig,
-                               width_ratios=[3, 3, 3, 2],
-                               hspace=0.3, wspace=0.3,
-                               left=0.06, right=0.98, top=0.92, bottom=0.08)
-
-        # Title
-        self.fig.suptitle('Evaluation Dashboard', fontsize=16,
-                         fontweight='bold', color='white')
-
-        # Create the 3 main plots (spanning columns 0-2)
-        self._create_efficiency_plot(gs[0, :3])
-        self._create_deaths_plot(gs[1, :3])
-        self._create_survival_plot(gs[2, :3])
-
-        # Create stats panel (column 3, all rows)
-        self._create_stats_panel(gs[:, 3])
-
-        # Initialize lines for each mode
-        self._init_mode_lines()
-
-        # Legend (in efficiency plot)
-        if len(self.modes) > 1:
-            self.axes['efficiency'].legend(loc='lower left', fontsize=9,
-                                           framealpha=0.7, facecolor='#2a2a4e')
-
-    def _create_efficiency_plot(self, gs_spec):
-        """Create efficiency over time plot."""
-        ax = self.fig.add_subplot(gs_spec)
-        ax.set_facecolor('#16213e')
-        ax.set_title('Efficiency (food / total consumed)', fontsize=11,
-                    color='white', fontweight='bold')
-        ax.set_ylabel('Efficiency', fontsize=10, color='gray')
-        ax.set_ylim(0, 1.05)
-        ax.set_xlim(0, self.total_timesteps)
-        ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.3, linewidth=1)
-        ax.axhline(y=1.0, color='#00ff88', linestyle='--', alpha=0.2, linewidth=1)
-        ax.grid(True, alpha=0.15, color='gray')
-        ax.tick_params(colors='gray', labelsize=9)
-        self.axes['efficiency'] = ax
-
-    def _create_deaths_plot(self, gs_spec):
-        """Create cumulative deaths plot."""
-        ax = self.fig.add_subplot(gs_spec)
-        ax.set_facecolor('#16213e')
-        ax.set_title('Cumulative Deaths', fontsize=11,
-                    color='white', fontweight='bold')
-        ax.set_ylabel('Deaths', fontsize=10, color='gray')
-        ax.set_xlim(0, self.total_timesteps)
-        ax.grid(True, alpha=0.15, color='gray')
-        ax.tick_params(colors='gray', labelsize=9)
-        self.axes['deaths'] = ax
-
-    def _create_survival_plot(self, gs_spec):
-        """Create rolling average survival time plot."""
-        ax = self.fig.add_subplot(gs_spec)
-        ax.set_facecolor('#16213e')
-        ax.set_title(f'Survival Time (rolling avg, window={ROLLING_WINDOW})',
-                    fontsize=11, color='white', fontweight='bold')
-        ax.set_ylabel('Steps', fontsize=10, color='gray')
-        ax.set_xlabel('Timesteps', fontsize=10, color='gray')
-        ax.set_xlim(0, self.total_timesteps)
-        ax.grid(True, alpha=0.15, color='gray')
-        ax.tick_params(colors='gray', labelsize=9)
-        self.axes['survival'] = ax
-
-    def _create_stats_panel(self, gs_spec):
-        """Create live stats panel."""
-        ax = self.fig.add_subplot(gs_spec)
-        ax.set_facecolor('#0f0f23')
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.axis('off')
-
-        # Title for stats panel
-        ax.text(0.5, 0.97, 'Live Stats', fontsize=13, fontweight='bold',
-               color='white', ha='center', va='top',
-               transform=ax.transAxes)
-
-        # Create text placeholders for each mode
-        n_modes = len(self.modes)
-        spacing = 0.85 / max(n_modes, 1)
-
-        for i, mode in enumerate(self.modes):
-            y_pos = 0.88 - (i * spacing)
-            color = get_mode_color(mode)
-
-            # Mode name header
-            ax.text(0.1, y_pos, mode, fontsize=11, fontweight='bold',
-                   color=color, ha='left', va='top',
-                   transform=ax.transAxes)
-
-            # Stats text (will be updated)
-            text = ax.text(0.1, y_pos - 0.05, '', fontsize=10,
-                          color='#cccccc', ha='left', va='top',
-                          transform=ax.transAxes, family='monospace',
-                          linespacing=1.4)
-            self.stat_texts[mode] = text
-
-        self.axes['stats'] = ax
-
-    def _init_mode_lines(self):
-        """Initialize line artists for each mode on each plot."""
+        # Add traces for each mode
         for mode in self.modes:
             color = get_mode_color(mode)
-            self.lines[mode] = {}
+            self._trace_indices[mode] = {}
 
-            # Efficiency line
-            line, = self.axes['efficiency'].plot(
-                [], [], color=color, linewidth=2, alpha=0.9, label=mode
+            # Efficiency trace
+            fig.add_trace(
+                go.Scatter(x=[], y=[], mode='lines', name=mode,
+                          line=dict(color=color, width=2),
+                          showlegend=True),
+                row=1, col=1
             )
-            self.lines[mode]['efficiency'] = line
+            self._trace_indices[mode]['efficiency'] = trace_idx
+            trace_idx += 1
 
-            # Deaths line
-            line, = self.axes['deaths'].plot(
-                [], [], color=color, linewidth=2, alpha=0.9
+            # Deaths trace
+            fig.add_trace(
+                go.Scatter(x=[], y=[], mode='lines', name=mode,
+                          line=dict(color=color, width=2),
+                          showlegend=False),
+                row=2, col=1
             )
-            self.lines[mode]['deaths'] = line
+            self._trace_indices[mode]['deaths'] = trace_idx
+            trace_idx += 1
 
-            # Survival line
-            line, = self.axes['survival'].plot(
-                [], [], color=color, linewidth=2, alpha=0.9
+            # Survival trace
+            fig.add_trace(
+                go.Scatter(x=[], y=[], mode='lines', name=mode,
+                          line=dict(color=color, width=2),
+                          showlegend=False),
+                row=3, col=1
             )
-            self.lines[mode]['survival'] = line
+            self._trace_indices[mode]['survival'] = trace_idx
+            trace_idx += 1
 
-    def _update_frame(self, frame):
-        """Animation update callback."""
-        if not self.running:
-            return []
+        # Layout
+        fig.update_layout(
+            title=dict(text='Testing Dashboard', x=0.5,
+                      font=dict(size=18, color=THEME['text'])),
+            plot_bgcolor=THEME['paper'],
+            paper_bgcolor=THEME['background'],
+            font=dict(color=THEME['text']),
+            height=800,
+            legend=dict(x=0.01, y=0.99, bgcolor='rgba(0,0,0,0.3)'),
+            margin=dict(r=250),  # Space for stats panel
+        )
 
-        # Process any pending updates
-        self._process_updates()
+        # Configure axes
+        fig.update_xaxes(range=[0, self.total_timesteps], gridcolor=THEME['grid'])
+        fig.update_yaxes(gridcolor=THEME['grid'])
 
-        # Skip redraw if nothing changed
-        if not self.dirty:
-            return []
-        self.dirty = False
+        # Efficiency Y-axis
+        fig.update_yaxes(range=[0, 1.05], row=1, col=1)
+        fig.add_hline(y=0.5, line_dash='dash', line_color='gray',
+                      opacity=0.3, row=1, col=1)
+        fig.add_hline(y=1.0, line_dash='dash', line_color='#00ff88',
+                      opacity=0.2, row=1, col=1)
 
-        all_artists = []
-        max_deaths = 0
-        max_survival = 0
+        # X-axis label on bottom plot only
+        fig.update_xaxes(title_text='Timesteps', row=3, col=1)
+
+        return fig
+
+    def _create_stats_annotations(self) -> list[dict]:
+        """Create annotations for the stats panel."""
+        annotations = []
+
+        # Title
+        annotations.append(dict(
+            text='<b>Live Stats</b>',
+            x=1.02, y=0.98,
+            xref='paper', yref='paper',
+            showarrow=False,
+            font=dict(size=14, color=THEME['text']),
+            xanchor='left',
+        ))
+
+        # Per-mode stats
+        y_pos = 0.90
+        spacing = 0.18
 
         for mode in self.modes:
             stats = self.stats[mode]
-            lines = self.lines[mode]
-
-            if not stats.timesteps:
-                continue
-
-            x = np.array(stats.timesteps)
-
-            # Update efficiency line
-            y_eff = np.array(stats.efficiency_history)
-            lines['efficiency'].set_data(x, y_eff)
-            all_artists.append(lines['efficiency'])
-
-            # Update deaths line
-            y_deaths = np.array(stats.cumulative_deaths)
-            lines['deaths'].set_data(x, y_deaths)
-            all_artists.append(lines['deaths'])
-            max_deaths = max(max_deaths, y_deaths[-1] if len(y_deaths) else 0)
-
-            # Update survival line
-            y_surv = np.array(stats.survival_rolling)
-            lines['survival'].set_data(x, y_surv)
-            all_artists.append(lines['survival'])
-            if len(y_surv) > 0:
-                max_survival = max(max_survival, np.max(y_surv))
-
-            # Update stats text
-            text = self.stat_texts[mode]
+            color = get_mode_color(mode)
             status = "DONE" if stats.is_complete else "running"
-            text.set_text(
-                f"Efficiency: {stats.current_efficiency:>6.1%}\n"
-                f"Deaths:     {stats.total_deaths:>6,}\n"
-                f"Survival:   {stats.current_survival_avg:>6.0f} steps\n"
-                f"Deaths/1k:  {stats.deaths_per_1k:>6.1f}\n"
+
+            # Mode name
+            annotations.append(dict(
+                text=f'<b>{mode}</b>',
+                x=1.02, y=y_pos,
+                xref='paper', yref='paper',
+                showarrow=False,
+                font=dict(size=12, color=color),
+                xanchor='left',
+            ))
+
+            # Stats text
+            stats_text = (
+                f"Efficiency: {stats.current_efficiency:>6.1%}<br>"
+                f"Deaths:     {stats.total_deaths:>6,}<br>"
+                f"Survival:   {stats.current_survival_avg:>6.0f} steps<br>"
+                f"Deaths/1k:  {stats.deaths_per_1k:>6.1f}<br>"
                 f"[{status}]"
             )
-            all_artists.append(text)
+            annotations.append(dict(
+                text=stats_text,
+                x=1.02, y=y_pos - 0.03,
+                xref='paper', yref='paper',
+                showarrow=False,
+                font=dict(size=10, color='#cccccc', family='monospace'),
+                xanchor='left',
+                align='left',
+            ))
 
-        # Auto-scale Y axes
-        if max_deaths > 0:
-            self.axes['deaths'].set_ylim(0, max_deaths * 1.1)
-        if max_survival > 0:
-            self.axes['survival'].set_ylim(0, max_survival * 1.2)
+            y_pos -= spacing
 
-        # Update title if complete
-        if self.is_complete:
-            self.fig.suptitle('Evaluation Complete (close window when done)',
-                            fontsize=16, fontweight='bold', color='#88ff88')
-
-        return all_artists
+        return annotations
 
     def run(self):
-        """Start the dashboard (blocking)."""
-        self._create_figure()
+        """Start the dashboard using Dash."""
+        app = Dash(__name__)
 
-        self.anim = FuncAnimation(
-            self.fig,
-            self._update_frame,
-            interval=ANIMATION_INTERVAL_MS,
-            blit=False,  # Need full redraw for text updates
-            cache_frame_data=False
+        # Dark theme - override ALL Dash containers
+        bg = THEME['background']
+        app.index_string = f'''
+<!DOCTYPE html>
+<html style="background: {bg} !important;">
+    <head>
+        {{%metas%}}
+        <title>Testing Dashboard</title>
+        {{%favicon%}}
+        {{%css%}}
+        <style>
+            html, body, #react-entry-point, ._dash-loading {{
+                background-color: {bg} !important;
+                background: {bg} !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                min-height: 100vh !important;
+            }}
+            body > div, #react-entry-point > div {{
+                background-color: {bg} !important;
+            }}
+        </style>
+    </head>
+    <body style="background: {bg} !important;">
+        {{%app_entry%}}
+        <footer>
+            {{%config%}}
+            {{%scripts%}}
+            {{%renderer%}}
+        </footer>
+    </body>
+</html>
+'''
+
+        fig = self._create_figure()
+
+        app.layout = html.Div([
+            dcc.Graph(id='live-graph', figure=fig),
+            dcc.Interval(id='interval', interval=UPDATE_INTERVAL_MS, n_intervals=0),
+        ], style={
+            'backgroundColor': THEME['background'],
+            'padding': '20px',
+            'minHeight': '100vh',
+        })
+
+        @app.callback(
+            Output('live-graph', 'figure'),
+            Input('interval', 'n_intervals')
         )
+        def update_graph(n):
+            self._process_updates()
 
-        plt.show()
+            fig = self._create_figure()
+
+            # Update data for each mode
+            for mode in self.modes:
+                stats = self.stats[mode]
+                indices = self._trace_indices[mode]
+
+                if not stats.timesteps:
+                    continue
+
+                x = stats.timesteps
+
+                # Update traces
+                fig.data[indices['efficiency']].x = x
+                fig.data[indices['efficiency']].y = stats.efficiency_history
+
+                fig.data[indices['deaths']].x = x
+                fig.data[indices['deaths']].y = stats.cumulative_deaths
+
+                fig.data[indices['survival']].x = x
+                fig.data[indices['survival']].y = stats.survival_rolling
+
+            # Auto-scale deaths Y-axis
+            max_deaths = max((s.total_deaths for s in self.stats.values()), default=0)
+            if max_deaths > 0:
+                fig.update_yaxes(range=[0, max_deaths * 1.1], row=2, col=1)
+
+            # Auto-scale survival Y-axis
+            max_survival = max(
+                (max(s.survival_rolling) if s.survival_rolling else 0
+                 for s in self.stats.values()),
+                default=0
+            )
+            if max_survival > 0:
+                fig.update_yaxes(range=[0, max_survival * 1.2], row=3, col=1)
+
+            # Add stats annotations
+            fig.update_layout(annotations=self._create_stats_annotations())
+
+            # Update title if complete
+            if self.is_complete:
+                fig.update_layout(title=dict(
+                    text='Testing Complete (close window when done)',
+                    font=dict(color='#88ff88')
+                ))
+
+            return fig
+
+        # Run server
+        app.run(debug=False, use_reloader=False, port=8051)
 
     def close(self):
         """Close the dashboard."""
         self.running = False
-        if self.fig:
-            plt.close(self.fig)
 
 
 def _dashboard_worker(modes: list[str], total_timesteps: int,
-                      update_queue: MPQueue, stop_event, eval_stop_event):
+                      update_queue: MPQueue, stop_event, testing_stop_event):
     """Worker function for dashboard process."""
-    dashboard = EvalDashboard(modes, total_timesteps, stop_event=eval_stop_event)
+    dashboard = TestingDashboard(modes, total_timesteps, stop_event=testing_stop_event)
 
     def poll_queue():
         """Poll multiprocessing queue and forward to dashboard."""
@@ -459,7 +486,7 @@ def _dashboard_worker(modes: list[str], total_timesteps: int,
             try:
                 item = update_queue.get(timeout=QUEUE_POLL_TIMEOUT)
                 if item is None:
-                    # Poison pill - evaluation done
+                    # Poison pill - testing done
                     dashboard.running = False
                     break
                 msg_type, mode, data = item
@@ -479,12 +506,12 @@ def _dashboard_worker(modes: list[str], total_timesteps: int,
         stop_event.set()
 
 
-class EvalDashboardProcess:
+class TestingDashboardProcess:
     """
-    Process-isolated evaluation dashboard.
+    Process-isolated testing dashboard.
 
-    Runs matplotlib in a separate process for zero overhead on evaluation.
-    Survives after evaluation completes so user can inspect results.
+    Runs Plotly/Dash in a separate process for zero overhead on testing.
+    Survives after testing completes so user can inspect results.
     """
 
     def __init__(self, modes: list[str], total_timesteps: int = 100000):
@@ -494,7 +521,7 @@ class EvalDashboardProcess:
         ctx = mp.get_context('spawn')
         self._queue: MPQueue = ctx.Queue(maxsize=QUEUE_MAX_SIZE)
         self._stop_event = ctx.Event()
-        self._eval_stop_event = ctx.Event()
+        self._testing_stop_event = ctx.Event()
         self._process: Optional[Process] = None
 
     def start(self):
@@ -503,7 +530,7 @@ class EvalDashboardProcess:
         self._process = ctx.Process(
             target=_dashboard_worker,
             args=(self.modes, self.total_timesteps,
-                  self._queue, self._stop_event, self._eval_stop_event),
+                  self._queue, self._stop_event, self._testing_stop_event),
             daemon=False  # Don't daemon - we want it to survive
         )
         self._process.start()
@@ -545,7 +572,7 @@ class EvalDashboardProcess:
 
     def should_stop(self) -> bool:
         """Check if user requested stop via dashboard."""
-        return self._eval_stop_event.is_set()
+        return self._testing_stop_event.is_set()
 
     def stop(self, timeout: float = 2.0):
         """Stop dashboard gracefully."""
@@ -567,7 +594,12 @@ class EvalDashboardProcess:
             self._process.join()
 
 
+# Legacy alias for backwards compatibility
+EvalDashboard = TestingDashboard
+EvalDashboardProcess = TestingDashboardProcess
+
+
 def create_testing_dashboard(modes: list[str],
-                             total_timesteps: int = 100000) -> EvalDashboardProcess:
-    """Factory for process-isolated evaluation dashboard."""
-    return EvalDashboardProcess(modes, total_timesteps)
+                             total_timesteps: int = 100000) -> TestingDashboardProcess:
+    """Factory for process-isolated testing dashboard."""
+    return TestingDashboardProcess(modes, total_timesteps)
