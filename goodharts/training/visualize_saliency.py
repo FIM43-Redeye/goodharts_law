@@ -344,7 +344,7 @@ def load_model_from_path(model_path: str, device: torch.device = None) -> tuple[
 
 def find_default_model() -> str:
     """Find the first available model in the models directory."""
-    models_dir = Path(__file__).parent.parent / 'models'
+    models_dir = Path(__file__).parent.parent.parent / 'models'
     
     # Prefer ground_truth.pth if it exists
     preferred = models_dir / 'ground_truth.pth'

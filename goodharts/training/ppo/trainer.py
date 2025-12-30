@@ -1763,9 +1763,15 @@ class PPOTrainer:
                     cfg.entropy_final * coef_progress
                 )
 
-                # Entropy floor: constant throughout training
-                # Model needs some stochasticity to handle randomized environments
-                current_entropy_floor = cfg.entropy_floor
+                # Entropy floor: constant during learning phase, then decays
+                # Phase 1 (0 to decay_fraction): constant floor for stability while learning
+                # Phase 2 (decay_fraction to 1): floor decays to 0, allowing determinism
+                if progress < cfg.entropy_decay_fraction:
+                    current_entropy_floor = cfg.entropy_floor
+                else:
+                    # Linear decay from entropy_floor to 0 over remaining training
+                    floor_progress = (progress - cfg.entropy_decay_fraction) / (1 - cfg.entropy_decay_fraction)
+                    current_entropy_floor = cfg.entropy_floor * (1 - floor_progress)
 
                 # LR decay: reduce learning rate over training for fine-tuning
                 if cfg.lr_decay:
