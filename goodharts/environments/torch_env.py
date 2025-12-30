@@ -218,6 +218,26 @@ class TorchVecEnv:
         self._density_poison_mid = (poison_min + poison_max) / 2.0
         self._density_poison_scale = (poison_max - poison_min) / 2.0 if poison_max > poison_min else 1.0
 
+    def _grid_scatter(self, grid_ids: torch.Tensor, y: torch.Tensor,
+                      x: torch.Tensor, values: torch.Tensor):
+        """
+        Scatter values into grids at specified positions.
+
+        Uses scatter_ instead of indexed assignment to avoid CUDA graph issues.
+        Indexed assignment like `grids[ids, y, x] = vals` causes "mutated inputs"
+        warnings because the indices change each step. scatter_ is explicitly
+        designed for this and works with CUDA graphs.
+
+        Args:
+            grid_ids: (n,) grid indices
+            y: (n,) y coordinates
+            x: (n,) x coordinates
+            values: (n,) values to write (must be float for grid dtype)
+        """
+        # Convert 3D indices to flat 1D indices
+        flat_idx = grid_ids * (self.height * self.width) + y * self.width + x
+        self.grids.view(-1).scatter_(0, flat_idx.long(), values)
+
     def compile_step(self, mode: str = 'max-autotune-no-cudagraphs', fullgraph: bool = True):
         """
         Compile the step method using torch.compile for maximum performance.
@@ -543,7 +563,7 @@ class TorchVecEnv:
             self.agent_underlying_cell,
             old_cell_values
         )
-        self.grids[grid_ids, old_y, old_x] = restore_values
+        self._grid_scatter(grid_ids, old_y, old_x, restore_values)
 
         # Reset energy, steps, dones where done (using pre-allocated constants)
         self.agent_energy = torch.where(
@@ -576,7 +596,7 @@ class TorchVecEnv:
         current_at_new = self.grids[grid_ids, new_positions_y, new_positions_x]
         # Only mark where done (set to agent type)
         new_values = torch.where(done_mask, agent_types_f, current_at_new)
-        self.grids[grid_ids, new_positions_y, new_positions_x] = new_values
+        self._grid_scatter(grid_ids, new_positions_y, new_positions_x, new_values)
     
     def _place_items(self, grid_id: int, cell_type: int, count):
         """Place items at random empty positions using noise-based selection.
@@ -633,7 +653,8 @@ class TorchVecEnv:
         self._old_x.copy_(self.agent_x)
 
         # Restore old cells (clear agent markers before moving)
-        self.grids[self.grid_indices, self._old_y, self._old_x] = self.agent_underlying_cell
+        # Use scatter_ to avoid CUDA graph "mutated inputs" warning
+        self._grid_scatter(self.grid_indices, self._old_y, self._old_x, self.agent_underlying_cell)
 
         # Get movement deltas
         dx = self.action_deltas[actions, 0]
@@ -650,7 +671,7 @@ class TorchVecEnv:
         food_mask, poison_mask = self._eat_batch()
 
         # Mark agents at new positions
-        self.grids[self.grid_indices, self.agent_y, self.agent_x] = self.agent_types.float()
+        self._grid_scatter(self.grid_indices, self.agent_y, self.agent_x, self.agent_types.float())
 
         # Step count and done check
         # Separate terminated (real death) from truncated (time limit)
@@ -713,7 +734,7 @@ class TorchVecEnv:
         self.agent_underlying_cell = final_cell_values
 
         # Clear eaten items from grid
-        self.grids[self.grid_indices, self.agent_y, self.agent_x] = final_cell_values
+        self._grid_scatter(self.grid_indices, self.agent_y, self.agent_x, final_cell_values)
 
         # Respawn eaten items
         self._respawn_items_vectorized(food_mask, self._cell_food)
@@ -759,7 +780,7 @@ class TorchVecEnv:
         # This writes to ALL positions but only changes where do_write=True
         current_vals = self.grids[self.grid_indices, chosen_y, chosen_x]
         new_vals = torch.where(do_write, float(cell_type), current_vals)
-        self.grids[self.grid_indices, chosen_y, chosen_x] = new_vals
+        self._grid_scatter(self.grid_indices, chosen_y, chosen_x, new_vals)
     
     def _get_observations(self) -> torch.Tensor:
         """Get batched observations (fully vectorized on GPU).
