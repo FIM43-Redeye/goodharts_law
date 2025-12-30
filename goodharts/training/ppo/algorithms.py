@@ -216,12 +216,12 @@ def ppo_update(
             n_updates += 1
     
     # Compute explained variance on last minibatch
+    # Use branchless computation to avoid GPU sync from tensor boolean check
     with torch.no_grad():
         var_returns = mb_returns.var()
-        if var_returns > 1e-8:
-            explained_var = 1 - (mb_returns - mb_old_values).var() / var_returns
-        else:
-            explained_var = torch.tensor(0.0, device=device)
+        residual_var = (mb_returns - mb_old_values).var()
+        # Avoid division by zero with clamp, no branching needed
+        explained_var = 1 - residual_var / var_returns.clamp(min=1e-8)
     
     # Return TENSORS - .item() sync happens in AsyncLogger background thread
     # This eliminates GPU stalls in the training loop

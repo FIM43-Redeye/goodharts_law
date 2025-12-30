@@ -5,8 +5,14 @@ This is a drop-in replacement for VecEnv that keeps all state on GPU,
 eliminating CPU-GPU transfer overhead during training.
 
 All operations are vectorized over the batch dimension using PyTorch ops.
+
+NOTE: This class inherits from nn.Module so that mutable state tensors can be
+registered as buffers. This is required for CUDA graph compatibility - PyTorch's
+CUDA graph system allows in-place mutations of nn.Module buffers but not of
+regular instance attributes ("eager inputs").
 """
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
 
@@ -32,16 +38,21 @@ def _build_action_deltas(device: torch.device, max_move_distance: int = 1) -> to
     return torch.tensor(deltas, dtype=torch.int32, device=device)
 
 
-class TorchVecEnv:
+class TorchVecEnv(nn.Module):
     """
     GPU-native vectorized environment.
-    
+
     All state is stored in PyTorch tensors on the specified device.
     Observations are returned as GPU tensors (no CPU transfer).
-    
+
     API matches VecEnv for drop-in replacement.
+
+    Inherits from nn.Module to enable CUDA graph compatibility.
+    All mutable tensor state is registered as buffers (persistent=False),
+    which allows in-place mutations without triggering "mutated inputs"
+    warnings that would disable CUDA graph capture.
     """
-    
+
     def __init__(
         self,
         n_envs: int,
@@ -60,9 +71,11 @@ class TorchVecEnv:
             device: Torch device (auto-detect if None)
             agent_types: Optional list of agent types
         """
+        super().__init__()
+
         self.n_envs = n_envs
         self.obs_spec = obs_spec
-        
+
         # Device selection - use centralized get_device()
         if device is None:
             device = get_device()
@@ -98,9 +111,10 @@ class TorchVecEnv:
         # Used for proxy mode observations
         cell_types = CellType.all_types()
         n_cell_types = len(cell_types)
-        self._interestingness_lut = torch.zeros(n_cell_types, dtype=torch.float32, device=device)
+        interestingness_lut = torch.zeros(n_cell_types, dtype=torch.float32, device=device)
         for ct in cell_types:
-            self._interestingness_lut[ct.value] = ct.interestingness
+            interestingness_lut[ct.value] = ct.interestingness
+        self.register_buffer('_interestingness_lut', interestingness_lut, persistent=False)
         
         # Agent settings (required)
         self.initial_energy = config['ENERGY_START']
@@ -130,73 +144,77 @@ class TorchVecEnv:
         self.food_reward = self.CellType.FOOD.energy_reward
         self.poison_penalty = self.CellType.POISON.energy_penalty
         
-        # Agent types
+        # Agent types (constant, but register as buffer for CUDA graph address stability)
         if agent_types is None:
             agent_types = [self.CellType.PREY.value] * n_envs
-        self.agent_types = torch.tensor(agent_types, dtype=torch.int32, device=device)
+        self.register_buffer('agent_types', torch.tensor(agent_types, dtype=torch.int32, device=device), persistent=False)
 
-        # Action deltas - must match policy's action space
+        # Action deltas - must match policy's action space (constant)
         self.max_move_distance = config.get('MAX_MOVE_DISTANCE', 1)
-        self.action_deltas = _build_action_deltas(device, self.max_move_distance)
+        self.register_buffer('action_deltas', _build_action_deltas(device, self.max_move_distance), persistent=False)
 
         # Grid setup - each env has its own independent grid
         self.n_grids = n_envs
-        self.grid_indices = torch.arange(n_envs, device=device)
-        
-        # Per-grid counts
-        self.grid_food_counts = torch.full((self.n_grids,), self._default_food, dtype=torch.int32, device=device)
-        self.grid_poison_counts = torch.full((self.n_grids,), self._default_poison, dtype=torch.int32, device=device)
-        
-        # State tensors (all on GPU)
+        self.register_buffer('grid_indices', torch.arange(n_envs, device=device), persistent=False)
+
+        # Per-grid counts (mutable)
+        self.register_buffer('grid_food_counts', torch.full((self.n_grids,), self._default_food, dtype=torch.int32, device=device), persistent=False)
+        self.register_buffer('grid_poison_counts', torch.full((self.n_grids,), self._default_poison, dtype=torch.int32, device=device), persistent=False)
+
+        # State tensors (all on GPU, all mutable)
         # Grid uses float32 for faster F.pad (avoids dtype conversion overhead)
-        self.grids = torch.zeros((self.n_grids, self.height, self.width), dtype=torch.float32, device=device)
+        self.register_buffer('grids', torch.zeros((self.n_grids, self.height, self.width), dtype=torch.float32, device=device), persistent=False)
         # Use int32 for positions (TPU-friendly; PyTorch accepts int32 for indexing)
-        self.agent_x = torch.zeros(n_envs, dtype=torch.int32, device=device)
-        self.agent_y = torch.zeros(n_envs, dtype=torch.int32, device=device)
-        self.agent_energy = torch.full((n_envs,), self.initial_energy, dtype=torch.float32, device=device)
-        self.agent_steps = torch.zeros(n_envs, dtype=torch.int32, device=device)
+        self.register_buffer('agent_x', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
+        self.register_buffer('agent_y', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
+        self.register_buffer('agent_energy', torch.full((n_envs,), self.initial_energy, dtype=torch.float32, device=device), persistent=False)
+        self.register_buffer('agent_steps', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
 
         # Track what cell type is "under" each agent (for restoration when moving)
         # Agents are permanently marked on grid - this tracks the original cell value
-        self.agent_underlying_cell = torch.zeros(n_envs, dtype=torch.float32, device=device)
-        
-        # Pre-allocated view buffer
-        self._view_buffer = torch.zeros(
+        self.register_buffer('agent_underlying_cell', torch.zeros(n_envs, dtype=torch.float32, device=device), persistent=False)
+
+        # Pre-allocated view buffer (mutable - written each step)
+        self.register_buffer('_view_buffer', torch.zeros(
             (n_envs, self.n_channels, self.view_size, self.view_size),
             dtype=torch.float32, device=device
-        )
-        
+        ), persistent=False)
+
         # Done states - separate terminated (real death) from truncated (time limit)
-        self.terminated = torch.zeros(n_envs, dtype=torch.bool, device=device)
-        self.truncated = torch.zeros(n_envs, dtype=torch.bool, device=device)
-        self.dones = torch.zeros(n_envs, dtype=torch.bool, device=device)  # Combined for resets
+        self.register_buffer('terminated', torch.zeros(n_envs, dtype=torch.bool, device=device), persistent=False)
+        self.register_buffer('truncated', torch.zeros(n_envs, dtype=torch.bool, device=device), persistent=False)
+        self.register_buffer('dones', torch.zeros(n_envs, dtype=torch.bool, device=device), persistent=False)
 
         # Pre-allocated temporaries for step() to avoid per-step allocations
-        self._old_y = torch.zeros(n_envs, dtype=torch.int32, device=device)
-        self._old_x = torch.zeros(n_envs, dtype=torch.int32, device=device)
-        self._dones_return = torch.zeros(n_envs, dtype=torch.bool, device=device)
-        self._terminated_return = torch.zeros(n_envs, dtype=torch.bool, device=device)
-        self._truncated_return = torch.zeros(n_envs, dtype=torch.bool, device=device)
-        self._step_rewards = torch.zeros(n_envs, dtype=torch.float32, device=device)
-        self._empty_value = torch.tensor(self._cell_empty, device=device, dtype=torch.float32)
-        self._neg_inf = torch.tensor(-float('inf'), device=device, dtype=torch.float32)
+        self.register_buffer('_old_y', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
+        self.register_buffer('_old_x', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
+        self.register_buffer('_dones_return', torch.zeros(n_envs, dtype=torch.bool, device=device), persistent=False)
+        self.register_buffer('_terminated_return', torch.zeros(n_envs, dtype=torch.bool, device=device), persistent=False)
+        self.register_buffer('_truncated_return', torch.zeros(n_envs, dtype=torch.bool, device=device), persistent=False)
+        self.register_buffer('_step_rewards', torch.zeros(n_envs, dtype=torch.float32, device=device), persistent=False)
+        self.register_buffer('_empty_value', torch.tensor(self._cell_empty, device=device, dtype=torch.float32), persistent=False)
+        self.register_buffer('_neg_inf', torch.tensor(-float('inf'), device=device, dtype=torch.float32), persistent=False)
 
         # Pre-allocated constants for branchless torch.where in _reset_agents_masked
-        # These avoid per-reset tensor allocations
-        self._zero_int32 = torch.zeros(n_envs, dtype=torch.int32, device=device)
-        self._zero_bool = torch.zeros(n_envs, dtype=torch.bool, device=device)
-        self._initial_energy_tensor = torch.full((n_envs,), self.initial_energy, dtype=torch.float32, device=device)
-        self._empty_cell_tensor = torch.full((n_envs,), self._cell_empty, dtype=torch.float32, device=device)
+        # These avoid per-reset tensor allocations (constant, but buffer for address stability)
+        self.register_buffer('_zero_int32', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
+        self.register_buffer('_zero_bool', torch.zeros(n_envs, dtype=torch.bool, device=device), persistent=False)
+        self.register_buffer('_initial_energy_tensor', torch.full((n_envs,), self.initial_energy, dtype=torch.float32, device=device), persistent=False)
+        self.register_buffer('_empty_cell_tensor', torch.full((n_envs,), self._cell_empty, dtype=torch.float32, device=device), persistent=False)
 
-        # Stats tracking
-        self.current_episode_food = torch.zeros(n_envs, dtype=torch.int32, device=device)
-        self.last_episode_food = torch.zeros(n_envs, dtype=torch.int32, device=device)
-        self.current_episode_poison = torch.zeros(n_envs, dtype=torch.int32, device=device)
-        self.last_episode_poison = torch.zeros(n_envs, dtype=torch.int32, device=device)
+        # Stats tracking (mutable)
+        self.register_buffer('current_episode_food', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
+        self.register_buffer('last_episode_food', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
+        self.register_buffer('current_episode_poison', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
+        self.register_buffer('last_episode_poison', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
+
+        # Episode rewards accumulator (for CUDA graph-compatible tracking)
+        # Lives here because TorchVecEnv inherits from nn.Module, enabling stable buffer addresses
+        self.register_buffer('episode_rewards', torch.zeros(n_envs, dtype=torch.float32, device=device), persistent=False)
 
         # Pre-allocated density buffer and cached normalization constants
         # Eliminates ~384 tensor allocations per update in privileged critic mode
-        self._density_buffer = torch.zeros((n_envs, 2), dtype=torch.float32, device=device)
+        self.register_buffer('_density_buffer', torch.zeros((n_envs, 2), dtype=torch.float32, device=device), persistent=False)
         self._density_food_mid = (default_food + default_food) / 2.0
         self._density_food_scale = 1.0  # Updated in set_curriculum_ranges
         self._density_poison_mid = (default_poison + default_poison) / 2.0
@@ -238,7 +256,7 @@ class TorchVecEnv:
         flat_idx = grid_ids * (self.height * self.width) + y * self.width + x
         self.grids.view(-1).scatter_(0, flat_idx.long(), values)
 
-    def compile_step(self, mode: str = 'max-autotune-no-cudagraphs', fullgraph: bool = True):
+    def compile_step(self, mode: str = 'max-autotune', fullgraph: bool = True):
         """
         Compile the step method using torch.compile for maximum performance.
 
@@ -247,9 +265,9 @@ class TorchVecEnv:
 
         Args:
             mode: torch.compile mode. Options:
-                - 'max-autotune-no-cudagraphs': Best for AMD ROCm (default)
-                - 'max-autotune': Includes CUDA graphs (NVIDIA only)
-                - 'reduce-overhead': Faster compile, less optimization
+                - 'max-autotune': Full optimization with CUDA graphs (default)
+                - 'reduce-overhead': Faster compile, enables CUDA graphs
+                - 'max-autotune-no-cudagraphs': For debugging CUDA graph issues
             fullgraph: If True, requires entire step to compile as one graph.
                        Falls back to fullgraph=False if compilation fails.
 
@@ -333,14 +351,15 @@ class TorchVecEnv:
         self.grids.fill_(self._cell_empty)
 
         # Generate random counts for all grids at once
-        self.grid_food_counts = torch.randint(
+        # Use copy_() to preserve buffer memory address for CUDA graph compatibility
+        self.grid_food_counts.copy_(torch.randint(
             self.food_range[0], self.food_range[1] + 1,
             (N,), dtype=torch.int32, device=self.device
-        )
-        self.grid_poison_counts = torch.randint(
+        ))
+        self.grid_poison_counts.copy_(torch.randint(
             self.poison_range[0], self.poison_range[1] + 1,
             (N,), dtype=torch.int32, device=self.device
-        )
+        ))
 
         # Place food on all grids
         self._place_items_all_grids(self._cell_food, self.grid_food_counts)
@@ -535,18 +554,19 @@ class TorchVecEnv:
         done_int = done_mask.int()
 
         # Update episode stats (only where done)
-        self.last_episode_food = torch.where(
+        # Use copy_() to preserve buffer memory address for CUDA graph compatibility
+        self.last_episode_food.copy_(torch.where(
             done_mask, self.current_episode_food, self.last_episode_food
-        )
-        self.last_episode_poison = torch.where(
+        ))
+        self.last_episode_poison.copy_(torch.where(
             done_mask, self.current_episode_poison, self.last_episode_poison
-        )
-        self.current_episode_food = torch.where(
+        ))
+        self.current_episode_food.copy_(torch.where(
             done_mask, self._zero_int32, self.current_episode_food
-        )
-        self.current_episode_poison = torch.where(
+        ))
+        self.current_episode_poison.copy_(torch.where(
             done_mask, self._zero_int32, self.current_episode_poison
-        )
+        ))
 
         # Restore old cells where done (clear agent markers)
         old_y = self.agent_y
@@ -566,25 +586,27 @@ class TorchVecEnv:
         self._grid_scatter(grid_ids, old_y, old_x, restore_values)
 
         # Reset energy, steps, dones where done (using pre-allocated constants)
-        self.agent_energy = torch.where(
+        # Use copy_() to preserve buffer memory address for CUDA graph compatibility
+        self.agent_energy.copy_(torch.where(
             done_mask, self._initial_energy_tensor, self.agent_energy
-        )
-        self.agent_steps = torch.where(
+        ))
+        self.agent_steps.copy_(torch.where(
             done_mask, self._zero_int32, self.agent_steps
-        )
-        self.dones = torch.where(
+        ))
+        self.dones.copy_(torch.where(
             done_mask, self._zero_bool, self.dones
-        )
+        ))
 
         # Spawn new positions for ALL agents (cheap), only apply where done
         new_y, new_x = self._random_empty_positions(self.grids[grid_ids])
 
         # Only update positions where done
-        self.agent_y = torch.where(done_mask, new_y, self.agent_y)
-        self.agent_x = torch.where(done_mask, new_x, self.agent_x)
-        self.agent_underlying_cell = torch.where(
+        # Use copy_() to preserve buffer memory address for CUDA graph compatibility
+        self.agent_y.copy_(torch.where(done_mask, new_y, self.agent_y))
+        self.agent_x.copy_(torch.where(done_mask, new_x, self.agent_x))
+        self.agent_underlying_cell.copy_(torch.where(
             done_mask, self._empty_cell_tensor, self.agent_underlying_cell
-        )
+        ))
 
         # Mark agents on grids where done
         # Need to use scatter or advanced indexing carefully
@@ -661,10 +683,12 @@ class TorchVecEnv:
         dy = self.action_deltas[actions, 1]
 
         # Move agents (toroidal wrapping)
-        self.agent_x = (self.agent_x + dx) % self.width
-        self.agent_y = (self.agent_y + dy) % self.height
+        # Use copy_() to preserve buffer memory address for CUDA graph compatibility
+        self.agent_x.copy_((self.agent_x + dx) % self.width)
+        self.agent_y.copy_((self.agent_y + dy) % self.height)
 
         # Energy cost (branchless: multiplier is 0.0 when frozen)
+        # -= is in-place so address is preserved
         self.agent_energy -= self.energy_move_cost * self._energy_enabled
 
         # Eating (updates energy unless frozen, plus underlying_cell and item clearing)
@@ -714,16 +738,17 @@ class TorchVecEnv:
         poison_mask = (cell_values == self._cell_poison)
 
         # Update agent energy (branchless: multiplier is 0.0 when frozen, so no change)
-        self.agent_energy = torch.where(
+        # Use copy_() to preserve buffer memory address for CUDA graph compatibility
+        self.agent_energy.copy_(torch.where(
             food_mask, self.agent_energy + self.food_reward * self._energy_enabled, self.agent_energy
-        )
-        self.agent_energy = torch.where(
+        ))
+        self.agent_energy.copy_(torch.where(
             poison_mask, self.agent_energy - self.poison_penalty * self._energy_enabled, self.agent_energy
-        )
+        ))
 
         # Update episode counters
-        self.current_episode_food = torch.where(food_mask, self.current_episode_food + 1, self.current_episode_food)
-        self.current_episode_poison = torch.where(poison_mask, self.current_episode_poison + 1, self.current_episode_poison)
+        self.current_episode_food.copy_(torch.where(food_mask, self.current_episode_food + 1, self.current_episode_food))
+        self.current_episode_poison.copy_(torch.where(poison_mask, self.current_episode_poison + 1, self.current_episode_poison))
 
         # Determine what the cell becomes after eating
         # If ate food or poison -> EMPTY, otherwise keep original
@@ -731,7 +756,7 @@ class TorchVecEnv:
         final_cell_values = torch.where(ate_something, self._empty_value, cell_values)
 
         # Update underlying cell (what's "under" the agent after this step)
-        self.agent_underlying_cell = final_cell_values
+        self.agent_underlying_cell.copy_(final_cell_values)
 
         # Clear eaten items from grid
         self._grid_scatter(self.grid_indices, self.agent_y, self.agent_x, final_cell_values)
