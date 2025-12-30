@@ -825,19 +825,13 @@ class PPOTrainer:
                 # Get density info for privileged critic
                 density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
 
-                # Use fused compiled inference if available
-                # This combines policy forward + sampling + value head in one graph
-                if self._compiled_inference is not None:
-                    torch.compiler.cudagraph_mark_step_begin()
-                    actions, log_probs, values, _, features = self._compiled_inference(states, density_info)
-                else:
-                    # Eager mode fallback
-                    with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                        logits, features = self.policy.forward_with_features(states.float())
-                        dist = Categorical(logits=logits, validate_args=False)
-                        actions = dist.sample()
-                        log_probs = dist.log_prob(actions)
-                        values = self.value_head(features, density_info).squeeze(-1)
+                # Inference (eager mode during warmup - fused rollout step handles main loop)
+                with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                    logits, features = self.policy.forward_with_features(states.float())
+                    dist = Categorical(logits=logits, validate_args=False)
+                    actions = dist.sample()
+                    log_probs = dist.log_prob(actions)
+                    values = self.value_head(features, density_info).squeeze(-1)
 
             current_states = states.clone()
             next_states, eating_info, terminated, truncated = self.vec_env.step(actions)
@@ -1105,18 +1099,6 @@ class PPOTrainer:
             fused=use_fused
         )
 
-        # Separate CUDA stream for inference - allows overlapping kernel scheduling
-        # with PPO's final operations. No extra VRAM, just a scheduling queue.
-        self._inference_stream = None
-        self._ppo_done_event = None
-        self._inference_done_event = None
-        if self.device.type == 'cuda':
-            self._inference_stream = torch.cuda.Stream(device=self.device)
-            self._ppo_done_event = torch.cuda.Event()
-            self._inference_done_event = torch.cuda.Event()
-            print(f"   [Streams] Inference stream created for overlap")
-        
-        
         # Reward computer - unified class handles both numpy and torch
         # Shaping is now handled internally by each RewardComputer subclass
         self.reward_computer = RewardComputer.create(
@@ -1208,19 +1190,11 @@ class PPOTrainer:
 
                     self._compiled_rollout_step = compiled_rollout_step
 
-                    # Keep standalone inference for warmup/prefetch (simpler, already works)
-                    @torch.compile(mode=compile_mode)
-                    def compiled_inference(states, density_info):
-                        """Standalone inference for warmup and prefetch."""
-                        with autocast(device_type=device_type, enabled=use_amp):
-                            logits, features = policy.forward_with_features(states)
-                            dist = Categorical(logits=logits, validate_args=False)
-                            actions = dist.sample()
-                            log_probs = dist.log_prob(actions)
-                            values = value_head(features, density_info).squeeze(-1)
-                        return actions, log_probs, values, logits, features
-
-                    self._compiled_inference = compiled_inference
+                    # NOTE: We intentionally do NOT compile a separate inference function.
+                    # Having two compiled functions (compiled_rollout_step + compiled_inference)
+                    # that share the same model weights causes segfaults on ROCm when weights
+                    # are modified between calls (PPO update). The prefetch uses eager mode,
+                    # which is fine since it's only 1 call per update vs 128 for the rollout.
 
                     # Compile PPO update function
                     self._compiled_ppo_update = torch.compile(ppo_update, mode=compile_mode)
@@ -1430,39 +1404,33 @@ class PPOTrainer:
         last_update_time = self.start_time
         last_update_steps = 0
 
-        # Inference prefetch: True if inference was issued after PPO update
-        # GPU runs inference while CPU does bookkeeping (overlap)
-        inference_pending = False
-
         # ============================================================
         # STEP-THEN-INFER PATTERN
         # ============================================================
         # Unlike traditional Infer-Then-Step, we run inference AFTER env.step()
         # to get next step's actions. This makes ENV_STEP → REWARD_SHAPE → INFERENCE
-        # adjacent and fusable.
+        # adjacent and fusable into ONE compiled graph.
         #
         # Initial inference: get first actions before entering the loop.
-        # After first iteration, actions come from the previous step's inference.
+        # After PPO updates weights, needs_initial_inference triggers fresh inference.
         # ============================================================
 
         # Initial potentials for reward shaping
         potentials = self.reward_computer.get_initial_potentials(states)
 
-        # Initial inference to get first actions (will be skipped if prefetch active)
+        # Initial inference to get first actions (eager mode - only runs once)
         density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
         with torch.no_grad():
-            with record_function("INFERENCE"):
-                if self._compiled_inference is not None:
-                    torch.compiler.cudagraph_mark_step_begin()
-                    actions, log_probs, values, logits, features = self._compiled_inference(states, density_info)
-                else:
-                    with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                        logits, features = self.policy.forward_with_features(states.float())
-                        dist = Categorical(logits=logits, validate_args=False)
-                        actions = dist.sample()
-                        log_probs = dist.log_prob(actions)
-                        values = self.value_head(features, density_info).squeeze(-1)
+            with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                logits, features = self.policy.forward_with_features(states.float())
+                dist = Categorical(logits=logits, validate_args=False)
+                actions = dist.sample()
+                log_probs = dist.log_prob(actions)
+                values = self.value_head(features, density_info).squeeze(-1)
         last_logits = logits
+
+        # Flag to trigger fresh inference after PPO update
+        needs_initial_inference = False
 
         while self.total_steps < cfg.total_timesteps:
             self.profiler.start()
@@ -1487,12 +1455,19 @@ class PPOTrainer:
             # At this point we have: states, actions, log_probs, values, potentials
             # (from initial inference or previous iteration's inference)
 
-            # If prefetch is pending (after PPO update), wait for it
-            if inference_pending:
-                if self._inference_stream is not None:
-                    torch.cuda.current_stream().wait_event(self._inference_done_event)
-                inference_pending = False
-                # Prefetched values are already in: actions, log_probs, values, potentials, density_info
+            # After PPO update, we need fresh inference with updated weights
+            # This runs once per rollout (~0.8% overhead vs prefetch complexity)
+            if needs_initial_inference:
+                with torch.no_grad():
+                    density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
+                    with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                        logits, features = self.policy.forward_with_features(states.float())
+                        dist = Categorical(logits=logits, validate_args=False)
+                        actions = dist.sample()
+                        log_probs = dist.log_prob(actions)
+                        values = self.value_head(features, density_info).squeeze(-1)
+                    potentials = self.reward_computer.get_initial_potentials(states)
+                needs_initial_inference = False
 
             # ============================================================
             # FUSED ROLLOUT STEP: ENV_STEP + REWARD_SHAPE + INFERENCE
@@ -1690,63 +1665,14 @@ class PPOTrainer:
                         potentials = self.reward_computer.get_initial_potentials(states)
                         episode_rewards.zero_()
 
-                # ============================================================
-                # INFERENCE PREFETCH: Issue next rollout's inference NOW
-                # GPU runs inference while CPU does bookkeeping (overlap)
-                #
-                # Using separate CUDA stream: inference kernels are scheduled
-                # immediately, overlapping with PPO's final cleanup. The stream
-                # waits on ppo_done_event to ensure weights are updated.
-                # ============================================================
-                # Save old logits for metrics packing (action probs from previous update)
+                # Signal that next rollout needs fresh inference with updated weights
+                needs_initial_inference = True
+
+                # Save logits for metrics packing (action probs from this update)
                 prev_logits = last_logits
 
-                # Record event on default stream - inference stream will wait on this
-                if self._ppo_done_event is not None:
-                    self._ppo_done_event.record()
-
-                with torch.no_grad():
-                    # Get fresh density for prefetched inference (privileged critic)
-                    prefetch_density = self.vec_env.get_density_info() if self._aux_buf is not None else None
-
-                    with record_function("INFERENCE"):
-                        # Issue inference on separate stream (overlaps kernel scheduling)
-                        if self._inference_stream is not None:
-                            self._inference_stream.wait_event(self._ppo_done_event)
-                            with torch.cuda.stream(self._inference_stream):
-                                if self._compiled_inference is not None:
-                                    actions, log_probs, values, logits, features = self._compiled_inference(states, prefetch_density)
-                                else:
-                                    with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                                        logits, features = self.policy.forward_with_features(states.float())
-                                        dist = Categorical(logits=logits, validate_args=False)
-                                        actions = dist.sample()
-                                        log_probs = dist.log_prob(actions)
-                                        values = self.value_head(features, prefetch_density).squeeze(-1)
-                        else:
-                            # CPU/TPU fallback - no streams
-                            if self._compiled_inference is not None:
-                                actions, log_probs, values, logits, features = self._compiled_inference(states, prefetch_density)
-                            else:
-                                with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                                    logits, features = self.policy.forward_with_features(states.float())
-                                    dist = Categorical(logits=logits, validate_args=False)
-                                    actions = dist.sample()
-                                    log_probs = dist.log_prob(actions)
-                                    values = self.value_head(features, prefetch_density).squeeze(-1)
-                # Store prefetched values for next rollout's first step
-                # Step-Then-Infer: these become the initial (actions, values, potentials)
-                density_info = prefetch_density
-                potentials = self.reward_computer.get_initial_potentials(states)
-                last_logits = logits
-                inference_pending = True
-
-                # Record event on inference stream - default stream will wait on this
-                if self._inference_stream is not None:
-                    self._inference_done_event.record(self._inference_stream)
-
                 # ============================================================
-                # CPU BOOKKEEPING: GPU is running inference in parallel
+                # METRICS PACKING
                 # ============================================================
 
                 # Pack metrics tensor (GPU work - fast)
