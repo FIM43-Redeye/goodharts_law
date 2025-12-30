@@ -198,6 +198,66 @@ class RewardComputer(ABC):
 
         return total_rewards
 
+    def compute_stateless(
+        self,
+        eating_info: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        states: torch.Tensor,
+        next_states: torch.Tensor,
+        terminated: torch.Tensor,
+        prev_potentials: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Stateless reward computation for fusion with env.step() and inference.
+
+        Unlike compute(), this method does not mutate self.prev_potentials.
+        The caller is responsible for threading potentials between steps.
+
+        Args:
+            eating_info: (food_mask, poison_mask, starved_mask) from environment
+            states: Current observations
+            next_states: Next observations
+            terminated: True when agent truly died (starvation)
+            prev_potentials: Potential values from previous step
+
+        Returns:
+            (shaped_rewards, next_potentials) tuple - caller manages state
+        """
+        food_mask, poison_mask, starved_mask = eating_info
+
+        # 1. Compute base rewards from eating info (mode-specific)
+        base_rewards = self._compute_base_rewards(food_mask, poison_mask, starved_mask)
+
+        # 2. Add potential-based shaping
+        # Only zero potential on TRUE termination (death), not on truncation
+        next_potentials = self._compute_potentials(next_states)
+        target_potentials = torch.where(
+            terminated.bool(),
+            torch.zeros_like(next_potentials),
+            next_potentials
+        )
+
+        shaping = (target_potentials * self.gamma) - prev_potentials
+
+        # 3. Combine and clip
+        total_rewards = base_rewards + shaping
+        total_rewards = torch.clamp(total_rewards, -20.0, 20.0)
+
+        return total_rewards, next_potentials
+
+    def get_initial_potentials(self, states: torch.Tensor) -> torch.Tensor:
+        """
+        Compute initial potentials for the first step of a rollout.
+
+        Use this before calling compute_stateless() for the first time.
+
+        Args:
+            states: Initial observations
+
+        Returns:
+            Initial potential values
+        """
+        return self._compute_potentials(states)
+
     @abstractmethod
     def _compute_base_rewards(
         self,
