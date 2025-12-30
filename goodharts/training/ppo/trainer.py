@@ -1744,7 +1744,8 @@ class PPOTrainer:
                 # Entropy floor: constant during learning phase, then decays
                 # Phase 1 (0 to decay_fraction): constant floor for stability while learning
                 # Phase 2 (decay_fraction to 1): floor decays to 0, allowing determinism
-                if progress < cfg.entropy_decay_fraction:
+                # Special case: decay_fraction >= 1.0 means no decay (constant floor)
+                if cfg.entropy_decay_fraction >= 1.0 or progress < cfg.entropy_decay_fraction:
                     current_entropy_floor = cfg.entropy_floor
                 else:
                     # Linear decay from entropy_floor to 0 over remaining training
