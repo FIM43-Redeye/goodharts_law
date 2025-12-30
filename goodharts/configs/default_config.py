@@ -247,7 +247,6 @@ def get_simulation_config(config_path: str | None = None):
         # World (required)
         'GRID_WIDTH': world['width'],
         'GRID_HEIGHT': world['height'],
-        'WORLD_LOOP': world['loop'],
 
         # Resources (required)
         'GRID_FOOD_INIT': resources['food'],

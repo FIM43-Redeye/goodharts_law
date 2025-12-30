@@ -14,24 +14,12 @@ from goodharts.behaviors.action_space import build_action_space, index_to_action
 
 @pytest.fixture
 def config():
+    """Test configuration - world is always toroidal (edges wrap)."""
     cfg = get_simulation_config()
     cfg['GRID_WIDTH'] = 20
     cfg['GRID_HEIGHT'] = 20
     cfg['GRID_FOOD_INIT'] = 20
     cfg['GRID_POISON_INIT'] = 10
-    cfg['WORLD_LOOP'] = False
-    cfg['MAX_MOVE_DISTANCE'] = 1  # Tests expect 3x3 action space
-    return cfg
-
-
-@pytest.fixture
-def looping_config():
-    cfg = get_simulation_config()
-    cfg['GRID_WIDTH'] = 20
-    cfg['GRID_HEIGHT'] = 20
-    cfg['GRID_FOOD_INIT'] = 20
-    cfg['GRID_POISON_INIT'] = 10
-    cfg['WORLD_LOOP'] = True
     cfg['MAX_MOVE_DISTANCE'] = 1  # Tests expect 3x3 action space
     return cfg
 
@@ -143,36 +131,10 @@ class TestMovementMechanics:
         assert env.agent_x[0].item() == expected_x, f"X position wrong after action"
         assert env.agent_y[0].item() == expected_y, f"Y position wrong after action"
 
-    def test_bounded_mode_clamps_at_edges(self, config, device):
-        """In bounded mode, agents should be clamped at grid edges."""
-        config['WORLD_LOOP'] = False
+    def test_toroidal_wrapping(self, config, device):
+        """Agents should wrap around grid edges (toroidal world)."""
         spec = ObservationSpec.for_mode('ground_truth', config)
         env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
-
-        # Place agent at corner (0, 0)
-        env.agent_x[0] = 0
-        env.agent_y[0] = 0
-
-        # Find action that moves left/up (negative direction)
-        left_action = None
-        for idx in range(8):
-            dx, dy = index_to_action(idx)
-            if dx < 0 or dy < 0:
-                left_action = idx
-                break
-
-        if left_action is not None:
-            actions = torch.tensor([left_action], dtype=torch.long, device=device)
-            env.step(actions)
-
-            # Should be clamped at 0
-            assert env.agent_x[0].item() >= 0, "Agent went past left boundary"
-            assert env.agent_y[0].item() >= 0, "Agent went past top boundary"
-
-    def test_looping_mode_wraps_around(self, looping_config, device):
-        """In looping mode, agents should wrap around grid edges."""
-        spec = ObservationSpec.for_mode('ground_truth', looping_config)
-        env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=looping_config, device=device)
 
         # Place agent at corner (0, 0)
         env.agent_x[0] = 0
@@ -599,23 +561,6 @@ class TestSpawnCorrectness:
                 underlying = env.agent_underlying_cell[env_id].item()
                 assert underlying == CellType.EMPTY.value, \
                     f"Agent {env_id} spawned on non-empty cell (underlying={underlying})"
-
-    def test_shared_grid_no_agent_overlap(self, config, device):
-        """In shared grid mode, all agents should have unique positions."""
-        spec = ObservationSpec.for_mode('ground_truth', config)
-
-        # Use shared_grid mode with multiple agents
-        for _ in range(10):
-            env = create_torch_vec_env(
-                n_envs=4, obs_spec=spec, config=config, device=device, shared_grid=True
-            )
-
-            positions = set()
-            for env_id in range(4):
-                pos = (env.agent_y[env_id].item(), env.agent_x[env_id].item())
-                assert pos not in positions, \
-                    f"Duplicate agent position {pos} in shared grid mode"
-                positions.add(pos)
 
     def test_no_food_on_agent_positions_after_respawn(self, config, device):
         """Respawned food should not land on agent positions."""
