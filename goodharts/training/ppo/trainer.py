@@ -584,9 +584,22 @@ class PPOConfig:
     eps_clip: float = 0.2
     k_epochs: int = 4
     steps_per_env: int = 128
-    n_minibatches: int = 4
-    entropy_coef: float = 0.01
+    n_minibatches: int = 1
     value_coef: float = 0.5
+
+    # Entropy scheduling: prevents premature collapse while allowing full convergence
+    entropy_initial: float = 0.1      # Strong exploration early
+    entropy_final: float = 0.001      # Minimal when near-optimal
+    entropy_decay_fraction: float = 0.7  # Decay over 70% of training
+    entropy_floor: float = 0.5        # Min entropy during learning phase
+    entropy_floor_penalty: float = 0.05  # Penalty coefficient for floor violation
+
+    # Learning rate decay: reduces LR over training for fine-tuning
+    lr_decay: bool = False            # Enable LR decay
+    lr_final: float = 3e-5            # Final LR (10x lower than initial)
+
+    # Clip decay: tightens trust region over training to reduce late oscillation
+    eps_clip_final: float = 0.1       # Final clip (tighter than initial 0.2)
     output_path: str = 'models/ppo_agent.pth'
     log_to_file: bool = True
     log_dir: str = 'generated/logs'
@@ -618,7 +631,12 @@ class PPOConfig:
     # Privileged critic: value function sees episode density (food/poison counts)
     # This helps explain variance from episode difficulty without affecting policy
     privileged_critic: bool = True   # Enable density info for value head
-    
+
+    # PopArt weight rescaling: when True, rescale fc weights when stats change
+    # to preserve outputs. When False, only normalize returns (simpler but
+    # value outputs will drift with stats - may be more stable in some cases).
+    popart_rescale_weights: bool = True
+
     @classmethod
     def from_config(cls, mode: str = 'ground_truth', **overrides) -> 'PPOConfig':
         """
@@ -656,8 +674,18 @@ class PPOConfig:
             'k_epochs': train_cfg['k_epochs'],
             'steps_per_env': train_cfg['steps_per_env'],
             'n_minibatches': train_cfg['n_minibatches'],
-            'entropy_coef': train_cfg['entropy_coef'],
             'value_coef': train_cfg['value_coef'],
+            # Entropy scheduling
+            'entropy_initial': train_cfg['entropy_initial'],
+            'entropy_final': train_cfg['entropy_final'],
+            'entropy_decay_fraction': train_cfg['entropy_decay_fraction'],
+            'entropy_floor': train_cfg['entropy_floor'],
+            'entropy_floor_penalty': train_cfg['entropy_floor_penalty'],
+            # LR decay
+            'lr_decay': train_cfg.get('lr_decay', False),
+            'lr_final': train_cfg.get('lr_final', 3e-5),
+            # Clip decay
+            'eps_clip_final': train_cfg.get('eps_clip_final', 0.1),
             'use_amp': train_cfg['use_amp'],
             'compile_models': train_cfg['compile_models'],
             'compile_mode': train_cfg.get('compile_mode', 'max-autotune'),
@@ -668,6 +696,8 @@ class PPOConfig:
             'validation_mode': train_cfg['validation_mode'],
             'validation_food': train_cfg['validation_food'],
             'validation_poison': train_cfg['validation_poison'],
+            # PopArt options
+            'popart_rescale_weights': train_cfg.get('popart_rescale_weights', True),
         }
 
         # Apply overrides (CLI args take precedence)
@@ -926,11 +956,13 @@ class PPOTrainer:
             self.device,
             eps_clip=cfg.eps_clip,
             k_epochs=cfg.k_epochs,
-            entropy_coef=cfg.entropy_coef,
+            entropy_coef=cfg.entropy_initial,  # Use initial entropy for warmup
             value_coef=cfg.value_coef,
             n_minibatches=cfg.n_minibatches,
             scaler=self.scaler,
             aux_inputs=all_aux,
+            entropy_floor=cfg.entropy_floor,  # Floor active during warmup
+            entropy_floor_penalty=cfg.entropy_floor_penalty,
         )
 
         # Sync to ensure all kernels complete
@@ -1097,7 +1129,8 @@ class PPOTrainer:
         if cfg.value_head_type == 'popart':
             self.value_head = PopArtValueHead(
                 input_size=self.policy.hidden_size,
-                num_aux_inputs=num_aux
+                num_aux_inputs=num_aux,
+                rescale_weights=cfg.popart_rescale_weights,
             ).to(self.device)
         elif cfg.value_head_type == 'simple':
             self.value_head = ValueHead(
@@ -1314,7 +1347,9 @@ class PPOTrainer:
                 k_epochs=cfg.k_epochs,
                 steps_per_env=cfg.steps_per_env,
                 n_minibatches=cfg.n_minibatches,
-                entropy_coef=cfg.entropy_coef,
+                entropy_initial=cfg.entropy_initial,
+                entropy_final=cfg.entropy_final,
+                entropy_decay_fraction=cfg.entropy_decay_fraction,
                 vectorized=True,
             )
         
@@ -1717,6 +1752,30 @@ class PPOTrainer:
                     # Normalize advantages
                     all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
 
+                # Compute dynamic entropy coefficient and floor
+                # Both decay continuously from initial to final over full training
+                progress = self.total_steps / cfg.total_timesteps
+
+                # Entropy coef: decays over decay_fraction, then stays at final
+                coef_progress = min(1.0, progress / cfg.entropy_decay_fraction)
+                current_entropy_coef = (
+                    cfg.entropy_initial * (1 - coef_progress) +
+                    cfg.entropy_final * coef_progress
+                )
+
+                # Entropy floor: constant throughout training
+                # Model needs some stochasticity to handle randomized environments
+                current_entropy_floor = cfg.entropy_floor
+
+                # LR decay: reduce learning rate over training for fine-tuning
+                if cfg.lr_decay:
+                    current_lr = cfg.lr * (1 - progress) + cfg.lr_final * progress
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = current_lr
+
+                # Clip decay: tighten trust region over training to reduce oscillation
+                current_eps_clip = cfg.eps_clip * (1 - progress) + cfg.eps_clip_final * progress
+
                 # PPO update - tensors go in directly, no CPU sync needed
                 # Use compiled version when available (~9% faster)
                 with record_function("PPO_UPDATE"):
@@ -1726,14 +1785,16 @@ class PPOTrainer:
                         all_states, all_actions, all_log_probs,
                         all_returns, all_advantages, all_old_values,
                         self.device,
-                        eps_clip=cfg.eps_clip,
+                        eps_clip=current_eps_clip,
                         k_epochs=cfg.k_epochs,
-                        entropy_coef=cfg.entropy_coef,
+                        entropy_coef=current_entropy_coef,
                         value_coef=cfg.value_coef,
                         n_minibatches=cfg.n_minibatches,
                         scaler=self.scaler,
                         verbose=True,
                         aux_inputs=all_aux,
+                        entropy_floor=current_entropy_floor,
+                        entropy_floor_penalty=cfg.entropy_floor_penalty,
                     )
                 # Clear progress line
                 print(" " * 40, end='\r')

@@ -28,8 +28,8 @@ from goodharts.behaviors.action_space import get_action_labels, DISCRETE_8, crea
 # Dashboard constants
 DASHBOARD_MAX_POINTS = 1024       # Maximum data points to display in graphs
 EMA_SMOOTHING_ALPHA = 0.9         # Exponential moving average smoothing factor
-ANIMATION_INTERVAL_MS = 200       # Milliseconds between dashboard frame updates
-QUEUE_POLL_TIMEOUT = 0.05         # Seconds to wait when polling update queue
+ANIMATION_INTERVAL_MS = 50        # Milliseconds between dashboard frame updates (low = responsive)
+QUEUE_POLL_TIMEOUT = 0.01         # Seconds to wait when polling update queue
 QUEUE_MAX_SIZE = 1000             # Maximum pending updates in queue
 
 
