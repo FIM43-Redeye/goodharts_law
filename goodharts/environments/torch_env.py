@@ -847,19 +847,17 @@ class TorchVecEnv:
         Performance: Uses pre-allocated buffer and cached normalization constants
         to eliminate ~384 tensor allocations per update.
         """
-        # Write directly into pre-allocated buffer using in-place ops
+        # Compute normalized density values (no in-place ops for CUDA graph compatibility)
         # Column 0: normalized food density
         # Column 1: normalized poison density
-        buf = self._density_buffer
+        food_counts = self.grid_food_counts[self.grid_indices].float()
+        poison_counts = self.grid_poison_counts[self.grid_indices].float()
 
-        # Get counts and normalize in-place (no intermediate tensors)
-        buf[:, 0] = self.grid_food_counts[self.grid_indices].float()
-        buf[:, 0].sub_(self._density_food_mid).div_(self._density_food_scale)
+        food_normalized = (food_counts - self._density_food_mid) / self._density_food_scale
+        poison_normalized = (poison_counts - self._density_poison_mid) / self._density_poison_scale
 
-        buf[:, 1] = self.grid_poison_counts[self.grid_indices].float()
-        buf[:, 1].sub_(self._density_poison_mid).div_(self._density_poison_scale)
-
-        return buf
+        # Stack into buffer (returns new tensor, doesn't mutate)
+        return torch.stack([food_normalized, poison_normalized], dim=1)
 
 
 def create_torch_vec_env(
