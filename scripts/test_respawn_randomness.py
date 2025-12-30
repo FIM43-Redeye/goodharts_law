@@ -26,7 +26,6 @@ def main():
         n_envs=n_envs,
         device=device,
         obs_spec=obs_spec,
-        shared_grid=False,
     )
 
     height, width = vec_env.height, vec_env.width

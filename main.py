@@ -62,8 +62,6 @@ def parse_args():
 
     # World settings
     world_group = parser.add_argument_group('World')
-    world_group.add_argument('--loop', action='store_true',
-                             help='Enable toroidal world (edges wrap around)')
     world_group.add_argument('--food', type=int, default=None, metavar='N',
                              help='Override food count')
     world_group.add_argument('--poison', type=int, default=None, metavar='N',
@@ -124,16 +122,10 @@ def setup_config(args):
             args.model = bv_cfg['model']
 
     # CLI overrides for world
-    if args.loop:
-        config['WORLD_LOOP'] = True
     if args.food is not None:
         config['GRID_FOOD_INIT'] = args.food
     if args.poison is not None:
         config['GRID_POISON_INIT'] = args.poison
-
-    # Print world status
-    if config.get('WORLD_LOOP'):
-        print("Loop mode: World wraps at edges (toroidal)")
 
     # Determine agent setup based on args
     count = args.count

@@ -34,20 +34,19 @@ class TestFullSimulation:
         
         assert sim.step_count == 100
     
-    def test_simulation_with_loop_mode(self, config):
-        """Simulation should work with looping world."""
+    def test_simulation_with_toroidal_world(self, config):
+        """Simulation should work with toroidal world (default)."""
         from goodharts.simulation import Simulation
-        
-        config['WORLD_LOOP'] = True
+
         config['AGENTS_SETUP'] = [
             {'behavior_class': 'OmniscientSeeker', 'count': 3}
         ]
-        
+
         sim = Simulation(config)
-        
+
         for _ in range(50):
             sim.step()
-        
+
         # Agents should still be valid
         for agent in sim.agents:
             assert 0 <= agent.x < config['GRID_WIDTH']

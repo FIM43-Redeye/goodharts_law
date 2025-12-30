@@ -43,28 +43,25 @@ class TorchVecEnv:
     """
     
     def __init__(
-        self, 
-        n_envs: int, 
-        obs_spec: ObservationSpec, 
+        self,
+        n_envs: int,
+        obs_spec: ObservationSpec,
         config: dict = None,
         device: Optional[torch.device] = None,
-        shared_grid: bool = False,
         agent_types: list[int] = None
     ):
         """
         Initialize GPU-native vectorized environment.
-        
+
         Args:
             n_envs: Number of parallel environments
             obs_spec: Observation specification
             config: Optional config override
             device: Torch device (auto-detect if None)
-            shared_grid: If True, all agents share one grid
             agent_types: Optional list of agent types
         """
         self.n_envs = n_envs
         self.obs_spec = obs_spec
-        self.shared_grid = shared_grid
         
         # Device selection - use centralized get_device()
         if device is None:
@@ -80,7 +77,6 @@ class TorchVecEnv:
         # Dimensions from config (required)
         self.width = config['GRID_WIDTH']
         self.height = config['GRID_HEIGHT']
-        self.loop = config['WORLD_LOOP']
         
         # View settings from obs_spec
         self.view_radius = obs_spec.view_size // 2
@@ -95,7 +91,9 @@ class TorchVecEnv:
         # Freeze energy during training: agents don't die, enabling exploration
         # Used for proxy mode where agents can't learn from energy consequences
         self.freeze_energy = obs_spec.freeze_energy_in_training
-        
+        # Branchless multiplier: 0.0 when frozen (skip energy updates), 1.0 otherwise
+        self._energy_enabled = 0.0 if self.freeze_energy else 1.0
+
         # Build interestingness lookup table: cell_value -> interestingness
         # Used for proxy mode observations
         cell_types = CellType.all_types()
@@ -121,8 +119,14 @@ class TorchVecEnv:
         # Max items for fixed-size topk in _place_items (avoids sync)
         self._max_items_per_grid = max(default_food, default_poison, 1)
         
-        # CellType enum - all cell values accessed dynamically from this
+        # CellType enum - cache values as plain ints/floats for torch.compile compatibility
+        # (Descriptors cause graph breaks, plain values don't)
         self.CellType = config['CellType']
+        self._cell_empty = self.CellType.EMPTY.value
+        self._cell_wall = self.CellType.WALL.value
+        self._cell_food = self.CellType.FOOD.value
+        self._cell_poison = self.CellType.POISON.value
+        self._cell_prey = self.CellType.PREY.value
         self.food_reward = self.CellType.FOOD.energy_reward
         self.poison_penalty = self.CellType.POISON.energy_penalty
         
@@ -134,10 +138,10 @@ class TorchVecEnv:
         # Action deltas - must match policy's action space
         self.max_move_distance = config.get('MAX_MOVE_DISTANCE', 1)
         self.action_deltas = _build_action_deltas(device, self.max_move_distance)
-        
-        # Grid setup
-        self.n_grids = 1 if shared_grid else n_envs
-        self.grid_indices = torch.zeros(n_envs, dtype=torch.long, device=device) if shared_grid else torch.arange(n_envs, device=device)
+
+        # Grid setup - each env has its own independent grid
+        self.n_grids = n_envs
+        self.grid_indices = torch.arange(n_envs, device=device)
         
         # Per-grid counts
         self.grid_food_counts = torch.full((self.n_grids,), self._default_food, dtype=torch.int32, device=device)
@@ -174,8 +178,15 @@ class TorchVecEnv:
         self._terminated_return = torch.zeros(n_envs, dtype=torch.bool, device=device)
         self._truncated_return = torch.zeros(n_envs, dtype=torch.bool, device=device)
         self._step_rewards = torch.zeros(n_envs, dtype=torch.float32, device=device)
-        self._empty_value = torch.tensor(self.CellType.EMPTY.value, device=device, dtype=torch.float32)
+        self._empty_value = torch.tensor(self._cell_empty, device=device, dtype=torch.float32)
         self._neg_inf = torch.tensor(-float('inf'), device=device, dtype=torch.float32)
+
+        # Pre-allocated constants for branchless torch.where in _reset_agents_masked
+        # These avoid per-reset tensor allocations
+        self._zero_int32 = torch.zeros(n_envs, dtype=torch.int32, device=device)
+        self._zero_bool = torch.zeros(n_envs, dtype=torch.bool, device=device)
+        self._initial_energy_tensor = torch.full((n_envs,), self.initial_energy, dtype=torch.float32, device=device)
+        self._empty_cell_tensor = torch.full((n_envs,), self._cell_empty, dtype=torch.float32, device=device)
 
         # Stats tracking
         self.current_episode_food = torch.zeros(n_envs, dtype=torch.int32, device=device)
@@ -206,7 +217,43 @@ class TorchVecEnv:
         self._density_food_scale = (food_max - food_min) / 2.0 if food_max > food_min else 1.0
         self._density_poison_mid = (poison_min + poison_max) / 2.0
         self._density_poison_scale = (poison_max - poison_min) / 2.0 if poison_max > poison_min else 1.0
-    
+
+    def compile_step(self, mode: str = 'max-autotune-no-cudagraphs', fullgraph: bool = True):
+        """
+        Compile the step method using torch.compile for maximum performance.
+
+        This fuses the environment step + observation extraction into optimized kernels,
+        reducing CPU dispatch overhead from ~8,300 ops/100ms to a single fused kernel.
+
+        Args:
+            mode: torch.compile mode. Options:
+                - 'max-autotune-no-cudagraphs': Best for AMD ROCm (default)
+                - 'max-autotune': Includes CUDA graphs (NVIDIA only)
+                - 'reduce-overhead': Faster compile, less optimization
+            fullgraph: If True, requires entire step to compile as one graph.
+                       Falls back to fullgraph=False if compilation fails.
+
+        Note: Call this AFTER set_curriculum_ranges but BEFORE training starts.
+        """
+        import logging
+
+        try:
+            self._step_uncompiled = self.step
+            compiled = torch.compile(self._step_uncompiled, mode=mode, fullgraph=fullgraph)
+            self.step = compiled
+            logging.info(f"[TorchVecEnv] Compiled step with mode={mode}, fullgraph={fullgraph}")
+        except Exception as e:
+            if fullgraph:
+                logging.warning(f"[TorchVecEnv] fullgraph=True failed: {e}, retrying with fullgraph=False")
+                try:
+                    compiled = torch.compile(self._step_uncompiled, mode=mode, fullgraph=False)
+                    self.step = compiled
+                    logging.info(f"[TorchVecEnv] Compiled step with mode={mode}, fullgraph=False")
+                except Exception as e2:
+                    logging.warning(f"[TorchVecEnv] Compilation failed entirely: {e2}")
+            else:
+                logging.warning(f"[TorchVecEnv] Compilation failed: {e}")
+
     def reset(self, env_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Reset environments and return observations.
 
@@ -222,26 +269,20 @@ class TorchVecEnv:
             # Single sync to get Python-iterable env IDs
             env_id_list = env_ids.tolist()
 
-            if self.shared_grid:
-                # Shared grid mode: reset grid 0 once, then all agents
-                self._reset_grid(0)
-                for env_id in env_id_list:
-                    self._reset_agent(env_id)
-            else:
-                # Independent mode: grid_id == env_id (no lookup needed)
-                done_grids = set()
-                for env_id in env_id_list:
-                    # Each env has its own grid with matching index
-                    if env_id not in done_grids:
-                        self._reset_grid(env_id)
-                        done_grids.add(env_id)
-                    self._reset_agent(env_id)
+            # Independent mode: grid_id == env_id (no lookup needed)
+            done_grids = set()
+            for env_id in env_id_list:
+                # Each env has its own grid with matching index
+                if env_id not in done_grids:
+                    self._reset_grid(env_id)
+                    done_grids.add(env_id)
+                self._reset_agent(env_id)
 
         return self._get_observations()
     
     def _reset_grid(self, grid_id: int):
         """Clear and repopulate a specific grid."""
-        self.grids[grid_id].fill_(self.CellType.EMPTY.value)
+        self.grids[grid_id].fill_(self._cell_empty)
 
         # Randomize counts on GPU (stays on device, no sync)
         food_count = torch.randint(
@@ -257,8 +298,8 @@ class TorchVecEnv:
         self.grid_poison_counts[grid_id] = poison_count
 
         # Place items (accepts tensor counts)
-        self._place_items(grid_id, self.CellType.FOOD.value, food_count)
-        self._place_items(grid_id, self.CellType.POISON.value, poison_count)
+        self._place_items(grid_id, self._cell_food, food_count)
+        self._place_items(grid_id, self._cell_poison, poison_count)
 
     def _reset_all_grids_vectorized(self):
         """Reset all grids in a single batched operation - ZERO GPU sync.
@@ -269,7 +310,7 @@ class TorchVecEnv:
         N = self.n_grids
 
         # Clear all grids at once
-        self.grids.fill_(self.CellType.EMPTY.value)
+        self.grids.fill_(self._cell_empty)
 
         # Generate random counts for all grids at once
         self.grid_food_counts = torch.randint(
@@ -282,10 +323,10 @@ class TorchVecEnv:
         )
 
         # Place food on all grids
-        self._place_items_all_grids(self.CellType.FOOD.value, self.grid_food_counts)
+        self._place_items_all_grids(self._cell_food, self.grid_food_counts)
 
         # Place poison on all grids
-        self._place_items_all_grids(self.CellType.POISON.value, self.grid_poison_counts)
+        self._place_items_all_grids(self._cell_poison, self.grid_poison_counts)
 
     def _place_items_all_grids(self, cell_type: int, counts: torch.Tensor):
         """Place items on all grids simultaneously - ZERO GPU sync.
@@ -305,7 +346,7 @@ class TorchVecEnv:
         noise = torch.rand(N, H, W, device=self.device)
 
         # Mask non-empty cells to -inf so they can't be selected
-        empty_mask = (self.grids == self.CellType.EMPTY.value)
+        empty_mask = (self.grids == self._cell_empty)
         masked_noise = torch.where(empty_mask, noise, self._neg_inf)
 
         # Get top max_k candidates for each grid: (N, max_k)
@@ -368,7 +409,7 @@ class TorchVecEnv:
         noise = torch.rand(N, H, W, device=self.device)
 
         # Mask non-empty cells to -inf so they can't be chosen
-        empty_mask = (grids == self.CellType.EMPTY.value)
+        empty_mask = (grids == self._cell_empty)
         masked_noise = torch.where(empty_mask, noise, self._neg_inf)
 
         # Flatten spatial dimensions for selection
@@ -419,7 +460,7 @@ class TorchVecEnv:
         # Update position and mark on grid
         self.agent_y[env_id] = new_y
         self.agent_x[env_id] = new_x
-        self.agent_underlying_cell[env_id] = self.CellType.EMPTY.value
+        self.agent_underlying_cell[env_id] = self._cell_empty
         self.grids[grid_id, new_y, new_x] = self.agent_types[env_id].float()
 
         self.agent_energy[env_id] = self.initial_energy
@@ -432,66 +473,6 @@ class TorchVecEnv:
         self.current_episode_food[env_id] = 0
         self.current_episode_poison[env_id] = 0
     
-    def _reset_agents_batch(self, env_ids: torch.Tensor):
-        """Batch reset for multiple agents with proper grid marking."""
-        if len(env_ids) == 0:
-            return
-
-        # Update stats (vectorized)
-        self.last_episode_food[env_ids] = self.current_episode_food[env_ids]
-        self.last_episode_poison[env_ids] = self.current_episode_poison[env_ids]
-        self.current_episode_food[env_ids] = 0
-        self.current_episode_poison[env_ids] = 0
-
-        # Restore old cells (clear agent markers) - only where agents are actually marked
-        old_y = self.agent_y[env_ids]
-        old_x = self.agent_x[env_ids]
-        grid_ids = self.grid_indices[env_ids]
-        old_cell_values = self.grids[grid_ids, old_y, old_x]
-        agent_types_for_reset = self.agent_types[env_ids].float()
-        # Only restore where the agent is actually marked
-        actually_marked = (old_cell_values == agent_types_for_reset)
-        restore_values = torch.where(
-            actually_marked,
-            self.agent_underlying_cell[env_ids],
-            old_cell_values  # Keep existing if agent wasn't marked here
-        )
-        self.grids[grid_ids, old_y, old_x] = restore_values
-
-        # Reset energy, steps, dones (vectorized)
-        self.agent_energy[env_ids] = self.initial_energy
-        self.agent_steps[env_ids] = 0
-        self.dones[env_ids] = False
-
-        if self.shared_grid:
-            # Shared grid: sequential spawning for correctness (avoids collisions)
-            # Use range to avoid .tolist() sync; _spawn_agent_on_empty handles tensor indexing
-            for i in range(len(env_ids)):
-                self._spawn_agent_on_empty(env_ids[i])
-        else:
-            # Independent grids: vectorized spawning (each agent has own grid)
-            self._spawn_agents_vectorized(env_ids)
-
-    def _spawn_agent_on_empty(self, env_id):
-        """Spawn a single agent on an empty cell using noise-based selection.
-
-        Args:
-            env_id: Environment index (int or 0-d tensor)
-
-        Uses _random_empty_positions to avoid CPU-GPU sync. Still called
-        sequentially for shared_grid mode to prevent collisions.
-        """
-        grid_id = self.grid_indices[env_id]
-
-        # Select random empty position
-        new_y, new_x = self._random_empty_positions(self.grids[grid_id])
-
-        # Update position and mark on grid
-        self.agent_y[env_id] = new_y
-        self.agent_x[env_id] = new_x
-        self.agent_underlying_cell[env_id] = self.CellType.EMPTY.value
-        self.grids[grid_id, new_y, new_x] = self.agent_types[env_id].float()
-
     def _spawn_agents_vectorized(self, env_ids: torch.Tensor):
         """Fully vectorized spawn using noise-based random selection.
 
@@ -511,7 +492,7 @@ class TorchVecEnv:
         # Update agent positions (vectorized)
         self.agent_y[env_ids] = new_y
         self.agent_x[env_ids] = new_x
-        self.agent_underlying_cell[env_ids] = self.CellType.EMPTY.value
+        self.agent_underlying_cell[env_ids] = self._cell_empty
 
         # Mark agents on grids (vectorized advanced indexing)
         self.grids[grid_ids, new_y, new_x] = self.agent_types[env_ids].float()
@@ -541,10 +522,10 @@ class TorchVecEnv:
             done_mask, self.current_episode_poison, self.last_episode_poison
         )
         self.current_episode_food = torch.where(
-            done_mask, torch.zeros_like(self.current_episode_food), self.current_episode_food
+            done_mask, self._zero_int32, self.current_episode_food
         )
         self.current_episode_poison = torch.where(
-            done_mask, torch.zeros_like(self.current_episode_poison), self.current_episode_poison
+            done_mask, self._zero_int32, self.current_episode_poison
         )
 
         # Restore old cells where done (clear agent markers)
@@ -564,19 +545,15 @@ class TorchVecEnv:
         )
         self.grids[grid_ids, old_y, old_x] = restore_values
 
-        # Reset energy, steps, dones where done
+        # Reset energy, steps, dones where done (using pre-allocated constants)
         self.agent_energy = torch.where(
-            done_mask, self.initial_energy, self.agent_energy
+            done_mask, self._initial_energy_tensor, self.agent_energy
         )
         self.agent_steps = torch.where(
-            done_mask,
-            torch.zeros_like(self.agent_steps),
-            self.agent_steps
+            done_mask, self._zero_int32, self.agent_steps
         )
         self.dones = torch.where(
-            done_mask,
-            torch.zeros_like(self.dones),
-            self.dones
+            done_mask, self._zero_bool, self.dones
         )
 
         # Spawn new positions for ALL agents (cheap), only apply where done
@@ -586,9 +563,7 @@ class TorchVecEnv:
         self.agent_y = torch.where(done_mask, new_y, self.agent_y)
         self.agent_x = torch.where(done_mask, new_x, self.agent_x)
         self.agent_underlying_cell = torch.where(
-            done_mask,
-            torch.full_like(self.agent_underlying_cell, self.CellType.EMPTY.value),
-            self.agent_underlying_cell
+            done_mask, self._empty_cell_tensor, self.agent_underlying_cell
         )
 
         # Mark agents on grids where done
@@ -635,7 +610,7 @@ class TorchVecEnv:
         scatter_values = torch.where(
             valid_mask,
             torch.tensor(cell_type, device=self.device, dtype=flat_grid.dtype),
-            torch.tensor(self.CellType.EMPTY.value, device=self.device, dtype=flat_grid.dtype)
+            torch.tensor(self._cell_empty, device=self.device, dtype=flat_grid.dtype)
         ).expand(max_k)
         flat_grid.scatter_(0, flat_indices, scatter_values)
     
@@ -664,17 +639,12 @@ class TorchVecEnv:
         dx = self.action_deltas[actions, 0]
         dy = self.action_deltas[actions, 1]
 
-        # Move agents
-        if self.loop:
-            self.agent_x = (self.agent_x + dx) % self.width
-            self.agent_y = (self.agent_y + dy) % self.height
-        else:
-            self.agent_x = torch.clamp(self.agent_x + dx, 0, self.width - 1)
-            self.agent_y = torch.clamp(self.agent_y + dy, 0, self.height - 1)
+        # Move agents (toroidal wrapping)
+        self.agent_x = (self.agent_x + dx) % self.width
+        self.agent_y = (self.agent_y + dy) % self.height
 
-        # Energy cost (skipped when frozen for training exploration)
-        if not self.freeze_energy:
-            self.agent_energy -= self.energy_move_cost
+        # Energy cost (branchless: multiplier is 0.0 when frozen)
+        self.agent_energy -= self.energy_move_cost * self._energy_enabled
 
         # Eating (updates energy unless frozen, plus underlying_cell and item clearing)
         food_mask, poison_mask = self._eat_batch()
@@ -690,11 +660,8 @@ class TorchVecEnv:
         # Truncated: hit time limit (in-place comparison)
         torch.ge(self.agent_steps, self.max_steps, out=self.truncated)
 
-        # Terminated: agent died (in-place, respects freeze_energy)
-        if self.freeze_energy:
-            self.terminated.zero_()  # In-place zero, no allocation
-        else:
-            torch.le(self.agent_energy, 0, out=self.terminated)
+        # Terminated: agent died (branchless - when freeze_energy, energy never drops so always False)
+        torch.le(self.agent_energy, 0, out=self.terminated)
 
         # Dones: combined for reset logic (in-place OR)
         torch.bitwise_or(self.terminated, self.truncated, out=self.dones)
@@ -704,18 +671,8 @@ class TorchVecEnv:
         self._terminated_return.copy_(self.terminated)
         self._truncated_return.copy_(self.truncated)
 
-        # Auto-reset done agents
-        # Use masked reset for independent grids (training) - no GPU sync
-        # Use indexed reset for shared grid (visualization) - handles collisions
-        if self.shared_grid:
-            # Shared grid: need sequential spawning to avoid collisions
-            # This path still syncs but is only used for visualization
-            if self.dones.any():
-                done_indices = self.dones.nonzero(as_tuple=True)[0]
-                self._reset_agents_batch(done_indices)
-        else:
-            # Independent grids: fully masked reset - ZERO GPU sync
-            self._reset_agents_masked(self.dones)
+        # Auto-reset done agents - fully masked reset (ZERO GPU sync)
+        self._reset_agents_masked(self.dones)
 
         eating_info = (food_mask, poison_mask, self.terminated)
         return self._get_observations(), eating_info, self._terminated_return, self._truncated_return
@@ -732,13 +689,16 @@ class TorchVecEnv:
         cell_values = self.grids[self.grid_indices, self.agent_y, self.agent_x]
 
         # Detect what was eaten
-        food_mask = (cell_values == self.CellType.FOOD.value)
-        poison_mask = (cell_values == self.CellType.POISON.value)
+        food_mask = (cell_values == self._cell_food)
+        poison_mask = (cell_values == self._cell_poison)
 
-        # Update agent energy (skipped when frozen for training exploration)
-        if not self.freeze_energy:
-            self.agent_energy = torch.where(food_mask, self.agent_energy + self.food_reward, self.agent_energy)
-            self.agent_energy = torch.where(poison_mask, self.agent_energy - self.poison_penalty, self.agent_energy)
+        # Update agent energy (branchless: multiplier is 0.0 when frozen, so no change)
+        self.agent_energy = torch.where(
+            food_mask, self.agent_energy + self.food_reward * self._energy_enabled, self.agent_energy
+        )
+        self.agent_energy = torch.where(
+            poison_mask, self.agent_energy - self.poison_penalty * self._energy_enabled, self.agent_energy
+        )
 
         # Update episode counters
         self.current_episode_food = torch.where(food_mask, self.current_episode_food + 1, self.current_episode_food)
@@ -756,8 +716,8 @@ class TorchVecEnv:
         self.grids[self.grid_indices, self.agent_y, self.agent_x] = final_cell_values
 
         # Respawn eaten items
-        self._respawn_items_vectorized(food_mask, self.CellType.FOOD.value)
-        self._respawn_items_vectorized(poison_mask, self.CellType.POISON.value)
+        self._respawn_items_vectorized(food_mask, self._cell_food)
+        self._respawn_items_vectorized(poison_mask, self._cell_poison)
 
         return food_mask, poison_mask
     
@@ -779,7 +739,7 @@ class TorchVecEnv:
         # Check which candidates are empty
         grid_read_ids = self.grid_indices.unsqueeze(1)  # (N, 1)
         vals = self.grids[grid_read_ids, rand_y, rand_x]  # (N, K)
-        is_empty = (vals == self.CellType.EMPTY.value)  # (N, K) bool
+        is_empty = (vals == self._cell_empty)  # (N, K) bool
 
         # Select first valid candidate (argmax returns index of first True)
         first_valid_idx = is_empty.int().argmax(dim=1)  # (N,)
@@ -813,14 +773,8 @@ class TorchVecEnv:
         r = self.view_radius
         vs = self.view_size
 
-        # Pad grids (grid is float32, no conversion needed)
-        if self.loop:
-            padded_grids = F.pad(self.grids, (r, r, r, r), mode='circular')
-        else:
-            padded_grids = F.pad(
-                self.grids, (r, r, r, r),
-                mode='constant', value=float(self.CellType.WALL.value)
-            )
+        # Pad grids with circular wrapping (grid is float32, no conversion needed)
+        padded_grids = F.pad(self.grids, (r, r, r, r), mode='circular')
 
         # VECTORIZED VIEW EXTRACTION using unfold
         windows = padded_grids.unfold(1, vs, 1).unfold(2, vs, 1)
@@ -837,8 +791,8 @@ class TorchVecEnv:
             views_int = views.int()  # int32 for TPU-friendly indexing
 
             # Binary channels for empty/wall
-            self._view_buffer[:, 0, :, :] = (views_int == self.CellType.EMPTY.value).float()
-            self._view_buffer[:, 1, :, :] = (views_int == self.CellType.WALL.value).float()
+            self._view_buffer[:, 0, :, :] = (views_int == self._cell_empty).float()
+            self._view_buffer[:, 1, :, :] = (views_int == self._cell_wall).float()
 
             # Interestingness channel (lookup from cell values)
             # Clamp to valid indices to avoid index errors
@@ -888,11 +842,10 @@ class TorchVecEnv:
 
 
 def create_torch_vec_env(
-    n_envs: int, 
-    obs_spec: ObservationSpec, 
+    n_envs: int,
+    obs_spec: ObservationSpec,
     config: dict = None,
     device: Optional[torch.device] = None,
-    shared_grid: bool = False,
     agent_types: list[int] = None
 ) -> TorchVecEnv:
     """Factory function to create a GPU-native vectorized environment."""
@@ -901,6 +854,5 @@ def create_torch_vec_env(
         obs_spec=obs_spec,
         config=config,
         device=device,
-        shared_grid=shared_grid,
         agent_types=agent_types
     )

@@ -253,27 +253,8 @@ class TestViewExtraction:
         assert obs[0, food_channel, r + 1, r].item() == 1.0, "Food at +y not at expected position"
         assert obs[0, food_channel, r - 1, r].item() == 1.0, "Food at -y not at expected position"
 
-    def test_view_at_corner_with_padding(self, config, device):
-        """View at grid corner should use wall padding in bounded mode."""
-        config['WORLD_LOOP'] = False
-        spec = ObservationSpec.for_mode('ground_truth', config)
-        env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
-
-        # Place agent at corner
-        env.agent_x[0] = 0
-        env.agent_y[0] = 0
-
-        obs = env._get_observations()
-
-        wall_channel = CellType.WALL.channel_index
-
-        # Top-left of view should be wall (padding)
-        assert obs[0, wall_channel, 0, 0].item() == 1.0, \
-            "Corner padding should be wall"
-
     def test_view_at_edge_with_wrapping(self, config, device):
-        """View at grid edge should wrap in looping mode."""
-        config['WORLD_LOOP'] = True
+        """View at grid edge should wrap (toroidal world)."""
         spec = ObservationSpec.for_mode('ground_truth', config)
         env = create_torch_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
 

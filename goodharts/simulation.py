@@ -2,7 +2,10 @@
 Simulation orchestrator for Goodhart's Law demonstration.
 
 Manages the valid vectorized environment and agents.
-Refactored to use TorchVecEnv (with shared_grid=True) replacing the legacy World/Organism.
+Refactored to use TorchVecEnv replacing the legacy World/Organism.
+
+NOTE: Visualization mode is currently limited - all agents share grid[0] but have
+independent environments. Full shared_grid support removed for training optimization.
 """
 import torch
 from goodharts.behaviors.learned import LEARNED_PRESETS
@@ -128,11 +131,12 @@ class Simulation:
         spec = ObservationSpec.for_mode(mode, config)
         
         # Uses TorchVecEnv via the updated import
+        # NOTE: Previously used shared_grid=True for visualization, but that mode
+        # was removed for training optimization. Each agent now has its own grid.
         self.vec_env = create_vec_env(
-            n_envs=num_agents, 
-            obs_spec=spec, 
+            n_envs=num_agents,
+            obs_spec=spec,
             config=config,
-            shared_grid=True,
             agent_types=agent_types
         )
         
