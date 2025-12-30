@@ -592,7 +592,7 @@ class PPOConfig:
     log_dir: str = 'generated/logs'
     use_amp: bool = False
     compile_models: bool = True
-    compile_mode: str = 'max-autotune-no-cudagraphs'  # reduce-overhead, max-autotune, max-autotune-no-cudagraphs
+    compile_mode: str = 'max-autotune'  # reduce-overhead, max-autotune, max-autotune-no-cudagraphs
     compile_env: bool = True  # torch.compile the environment step for better GPU utilization
     tensorboard: bool = False
     skip_warmup: bool = False
@@ -660,7 +660,7 @@ class PPOConfig:
             'value_coef': train_cfg['value_coef'],
             'use_amp': train_cfg['use_amp'],
             'compile_models': train_cfg['compile_models'],
-            'compile_mode': train_cfg.get('compile_mode', 'max-autotune-no-cudagraphs'),
+            'compile_mode': train_cfg.get('compile_mode', 'max-autotune'),
             'compile_env': train_cfg.get('compile_env', True),  # Compile env.step() by default
             # Validation
             'validation_interval': train_cfg['validation_interval'],
@@ -820,38 +820,66 @@ class PPOTrainer:
         terminated_buf = self._terminated_buf
         values_buf = self._values_buf
 
+        # Initial inference to get first actions (same as main loop)
+        potentials = self.reward_computer.get_initial_potentials(states)
+        density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
+        with torch.no_grad():
+            with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                logits, features = self.policy.forward_with_features(states.float())
+                dist = Categorical(logits=logits, validate_args=False)
+                actions = dist.sample()
+                log_probs = dist.log_prob(actions)
+                values = self.value_head(features, density_info).squeeze(-1)
+
         for step in range(cfg.steps_per_env):
             with torch.no_grad():
-                # Get density info for privileged critic
-                density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
+                # Use compiled rollout step if available (triggers CUDA graph capture)
+                if self._compiled_rollout_step is not None:
+                    torch.compiler.cudagraph_mark_step_begin()
+                    (
+                        next_states, next_actions, next_log_probs, next_values,
+                        next_potentials, logits,
+                        _current_states, _shaped_rewards, _dones, _terminated, _density_info
+                    ) = self._compiled_rollout_step(
+                        actions, log_probs, values, states, potentials
+                    )
+                    # Warmup doesn't need to write buffers, just exercise the compiled path
 
-                # Inference (eager mode during warmup - fused rollout step handles main loop)
-                with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                    logits, features = self.policy.forward_with_features(states.float())
-                    dist = Categorical(logits=logits, validate_args=False)
-                    actions = dist.sample()
-                    log_probs = dist.log_prob(actions)
-                    values = self.value_head(features, density_info).squeeze(-1)
+                    # Clone outputs to prevent CUDA graph buffer reuse issues
+                    states = next_states.clone()
+                    actions = next_actions.clone()
+                    log_probs = next_log_probs.clone()
+                    values = next_values.clone()
+                    potentials = next_potentials.clone()
+                else:
+                    # Fallback: eager mode
+                    density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
+                    with autocast(device_type=self.device_type, enabled=cfg.use_amp):
+                        logits, features = self.policy.forward_with_features(states.float())
+                        dist = Categorical(logits=logits, validate_args=False)
+                        actions = dist.sample()
+                        log_probs = dist.log_prob(actions)
+                        values = self.value_head(features, density_info).squeeze(-1)
 
-            current_states = states.clone()
-            next_states, eating_info, terminated, truncated = self.vec_env.step(actions)
-            dones = terminated | truncated
-            shaped_rewards = self.reward_computer.compute(eating_info, current_states, next_states, terminated)
+                    current_states = states.clone()
+                    next_states, eating_info, terminated, truncated = self.vec_env.step(actions)
+                    dones = terminated | truncated
+                    shaped_rewards = self.reward_computer.compute(eating_info, current_states, next_states, terminated)
 
-            # Store in pre-allocated tensor buffers
-            states_buf[step] = current_states
-            actions_buf[step] = actions
-            log_probs_buf[step] = log_probs.detach()
-            rewards_buf[step] = shaped_rewards
-            dones_buf[step] = dones
-            terminated_buf[step] = terminated
-            values_buf[step] = values
-            if self._aux_buf is not None:
-                self._aux_buf[step] = density_info
+                    # Store in pre-allocated tensor buffers
+                    states_buf[step] = current_states
+                    actions_buf[step] = actions
+                    log_probs_buf[step] = log_probs.detach()
+                    rewards_buf[step] = shaped_rewards
+                    dones_buf[step] = dones
+                    terminated_buf[step] = terminated
+                    values_buf[step] = values
+                    if self._aux_buf is not None:
+                        self._aux_buf[step] = density_info
 
-            episode_rewards += shaped_rewards
-            episode_rewards *= (~dones)
-            states = next_states
+                    episode_rewards += shaped_rewards
+                    episode_rewards *= (~dones)
+                    states = next_states
 
         # Bootstrap value
         with torch.no_grad():
@@ -862,7 +890,8 @@ class PPOTrainer:
 
         # Compute GAE (pass tensors directly, no stacking needed)
         # Use terminated_buf - only zero bootstrap on true death
-        advantages, returns = compute_gae(
+        gae_fn = self._compiled_gae if self._compiled_gae is not None else compute_gae
+        advantages, returns = gae_fn(
             rewards_buf, values_buf, terminated_buf,
             next_value, cfg.gamma, cfg.gae_lambda, device=self.device
         )
@@ -1089,6 +1118,11 @@ class PPOTrainer:
         self._compiled_inference = None
         self._compiled_rollout_step = None
         self._compiled_ppo_update = None
+        self._compiled_gae = None
+
+        # Pre-allocated constants for BUFFER_FLATTEN (avoids tensor creation each update)
+        self._inf_const = torch.tensor(float('inf'), device=self.device)
+        self._neg_inf_const = torch.tensor(float('-inf'), device=self.device)
 
         # Optimizer - use fused=True on CUDA to eliminate .item() sync overhead
         # Fused runs entirely on GPU, avoiding 384 CPU round-trips per update
@@ -1106,6 +1140,38 @@ class PPOTrainer:
             gamma=cfg.gamma,
             device=self.device
         )
+
+        # Pre-allocate rollout buffers (eliminates torch.cat burstiness)
+        # These are GPU tensors that get overwritten each update cycle
+        # MUST be allocated before compile block since closures capture these references
+        obs_shape = (cfg.steps_per_env, cfg.n_envs,
+                     self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size)
+        scalar_shape = (cfg.steps_per_env, cfg.n_envs)
+
+        self._states_buf = torch.zeros(obs_shape, device=self.device, dtype=torch.uint8)
+        self._actions_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.long)
+        self._log_probs_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
+        self._rewards_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
+        self._dones_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
+        self._terminated_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
+        self._values_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
+
+        # Privileged critic: density info buffer (food_density, poison_density per step)
+        if self._num_aux_inputs > 0:
+            aux_shape = (cfg.steps_per_env, cfg.n_envs, self._num_aux_inputs)
+            self._aux_buf = torch.zeros(aux_shape, device=self.device, dtype=torch.float32)
+        else:
+            self._aux_buf = None
+
+        # Episode tracking buffers (for async logging)
+        self._finished_dones_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
+        self._finished_rewards_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
+
+        # Note: step_idx tensor removed - buffer writes now use Python int index
+        # outside the compiled function to avoid implicit .item() calls
+
+        # Episode rewards accumulator lives in TorchVecEnv (nn.Module buffer for CUDA graph stability)
+        # Accessed via vec_env.episode_rewards
 
         # Compile models for extra speed if torch.compile is available (PyTorch 2.0+)
         # Use lock to serialize compilation - Dynamo's global state is not thread-safe
@@ -1129,35 +1195,42 @@ class PPOTrainer:
                     use_amp = cfg.use_amp
                     privileged_critic = cfg.privileged_critic
 
+                    # Capture buffer references for fused buffer storage
+                    states_buf = self._states_buf
+                    actions_buf = self._actions_buf
+                    log_probs_buf = self._log_probs_buf
+                    rewards_buf = self._rewards_buf
+                    dones_buf = self._dones_buf
+                    terminated_buf = self._terminated_buf
+                    values_buf = self._values_buf
+                    aux_buf = self._aux_buf
+                    finished_dones_buf = self._finished_dones_buf
+                    finished_rewards_buf = self._finished_rewards_buf
+                    # NOTE: episode_rewards must be accessed through vec_env (not captured)
+                    # to maintain nn.Module buffer semantics for CUDA graph compatibility
+                    # NOTE: Buffer writes done outside compiled function with Python int index
+
                     # ============================================================
-                    # FUSED ROLLOUT STEP: ENV_STEP + REWARD_SHAPE + INFERENCE
+                    # FUSED ROLLOUT STEP: ENV + REWARD + INFERENCE + BUFFER + TRACK
                     # ============================================================
-                    # This is the Step-Then-Infer pattern compiled as ONE graph.
-                    # All three operations are fused, eliminating graph breaks
-                    # between env stepping, reward shaping, and inference.
+                    # All operations compiled into ONE graph for maximum fusion.
+                    # This eliminates CPU dispatch overhead between operations.
                     @torch.compile(mode=compile_mode)
-                    def compiled_rollout_step(actions, states, potentials):
+                    def compiled_rollout_step(actions, log_probs, values, states, potentials):
                         """
-                        Fused rollout step: ENV_STEP -> REWARD_SHAPE -> INFERENCE.
+                        Fully fused rollout step with buffer storage and episode tracking.
 
                         Args:
-                            actions: Current actions to execute
+                            actions: Current actions to execute (also stored to buffer)
+                            log_probs: Current log probs (stored to buffer)
+                            values: Current values (stored to buffer)
                             states: Current observations (before step)
                             potentials: Current potential values for reward shaping
 
                         Returns:
-                            Tuple of (for_buffer, for_next_iter):
-                            - current_states: States before step (for buffer)
-                            - shaped_rewards: Rewards from this step (for buffer)
-                            - dones: Episode done flags (for buffer)
-                            - terminated: True termination flags (for buffer)
-                            - next_states: States after step (for next iter)
-                            - next_actions: Actions for next step
-                            - next_log_probs: Log probs for next step
-                            - next_values: Values for next step
-                            - next_potentials: Potentials for next step
-                            - density_info: Density info (for aux buffer)
-                            - logits: Raw logits (for logging)
+                            Tuple for next iteration:
+                            - next_states, next_actions, next_log_probs, next_values
+                            - next_potentials, logits (for action prob logging)
                         """
                         # Snapshot current states before env mutates them
                         current_states = states.clone()
@@ -1182,10 +1255,19 @@ class PPOTrainer:
                             next_log_probs = dist.log_prob(next_actions)
                             next_values = value_head(features, density_info).squeeze(-1)
 
+                        # EPISODE_TRACK - accumulate rewards, reset on done
+                        # Access through vec_env (not captured) to maintain nn.Module buffer semantics
+                        vec_env.episode_rewards.add_(shaped_rewards)
+                        vec_env.episode_rewards.mul_(~dones)  # Reset for done agents
+
+                        # Return all values needed for buffer writes (done outside with Python int index)
+                        # NOTE: Buffer writes with tensor indices cause implicit .item() calls,
+                        # breaking the graph into multiple regions. We return values instead.
                         return (
-                            current_states, shaped_rewards, dones, terminated,
                             next_states, next_actions, next_log_probs, next_values,
-                            next_potentials, density_info, logits
+                            next_potentials, logits,
+                            # Additional returns for buffer storage (written outside compiled function)
+                            current_states, shaped_rewards, dones, terminated, density_info
                         )
 
                     self._compiled_rollout_step = compiled_rollout_step
@@ -1199,7 +1281,11 @@ class PPOTrainer:
                     # Compile PPO update function
                     self._compiled_ppo_update = torch.compile(ppo_update, mode=compile_mode)
 
-                    print(f"   [JIT] torch.compile enabled ({compile_mode}) - fused rollout step")
+                    # Compile GAE computation (27x speedup from loop optimization)
+                    # Use reduce-overhead for better CUDA graph capture of the loop
+                    self._compiled_gae = torch.compile(compute_gae, mode=compile_mode)
+
+                    print(f"   [JIT] torch.compile enabled ({compile_mode}) - fused rollout step + GAE")
                 except RuntimeError as e:
                     if "FX" in str(e) or "dynamo" in str(e).lower():
                         print(f"   [JIT] Warning: torch.compile failed ({e}). Using eager mode.")
@@ -1278,31 +1364,6 @@ class PPOTrainer:
         self.checkpoint_interval = train_cfg.get('checkpoint_interval', 0)
         self.checkpoint_dir = os.path.dirname(cfg.output_path) or 'models'
 
-        # Pre-allocate rollout buffers (eliminates torch.cat burstiness)
-        # These are GPU tensors that get overwritten each update cycle
-        obs_shape = (cfg.steps_per_env, cfg.n_envs,
-                     self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size)
-        scalar_shape = (cfg.steps_per_env, cfg.n_envs)
-
-        self._states_buf = torch.zeros(obs_shape, device=self.device, dtype=torch.uint8)
-        self._actions_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.long)
-        self._log_probs_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
-        self._rewards_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
-        self._dones_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
-        self._terminated_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
-        self._values_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
-
-        # Privileged critic: density info buffer (food_density, poison_density per step)
-        if self._num_aux_inputs > 0:
-            aux_shape = (cfg.steps_per_env, cfg.n_envs, self._num_aux_inputs)
-            self._aux_buf = torch.zeros(aux_shape, device=self.device, dtype=torch.float32)
-        else:
-            self._aux_buf = None
-
-        # Episode tracking buffers (for async logging)
-        self._finished_dones_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
-        self._finished_rewards_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
-
         # Async metrics pipeline: GPU transfers to pinned memory while continuing work
         # We process PREVIOUS update's metrics while GPU runs NEXT update
         # 18 = 6 episode aggregates + 4 PPO metrics + 8 action probs (max)
@@ -1321,6 +1382,7 @@ class PPOTrainer:
 
         # Use pre-allocated GPU tensor buffers (from _setup)
         # These eliminate torch.cat overhead that caused GPU burstiness
+        # For non-compiled path, create local refs; compiled path uses closures
         states_buf = self._states_buf
         actions_buf = self._actions_buf
         log_probs_buf = self._log_probs_buf
@@ -1331,9 +1393,13 @@ class PPOTrainer:
         finished_dones_buf = self._finished_dones_buf
         finished_rewards_buf = self._finished_rewards_buf
 
-        # Current step within the buffer (reset each update)
+        # Step index for buffer writes (Python int - no GPU sync needed)
         step_in_buffer = 0
-        
+
+        # Episode rewards accumulator (nn.Module buffer in TorchVecEnv for CUDA graph stability)
+        episode_rewards = self.vec_env.episode_rewards
+        episode_rewards.zero_()
+
         # Initial state
         _vprint("Resetting environment for initial state...", v)
         states = self.vec_env.reset()
@@ -1342,7 +1408,6 @@ class PPOTrainer:
         # Initialize reward computer
         _vprint("Initializing reward computer...", v)
         self.reward_computer.initialize(states)  # stays on GPU
-        episode_rewards = torch.zeros(cfg.n_envs, device=self.device)
         _vprint("Training loop ready to start", v)
 
         # === WARMUP UPDATE (lazy init) ===
@@ -1470,18 +1535,38 @@ class PPOTrainer:
                 needs_initial_inference = False
 
             # ============================================================
-            # FUSED ROLLOUT STEP: ENV_STEP + REWARD_SHAPE + INFERENCE
+            # FUSED ROLLOUT STEP: ENV + REWARD + INFERENCE + BUFFER + TRACK
             # ============================================================
-            # All three operations compiled into ONE graph for maximum fusion.
+            # All operations compiled into ONE graph for maximum fusion.
             with torch.no_grad():
                 if self._compiled_rollout_step is not None:
                     with record_function("ROLLOUT_STEP"):
                         torch.compiler.cudagraph_mark_step_begin()
+                        # Compiled function returns values; we write buffers with Python int index
                         (
-                            current_states, shaped_rewards, dones, terminated,
                             next_states, next_actions, next_log_probs, next_values,
-                            next_potentials, next_density_info, logits
-                        ) = self._compiled_rollout_step(actions, states, potentials)
+                            next_potentials, logits,
+                            current_states, shaped_rewards, dones, terminated, density_info
+                        ) = self._compiled_rollout_step(
+                            actions, log_probs, values, states, potentials
+                        )
+
+                    # BUFFER_STORE - use Python int index (no GPU sync)
+                    # Done outside compiled function to avoid .item() calls on tensor indices
+                    step_i = step_in_buffer
+                    states_buf[step_i] = current_states
+                    actions_buf[step_i] = actions
+                    log_probs_buf[step_i] = log_probs
+                    rewards_buf[step_i] = shaped_rewards
+                    dones_buf[step_i] = dones
+                    terminated_buf[step_i] = terminated
+                    values_buf[step_i] = values
+                    if self._aux_buf is not None:
+                        self._aux_buf[step_i] = density_info
+                    finished_dones_buf[step_i] = dones
+                    finished_rewards_buf[step_i] = episode_rewards
+
+                    step_in_buffer += 1
                 else:
                     # Fallback to separate calls (eager mode)
                     with record_function("ENV_STEP"):
@@ -1504,42 +1589,48 @@ class PPOTrainer:
                             next_log_probs = dist.log_prob(next_actions)
                             next_values = self.value_head(features, next_density_info).squeeze(-1)
 
+                    # BUFFER_STORE (eager path only - compiled path does this inside)
+                    with record_function("BUFFER_STORE"):
+                        step_i = step_in_buffer  # Use Python int - no GPU sync
+                        states_buf[step_i] = current_states
+                        actions_buf[step_i] = actions
+                        log_probs_buf[step_i] = log_probs.detach()
+                        rewards_buf[step_i] = shaped_rewards
+                        dones_buf[step_i] = dones
+                        terminated_buf[step_i] = terminated
+                        values_buf[step_i] = values
+                        if self._aux_buf is not None:
+                            self._aux_buf[step_i] = next_density_info
+                        finished_dones_buf[step_i] = dones
+                        finished_rewards_buf[step_i] = episode_rewards
+
+                    # EPISODE_TRACK (eager path only)
+                    with record_function("EPISODE_TRACK"):
+                        episode_rewards += shaped_rewards
+                        episode_rewards *= (~dones)
+
+                    step_in_buffer += 1
+
             # Store logits for action_probs logging
             last_logits = logits
             self.profiler.tick("Inference")
-
-            # Store experience in pre-allocated tensor buffers
-            # Note: Each indexed write triggers CPU dispatch + GPU DtoD copy
-            with record_function("BUFFER_STORE"):
-                states_buf[step_in_buffer] = current_states
-                actions_buf[step_in_buffer] = actions
-                log_probs_buf[step_in_buffer] = log_probs.detach()
-                rewards_buf[step_in_buffer] = shaped_rewards
-                dones_buf[step_in_buffer] = dones
-                terminated_buf[step_in_buffer] = terminated
-                values_buf[step_in_buffer] = values
-                if self._aux_buf is not None:
-                    self._aux_buf[step_in_buffer] = next_density_info
-
-                # Track episode stats (defer logging to avoid Sync)
-                finished_dones_buf[step_in_buffer] = dones
-                finished_rewards_buf[step_in_buffer] = episode_rewards
-
-            step_in_buffer += 1
             self.total_steps += cfg.n_envs
 
-            # Episode tracking (tensor ops, not compiled)
-            with record_function("EPISODE_TRACK"):
-                episode_rewards += shaped_rewards
-                episode_rewards *= (~dones)  # Reset for done agents
-
             # Carry forward for next iteration
-            states = next_states
-            actions = next_actions
-            log_probs = next_log_probs
-            values = next_values
-            potentials = next_potentials
-            density_info = next_density_info
+            # Clone outputs from compiled function to prevent CUDA graph buffer reuse issues
+            # (CUDA graphs reuse output memory; without clone, next call overwrites these)
+            if self._compiled_rollout_step is not None:
+                states = next_states.clone()
+                actions = next_actions.clone()
+                log_probs = next_log_probs.clone()
+                values = next_values.clone()
+                potentials = next_potentials.clone()
+            else:
+                states = next_states
+                actions = next_actions
+                log_probs = next_log_probs
+                values = next_values
+                potentials = next_potentials
 
             # PPO Update (when buffer is full)
             if step_in_buffer >= cfg.steps_per_env:
@@ -1556,7 +1647,8 @@ class PPOTrainer:
 
                     # Compute GAE (pass pre-allocated tensors directly, no stacking)
                     # Use terminated_buf (not dones_buf) - only zero bootstrap on true death
-                    advantages, returns = compute_gae(
+                    gae_fn = self._compiled_gae if self._compiled_gae is not None else compute_gae
+                    advantages, returns = gae_fn(
                         rewards_buf, values_buf, terminated_buf,
                         next_value, cfg.gamma, cfg.gae_lambda, device=self.device
                     )
@@ -1574,24 +1666,22 @@ class PPOTrainer:
                     all_step_rewards = finished_rewards_buf  # Already (steps, envs)
 
                     # Masked aggregates - all ops stay on GPU
+                    # Use pre-allocated inf constants (avoids tensor creation overhead)
                     done_mask = all_step_dones.float()
-                    INF = torch.tensor(float('inf'), device=self.device)
 
                     # Food/poison: sum for envs that finished at least once this update
                     any_done_per_env = all_step_dones.any(dim=0)  # (envs,)
 
                     # Episode aggregates - order must match metrics_keys in sync section
-                    episode_agg_values = [
+                    # Use pre-allocated constants and stack into tensor
+                    episode_agg_tensor = torch.stack([
                         done_mask.sum(),
                         (all_step_rewards * done_mask).sum(),
-                        torch.where(all_step_dones, all_step_rewards, INF).min(),
-                        torch.where(all_step_dones, all_step_rewards, -INF).max(),
+                        torch.where(all_step_dones, all_step_rewards, self._inf_const).min(),
+                        torch.where(all_step_dones, all_step_rewards, self._neg_inf_const).max(),
                         (self.vec_env.last_episode_food * any_done_per_env).sum().float(),
                         (self.vec_env.last_episode_poison * any_done_per_env).sum().float(),
-                    ]
-
-                    # Stack into tensor (size determined by list length, not hardcoded)
-                    episode_agg_tensor = torch.stack(episode_agg_values)
+                    ])
 
                     # Reshape pre-allocated buffers (no torch.cat needed!)
                     # states_buf is (steps, envs, C, H, W) -> flatten to (steps*envs, C, H, W)

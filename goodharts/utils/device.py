@@ -444,20 +444,60 @@ def create_optimizer(
         raise ValueError(f"Unknown optimizer type: {optimizer_type}")
 
 
+def configure_inductor_cache(cache_dir: str = None, verbose: bool = True):
+    """
+    Configure persistent caching for torch.compile/Inductor.
+
+    By default, PyTorch caches compiled graphs to /tmp/ which is cleared on reboot.
+    This sets up a persistent cache in ~/.cache/torch_inductor_persistent/ so that
+    CUDA graphs and autotuned kernels persist across restarts.
+
+    Args:
+        cache_dir: Custom cache directory (default: ~/.cache/torch_inductor_persistent/)
+        verbose: Print cache configuration
+
+    Note:
+        Must be called BEFORE any torch.compile() calls to take effect.
+        Automatically called by apply_system_optimizations().
+    """
+    if cache_dir is None:
+        cache_dir = os.path.expanduser('~/.cache/torch_inductor_persistent')
+
+    # Create cache directory if it doesn't exist
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Set environment variable for Inductor cache
+    # This must be set before torch._inductor is imported
+    os.environ['TORCHINDUCTOR_CACHE_DIR'] = cache_dir
+
+    # Also configure via the config module if available
+    try:
+        import torch._inductor.config as inductor_config
+        # Ensure caching is enabled
+        inductor_config.fx_graph_cache = True
+        inductor_config.autotune_local_cache = True
+    except (ImportError, AttributeError):
+        pass  # Old PyTorch version without these configs
+
+    if verbose:
+        print(f"   Inductor cache: {cache_dir}")
+
+
 def apply_system_optimizations(device: torch.device = None, verbose: bool = True):
     """
     Apply global performance optimizations for the given device.
-    
+
     Automatically enables:
     - TensorFloat32 (TF32) for matmuls on Ampere+ GPUs (huge speedup for FP32)
     - cuDNN benchmarking (finds best convolution algorithms)
-    
+    - Persistent Inductor cache (avoids recompilation on restart)
+
     Args:
         device: Device to optimize for (default: auto-detect)
         verbose: Print applied optimizations
     """
     global _optimizations_applied
-    
+
     # Fast path - check if already done
     if _optimizations_applied:
         return
@@ -467,7 +507,10 @@ def apply_system_optimizations(device: torch.device = None, verbose: bool = True
         # Check again inside lock
         if _optimizations_applied:
             return
-            
+
+        # Configure persistent Inductor cache FIRST (before any compilation)
+        configure_inductor_cache(verbose=verbose)
+
         if device is None:
             device = get_device(verbose=False)
             

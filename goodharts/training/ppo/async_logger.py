@@ -108,8 +108,8 @@ class AsyncLogger:
     
     def _process_payload(self, p: LogPayload):
         """Do I/O work for one update (no GPU access here)."""
-        # Console output - show rolling sps prominently, instant/global in brackets
-        print(f"   [{p.mode}] Step {p.total_steps:,}: {p.sps_rolling:,.0f} sps [{p.sps_instant:,.0f}/{p.sps_global:,.0f}] | Best R={p.best_reward:.0f} | Ent={p.entropy:.3f} | ValL={p.value_loss:.4f} | ExpV={p.explained_var:.4f}")
+        # Console output - show instant sps prominently, rolling/global in brackets
+        print(f"   [{p.mode}] Step {p.total_steps:,}: {p.sps_instant:,.0f} sps [{p.sps_rolling:,.0f}/{p.sps_global:,.0f}] | Best R={p.best_reward:.0f} | Ent={p.entropy:.3f} | ValL={p.value_loss:.4f} | ExpV={p.explained_var:.4f}")
         if p.profiler_summary and p.profiler_summary != "No data":
             print(f"   [Profile] {p.profiler_summary}")
         
