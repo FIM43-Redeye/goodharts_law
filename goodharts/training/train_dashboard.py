@@ -354,13 +354,33 @@ class TrainingDashboard:
                     row=i, col=j
                 )
 
-        # Secondary y-axis styling
+        # Dual y-axis labels for Losses panel (row 1, col 2)
         fig.update_yaxes(
+            title_text='Policy',
+            title_font=dict(color=COLORS['policy_loss'], size=10),
+            gridcolor=COLORS['grid'],
+            zerolinecolor=COLORS['grid'],
+            row=1, col=2, secondary_y=False
+        )
+        fig.update_yaxes(
+            title_text='Value',
+            title_font=dict(color=COLORS['value_loss'], size=10),
             gridcolor=COLORS['grid'],
             zerolinecolor=COLORS['grid'],
             row=1, col=2, secondary_y=True
         )
+
+        # Dual y-axis labels for Behavior panel (row 2, col 2)
         fig.update_yaxes(
+            title_text='Count',
+            title_font=dict(size=10),
+            gridcolor=COLORS['grid'],
+            zerolinecolor=COLORS['grid'],
+            row=2, col=2, secondary_y=False
+        )
+        fig.update_yaxes(
+            title_text='Ratio',
+            title_font=dict(color=COLORS['food_ratio'], size=10),
             gridcolor=COLORS['grid'],
             zerolinecolor=COLORS['grid'],
             range=[0, 1],  # Food ratio fixed 0-1
@@ -742,6 +762,10 @@ class TrainingDashboard:
         print(f"[Dashboard] Tracking modes: {', '.join(self.modes)}")
         print("[Dashboard] Using WebSocket push (updates on data arrival)")
         print("[Dashboard] Press Ctrl+C to stop")
+
+        # Suppress Flask/Werkzeug request logging (POST spam)
+        import logging
+        logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
         app.run(debug=False, use_reloader=False)
 
