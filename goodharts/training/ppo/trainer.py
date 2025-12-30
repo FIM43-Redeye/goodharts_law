@@ -839,7 +839,8 @@ class PPOTrainer:
                     (
                         next_states, next_actions, next_log_probs, next_values,
                         next_potentials, logits,
-                        _current_states, _shaped_rewards, _dones, _terminated, _density_info
+                        _current_states, _shaped_rewards, _dones, _terminated, _density_info,
+                        _finished_episode_rewards
                     ) = self._compiled_rollout_step(
                         actions, log_probs, values, states, potentials
                     )
@@ -1258,6 +1259,8 @@ class PPOTrainer:
                         # EPISODE_TRACK - accumulate rewards, reset on done
                         # Access through vec_env (not captured) to maintain nn.Module buffer semantics
                         vec_env.episode_rewards.add_(shaped_rewards)
+                        # Capture episode rewards BEFORE reset (for logging finished episodes)
+                        finished_episode_rewards = vec_env.episode_rewards.clone()
                         vec_env.episode_rewards.mul_(~dones)  # Reset for done agents
 
                         # Return all values needed for buffer writes (done outside with Python int index)
@@ -1267,7 +1270,8 @@ class PPOTrainer:
                             next_states, next_actions, next_log_probs, next_values,
                             next_potentials, logits,
                             # Additional returns for buffer storage (written outside compiled function)
-                            current_states, shaped_rewards, dones, terminated, density_info
+                            current_states, shaped_rewards, dones, terminated, density_info,
+                            finished_episode_rewards  # Pre-reset rewards for logging
                         )
 
                     self._compiled_rollout_step = compiled_rollout_step
@@ -1546,7 +1550,8 @@ class PPOTrainer:
                         (
                             next_states, next_actions, next_log_probs, next_values,
                             next_potentials, logits,
-                            current_states, shaped_rewards, dones, terminated, density_info
+                            current_states, shaped_rewards, dones, terminated, density_info,
+                            finished_episode_rewards  # Pre-reset rewards for logging
                         ) = self._compiled_rollout_step(
                             actions, log_probs, values, states, potentials
                         )
@@ -1564,7 +1569,7 @@ class PPOTrainer:
                     if self._aux_buf is not None:
                         self._aux_buf[step_i] = density_info
                     finished_dones_buf[step_i] = dones
-                    finished_rewards_buf[step_i] = episode_rewards
+                    finished_rewards_buf[step_i] = finished_episode_rewards  # Use pre-reset value
 
                     step_in_buffer += 1
                 else:
@@ -1589,6 +1594,13 @@ class PPOTrainer:
                             next_log_probs = dist.log_prob(next_actions)
                             next_values = self.value_head(features, next_density_info).squeeze(-1)
 
+                    # EPISODE_TRACK (eager path only) - must happen BEFORE buffer store
+                    # so finished_episode_rewards captures the final value before reset
+                    with record_function("EPISODE_TRACK"):
+                        episode_rewards += shaped_rewards
+                        finished_episode_rewards = episode_rewards.clone()  # Capture before reset
+                        episode_rewards *= (~dones)
+
                     # BUFFER_STORE (eager path only - compiled path does this inside)
                     with record_function("BUFFER_STORE"):
                         step_i = step_in_buffer  # Use Python int - no GPU sync
@@ -1602,12 +1614,7 @@ class PPOTrainer:
                         if self._aux_buf is not None:
                             self._aux_buf[step_i] = next_density_info
                         finished_dones_buf[step_i] = dones
-                        finished_rewards_buf[step_i] = episode_rewards
-
-                    # EPISODE_TRACK (eager path only)
-                    with record_function("EPISODE_TRACK"):
-                        episode_rewards += shaped_rewards
-                        episode_rewards *= (~dones)
+                        finished_rewards_buf[step_i] = finished_episode_rewards  # Use pre-reset value
 
                     step_in_buffer += 1
 
