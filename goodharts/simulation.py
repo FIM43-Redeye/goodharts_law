@@ -47,25 +47,25 @@ class AgentWrapper:
         self.initial_energy = vec_env.initial_energy
 
     @property
-    def x(self):
+    def x(self) -> float:
         return self.vec_env.agent_x[self.idx].item()
-    
+
     @property
-    def y(self):
+    def y(self) -> float:
         return self.vec_env.agent_y[self.idx].item()
-        
+
     @property
-    def energy(self):
+    def energy(self) -> float:
         return self.vec_env.agent_energy[self.idx].item()
-        
+
     @property
-    def alive(self):
-        # In VecEnv, agents are reset on done, so they are always "alive" techinically.
+    def alive(self) -> bool:
+        # In VecEnv, agents are reset on done, so they are always "alive" technically.
         # But for visualization of death events, we track them.
         # Simulation.step handles death events.
         return True
 
-    def get_local_view(self, mode: str | None = None):
+    def get_local_view(self, mode: str | None = None) -> torch.Tensor:
         # This is inefficient if called individually (re-extracts entire batch).
         # Should be used sparingly (e.g. brain visualizer).
         # For main loop, we use batch extraction.
