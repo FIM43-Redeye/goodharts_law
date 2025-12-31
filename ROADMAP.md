@@ -20,8 +20,8 @@ but the "a-ha" moment should be watching agents *discover* deceptive strategies 
 - [x] Structured logging (CSV/JSON)
 - [x] Model verification suite
 - [x] Saliency visualization (gradient-based interpretability)
-- [ ] **Run full comparison**: ground-truth vs proxy-trained agents
-- [ ] Statistical validation that proxy agents die more from poison
+- [x] **Run full comparison**: ground-truth vs proxy-trained agents (see README results table)
+- [x] Statistical validation that proxy agents die more from poison (69x death rate, 56.1% efficiency gap)
 
 ## Phase 2.5: Code Quality ✅
 - [x] TOML configuration system with defaults
@@ -33,31 +33,38 @@ but the "a-ha" moment should be watching agents *discover* deceptive strategies 
 
 ---
 
-## Phase 3: Emergent Deception 🔮
-The cool stuff! Can agents discover deceptive strategies on their own?
+## Phase 3: Research Directions (Architectural Redesign Required)
 
-### Core Experiments
-- [ ] Multi-agent signaling dynamics
-- [ ] Resource competition under scarcity
-- [ ] Proxy gaming: can agents CREATE high-proxy cells?
-- [ ] "Inspector" agents vs "deceiver" agents
-- [ ] Adversarial co-evolution
+The following experiments would extend the Goodhart demonstration to more complex failure modes, but would require **significant architectural changes** to TorchVecEnv. The current vectorized environment assumes independent agents with no inter-agent communication or shared state manipulation.
 
-### Architecture Extensions
+### Why This Matters
+The current demo shows Goodhart failure in single-agent optimization. Multi-agent dynamics would demonstrate:
+- How proxy metrics fail under competition
+- Whether agents can learn to game metrics (not just optimize them)
+- Emergent deception as a convergent strategy
+
+### Potential Experiments (require new architecture)
+- Multi-agent signaling dynamics (agents need shared observation space)
+- Resource competition under scarcity (agents need to see each other)
+- Proxy gaming: can agents CREATE high-proxy cells? (agents need world-modification)
+- "Inspector" vs "deceiver" co-evolution (requires population-level training)
+
+### Incremental Extensions (possible with current architecture)
 - [ ] **Temporal state**: Feed step count / episode progress (aux MLP head)
-- [ ] **Population awareness**: Number of other agents as input
 - [ ] **Noisy vision**: Gaussian noise at view edges (uncertainty modeling)
-- [ ] **Recurrent agents**: LSTM/GRU for memory (BaseCNNWithMemory stub exists)
+- [ ] **Recurrent agents**: LSTM/GRU for memory
 - [ ] **Auxiliary scalar inputs**: Energy level, age, etc.
+
+These single-agent extensions don't require architectural changes and could strengthen the demonstration.
 
 ---
 
-## Phase 4: Publication-Ready
+## Phase 4: Publication-Ready ✅
 - [x] Comprehensive README with AI safety connection
-- [ ] Reproducible experiments with seeds and config files
-- [ ] Statistical analysis across many runs
+- [x] Reproducible experiments with seeds and config files (TOML config, deterministic seeds, run_full_evaluation.sh)
+- [x] Statistical analysis across many runs (multi-run aggregation with CIs in evaluation)
 - [ ] Diagrams showing information asymmetry (proxy vs ground truth)
-- [ ] Connection to real-world AI alignment failures
+- [x] Connection to real-world AI alignment failures (YouTube, CTR, test scores in README)
 
 ---
 
@@ -72,7 +79,7 @@ The cool stuff! Can agents discover deceptive strategies on their own?
       (Currently GPU pauses briefly during CPU work between modes.
        Staggered starts could keep GPU more consistently busy.)
 - [ ] Profile memory usage for large n_envs
-- [ ] Consider torch.compile() for model optimization
+- [x] torch.compile() for model optimization (implemented with async warmup)
 
 ### Code Quality
 - [ ] Consistent error handling across modules

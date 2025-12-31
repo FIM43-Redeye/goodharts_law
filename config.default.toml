@@ -190,6 +190,16 @@ validation_food = 128
 validation_poison = 128
 
 # =============================================================================
+# EVALUATION - Testing trained models
+# =============================================================================
+
+[evaluation]
+n_envs = 8192            # Parallel environments (high = better GPU utilization)
+steps_per_env = 4096     # Steps per environment
+runs = 3                 # Runs per mode for statistical aggregation
+base_seed = 42           # Starting seed (incremented per run)
+
+# =============================================================================
 # RUNTIME - Device and system settings
 # =============================================================================
 

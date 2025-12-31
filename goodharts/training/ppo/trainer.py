@@ -22,7 +22,7 @@ from goodharts.configs.default_config import get_simulation_config
 from goodharts.config import get_training_config
 from goodharts.utils.device import get_device, apply_system_optimizations, is_tpu, sync_device
 from goodharts.utils.seed import set_seed
-from goodharts.behaviors.brains import create_brain, save_brain, _clean_state_dict
+from goodharts.behaviors.brains import create_brain, save_brain
 from goodharts.behaviors.action_space import create_action_space, ActionSpace
 from goodharts.environments.torch_env import create_torch_vec_env
 from datetime import datetime
@@ -43,6 +43,15 @@ from .globals import (
     request_abort, clear_abort, is_abort_requested, reset_training_state,
     mark_warmup_done, check_warmup_done, get_compile_lock, get_warmup_lock,
 )
+from .warmup import (
+    warmup_forward_backward, run_warmup_update,
+    WarmupBuffers, CompiledFunctions as WarmupCompiledFunctions,
+)
+from .validation import run_validation_episodes
+from .checkpoint import save_training_checkpoint, save_final_model
+from .buffers import RolloutBuffers, MetricsConstants, allocate_rollout_buffers, allocate_metrics_constants
+from .compilation import CompiledFunctions, create_compiled_functions
+from .cleanup import cleanup_training_resources
 
 
 def _vprint(msg: str, verbose: bool):
@@ -106,208 +115,6 @@ class PPOTrainer:
         self.episode_count = 0
         self._aborted = False  # Track if training was aborted
 
-    def _warmup_forward_backward(self, batch_size: int, include_backward: bool = True, label: str = "Warmup") -> float:
-        """
-        Run forward (and optionally backward) pass to warm up JIT/cuDNN.
-
-        This triggers algorithm selection for cuDNN benchmark mode and compiles
-        torch.compile graphs. Running this once at startup avoids the compilation
-        penalty during actual training.
-
-        Args:
-            batch_size: Batch size for dummy tensors (should match training batch)
-            include_backward: Whether to run backward pass (needed for gradient kernels)
-            label: Label for progress messages
-
-        Returns:
-            Time taken in seconds
-        """
-        cfg = self.config
-        start_time = time.time()
-
-        # Create dummy tensors matching training shapes
-        dummy_obs = torch.zeros(
-            (batch_size, self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size),
-            device=self.device, requires_grad=False
-        )
-
-        with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-            logits = self.policy(dummy_obs)
-            features = self.policy.get_features(dummy_obs)
-            values = self.value_head(features).squeeze(-1)
-
-            if include_backward:
-                dummy_actions = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-                dummy_returns = torch.zeros(batch_size, device=self.device)
-
-                dist = Categorical(logits=logits, validate_args=False)
-                log_probs = dist.log_prob(dummy_actions)
-                dummy_loss = -log_probs.mean() + F.mse_loss(values, dummy_returns)
-                dummy_loss.backward()
-
-        # Synchronize to ensure kernels complete
-        if self.device.type == 'cuda':
-            torch.cuda.synchronize()
-
-        # Clean up
-        if include_backward:
-            self.policy.zero_grad()
-            self.value_head.zero_grad()
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
-
-        return time.time() - start_time
-
-    def _run_warmup_update(self, states: torch.Tensor, episode_rewards: torch.Tensor) -> torch.Tensor:
-        """
-        Run one full training update as warmup (discarded).
-
-        This triggers all lazy initialization in a realistic context:
-        - Real environment steps (not synthetic data)
-        - Full forward/backward through compiled models
-        - All MIOpen/cuDNN algorithm selection
-
-        The results are discarded; this just warms up the runtime.
-
-        Args:
-            states: Current environment states
-            episode_rewards: Episode reward accumulator
-
-        Returns:
-            New states after the warmup steps
-        """
-        cfg = self.config
-
-        # Use pre-allocated buffers (same as main training loop)
-        states_buf = self._states_buf
-        actions_buf = self._actions_buf
-        log_probs_buf = self._log_probs_buf
-        rewards_buf = self._rewards_buf
-        dones_buf = self._dones_buf
-        terminated_buf = self._terminated_buf
-        values_buf = self._values_buf
-
-        # Initial inference to get first actions (same as main loop)
-        potentials = self.reward_computer.get_initial_potentials(states)
-        critic_aux = self.vec_env.get_critic_aux() if self._aux_buf is not None else None
-        with torch.no_grad():
-            with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                logits, features = self.policy.forward_with_features(states.float())
-                dist = Categorical(logits=logits, validate_args=False)
-                actions = dist.sample()
-                log_probs = dist.log_prob(actions)
-                values = self.value_head(features, critic_aux).squeeze(-1)
-
-        for step in range(cfg.steps_per_env):
-            with torch.no_grad():
-                # Use compiled rollout step if available (triggers CUDA graph capture)
-                if self._compiled_rollout_step is not None:
-                    torch.compiler.cudagraph_mark_step_begin()
-                    (
-                        next_states, next_actions, next_log_probs, next_values,
-                        next_potentials, logits,
-                        _current_states, _shaped_rewards, _dones, _terminated, _critic_aux,
-                        _finished_episode_rewards
-                    ) = self._compiled_rollout_step(
-                        actions, log_probs, values, states, potentials
-                    )
-                    # Warmup doesn't need to write buffers, just exercise the compiled path
-
-                    # Clone outputs to prevent CUDA graph buffer reuse issues
-                    states = next_states.clone()
-                    actions = next_actions.clone()
-                    log_probs = next_log_probs.clone()
-                    values = next_values.clone()
-                    potentials = next_potentials.clone()
-                else:
-                    # Fallback: eager mode
-                    critic_aux = self.vec_env.get_critic_aux() if self._aux_buf is not None else None
-                    with autocast(device_type=self.device_type, enabled=cfg.use_amp):
-                        logits, features = self.policy.forward_with_features(states.float())
-                        dist = Categorical(logits=logits, validate_args=False)
-                        actions = dist.sample()
-                        log_probs = dist.log_prob(actions)
-                        values = self.value_head(features, critic_aux).squeeze(-1)
-
-                    current_states = states.clone()
-                    next_states, eating_info, terminated, truncated = self.vec_env.step(actions)
-                    dones = terminated | truncated
-                    shaped_rewards = self.reward_computer.compute(eating_info, current_states, next_states, terminated)
-
-                    # Store in pre-allocated tensor buffers
-                    states_buf[step] = current_states
-                    actions_buf[step] = actions
-                    log_probs_buf[step] = log_probs.detach()
-                    rewards_buf[step] = shaped_rewards
-                    dones_buf[step] = dones
-                    terminated_buf[step] = terminated
-                    values_buf[step] = values
-                    if self._aux_buf is not None:
-                        self._aux_buf[step] = critic_aux
-
-                    episode_rewards += shaped_rewards
-                    episode_rewards *= (~dones)
-                    states = next_states
-
-        # Bootstrap value
-        with torch.no_grad():
-            states_t = states.float()
-            _, features = self.policy.forward_with_features(states_t)
-            bootstrap_aux = self.vec_env.get_critic_aux() if self._aux_buf is not None else None
-            next_value = self.value_head(features, bootstrap_aux).squeeze(-1)
-
-        # Compute GAE (pass tensors directly, no stacking needed)
-        # Use terminated_buf - only zero bootstrap on true death
-        gae_fn = self._compiled_gae if self._compiled_gae is not None else compute_gae
-        advantages, returns = gae_fn(
-            rewards_buf, values_buf, terminated_buf,
-            next_value, cfg.gamma, cfg.gae_lambda, device=self.device
-        )
-
-        # Update PopArt statistics for value normalization
-        # Pass optimizer so PopArt can rescale momentum buffers after weight adjustment
-        if hasattr(self.value_head, 'update_stats'):
-            self.value_head.update_stats(returns.flatten(), self.optimizer)
-
-        # PPO update (this triggers backward pass lazy init)
-        # Reshape pre-allocated buffers (no torch.cat needed)
-        batch_size = cfg.steps_per_env * cfg.n_envs
-        all_states = states_buf.reshape(batch_size, -1, self.vec_env.view_size, self.vec_env.view_size).float()
-        all_actions = actions_buf.flatten()
-        all_log_probs = log_probs_buf.flatten()
-        all_values = values_buf.flatten()
-        all_returns = returns.flatten()
-        all_advantages = advantages.flatten()
-
-        # Normalize advantages
-        all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
-
-        # Use compiled version if available (triggers JIT compilation during warmup)
-        # IMPORTANT: Must pass aux_inputs with same shape as training to avoid recompilation
-        all_aux = self._aux_buf.reshape(batch_size, -1) if self._aux_buf is not None else None
-        ppo_fn = self._compiled_ppo_update if self._compiled_ppo_update is not None else ppo_update
-        ppo_fn(
-            self.policy, self.value_head, self.optimizer,
-            all_states, all_actions, all_log_probs,
-            all_returns, all_advantages, all_values,
-            self.device,
-            eps_clip=cfg.eps_clip,
-            k_epochs=cfg.k_epochs,
-            entropy_coef=cfg.entropy_initial,  # Use initial entropy for warmup
-            value_coef=cfg.value_coef,
-            n_minibatches=cfg.n_minibatches,
-            scaler=self.scaler,
-            aux_inputs=all_aux,
-            entropy_floor=cfg.entropy_floor,  # Floor active during warmup
-            entropy_floor_penalty=cfg.entropy_floor_penalty,
-        )
-
-        # Sync to ensure all kernels complete
-        if self.device.type == 'cuda':
-            torch.cuda.synchronize()
-
-        return states
-
     def train(self) -> dict:
         """
         Run the full training loop.
@@ -341,67 +148,30 @@ class PPOTrainer:
         Call this after training completes or on abort to ensure
         GPU memory, threads, and file handles are properly released.
         """
-        # Stop GPU monitor first
-        if self.gpu_monitor is not None:
-            try:
-                self.gpu_monitor.stop()
-            except Exception as e:
-                logger.debug(f"Cleanup: gpu_monitor.stop() failed: {e}")
-            self.gpu_monitor = None
+        # Use the extracted cleanup function for thread/file cleanup
+        cleanup_training_resources(
+            gpu_monitor=self.gpu_monitor,
+            bookkeeper=getattr(self, 'bookkeeper', None),
+            async_logger=self.async_logger,
+            tb_writer=self.tb_writer,
+            device=self.device,
+        )
 
-        # Stop bookkeeper before async_logger (bookkeeper submits to async_logger)
-        if hasattr(self, 'bookkeeper') and self.bookkeeper is not None:
-            try:
-                self.bookkeeper.stop()
-            except Exception as e:
-                logger.debug(f"Cleanup: bookkeeper.stop() failed: {e}")
-            self.bookkeeper = None
+        # Release local references to allow garbage collection
+        self.gpu_monitor = None
+        self.bookkeeper = None
+        self.async_logger = None
+        self.tb_writer = None
 
-        # Shutdown async logger (flushes any pending logs)
-        if self.async_logger:
-            try:
-                self.async_logger.shutdown(timeout=2.0)
-            except Exception as e:
-                logger.debug(f"Cleanup: async_logger.shutdown() failed: {e}")
-            self.async_logger = None
-
-        # Close TensorBoard writer
-        if self.tb_writer:
-            try:
-                self.tb_writer.close()
-            except Exception as e:
-                logger.debug(f"Cleanup: tb_writer.close() failed: {e}")
-            self.tb_writer = None
-
-        # Release environment (frees GPU tensors)
-        if self.vec_env:
-            try:
-                # VecEnv doesn't have an explicit close(), but we can
-                # release references to allow garbage collection
-                del self.vec_env
-            except Exception as e:
-                logger.debug(f"Cleanup: vec_env deletion failed: {e}")
+        # Release environment and model tensors
+        if self.vec_env is not None:
             self.vec_env = None
-
-        # Release model tensors
-        # Note: Can't use truthiness check on torch.compile wrapped modules
-        # (they don't support __len__), so check against None explicitly
         if self.policy is not None:
-            del self.policy
             self.policy = None
         if self.value_head is not None:
-            del self.value_head
             self.value_head = None
         if self.optimizer is not None:
-            del self.optimizer
             self.optimizer = None
-
-        # Clear GPU cache
-        if self.device and self.device.type == 'cuda':
-            try:
-                torch.cuda.empty_cache()
-            except Exception as e:
-                logger.debug(f"Cleanup: torch.cuda.empty_cache() failed: {e}")
     
     def _setup(self):
         """Initialize environment, networks, and logging."""
@@ -495,8 +265,7 @@ class PPOTrainer:
         self._compiled_gae = None
 
         # Pre-allocated constants for BUFFER_FLATTEN (avoids tensor creation each update)
-        self._inf_const = torch.tensor(float('inf'), device=self.device)
-        self._neg_inf_const = torch.tensor(float('-inf'), device=self.device)
+        self._metrics_consts = allocate_metrics_constants(self.device)
 
         # Optimizer - use fused=True on CUDA to eliminate .item() sync overhead
         # Fused runs entirely on GPU, avoiding 384 CPU round-trips per update
@@ -516,30 +285,26 @@ class PPOTrainer:
         )
 
         # Pre-allocate rollout buffers (eliminates torch.cat burstiness)
-        # These are GPU tensors that get overwritten each update cycle
         # MUST be allocated before compile block since closures capture these references
-        obs_shape = (cfg.steps_per_env, cfg.n_envs,
-                     self.vec_env.n_channels, self.vec_env.view_size, self.vec_env.view_size)
-        scalar_shape = (cfg.steps_per_env, cfg.n_envs)
-
-        self._states_buf = torch.zeros(obs_shape, device=self.device, dtype=torch.uint8)
-        self._actions_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.long)
-        self._log_probs_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
-        self._rewards_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
-        self._dones_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
-        self._terminated_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
-        self._values_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
-
-        # Privileged critic: auxiliary info buffer (density + ground truth view per step)
-        if self._num_aux_inputs > 0:
-            aux_shape = (cfg.steps_per_env, cfg.n_envs, self._num_aux_inputs)
-            self._aux_buf = torch.zeros(aux_shape, device=self.device, dtype=torch.float32)
-        else:
-            self._aux_buf = None
-
-        # Episode tracking buffers (for async logging)
-        self._finished_dones_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
-        self._finished_rewards_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
+        self._rollout_buffers = allocate_rollout_buffers(
+            n_envs=cfg.n_envs,
+            steps_per_env=cfg.steps_per_env,
+            n_channels=self.vec_env.n_channels,
+            view_size=self.vec_env.view_size,
+            device=self.device,
+            num_aux_inputs=self._num_aux_inputs,
+        )
+        # Individual buffer references (for compile closure capture)
+        self._states_buf = self._rollout_buffers.states
+        self._actions_buf = self._rollout_buffers.actions
+        self._log_probs_buf = self._rollout_buffers.log_probs
+        self._rewards_buf = self._rollout_buffers.rewards
+        self._dones_buf = self._rollout_buffers.dones
+        self._terminated_buf = self._rollout_buffers.terminated
+        self._values_buf = self._rollout_buffers.values
+        self._aux_buf = self._rollout_buffers.aux
+        self._finished_dones_buf = self._rollout_buffers.finished_dones
+        self._finished_rewards_buf = self._rollout_buffers.finished_rewards
 
         # Note: step_idx tensor removed - buffer writes now use Python int index
         # outside the compiled function to avoid implicit .item() calls
@@ -551,118 +316,22 @@ class PPOTrainer:
         # Use lock to serialize compilation - Dynamo's global state is not thread-safe
         # Skip on TPU - XLA uses its own JIT compilation
         # Note: Actual warmup happens in _training_loop via _run_warmup_update()
-        #
-        # Key insight: Compiling ENV_STEP + REWARD_SHAPE + INFERENCE into ONE function
-        # eliminates graph boundaries between all three operations. This fuses many
-        # small kernels into fewer large ones, reducing kernel launch overhead.
         with get_compile_lock():
             if cfg.compile_models and hasattr(torch, 'compile') and not is_tpu(self.device):
                 try:
-                    compile_mode = cfg.compile_mode
-
-                    # Capture references for closure - all must exist before this point
-                    policy = self.policy
-                    value_head = self.value_head
-                    vec_env = self.vec_env
-                    reward_computer = self.reward_computer
-                    device_type = self.device_type
-                    use_amp = cfg.use_amp
-                    privileged_critic = cfg.privileged_critic
-
-                    # Capture buffer references for fused buffer storage
-                    states_buf = self._states_buf
-                    actions_buf = self._actions_buf
-                    log_probs_buf = self._log_probs_buf
-                    rewards_buf = self._rewards_buf
-                    dones_buf = self._dones_buf
-                    terminated_buf = self._terminated_buf
-                    values_buf = self._values_buf
-                    aux_buf = self._aux_buf
-                    finished_dones_buf = self._finished_dones_buf
-                    finished_rewards_buf = self._finished_rewards_buf
-                    # NOTE: episode_rewards must be accessed through vec_env (not captured)
-                    # to maintain nn.Module buffer semantics for CUDA graph compatibility
-                    # NOTE: Buffer writes done outside compiled function with Python int index
-
-                    # ============================================================
-                    # FUSED ROLLOUT STEP: ENV + REWARD + INFERENCE + BUFFER + TRACK
-                    # ============================================================
-                    # All operations compiled into ONE graph for maximum fusion.
-                    # This eliminates CPU dispatch overhead between operations.
-                    @torch.compile(mode=compile_mode)
-                    def compiled_rollout_step(actions, log_probs, values, states, potentials):
-                        """
-                        Fully fused rollout step with buffer storage and episode tracking.
-
-                        Args:
-                            actions: Current actions to execute (also stored to buffer)
-                            log_probs: Current log probs (stored to buffer)
-                            values: Current values (stored to buffer)
-                            states: Current observations (before step)
-                            potentials: Current potential values for reward shaping
-
-                        Returns:
-                            Tuple for next iteration:
-                            - next_states, next_actions, next_log_probs, next_values
-                            - next_potentials, logits (for action prob logging)
-                        """
-                        # Snapshot current states before env mutates them
-                        current_states = states.clone()
-
-                        # ENV_STEP
-                        next_states, eating_info, terminated, truncated = vec_env.step(actions)
-                        dones = terminated | truncated
-
-                        # Get critic aux (density + privileged view) for value function
-                        critic_aux = vec_env.get_critic_aux() if privileged_critic else None
-
-                        # REWARD_SHAPE (stateless)
-                        shaped_rewards, next_potentials = reward_computer.compute_stateless(
-                            eating_info, current_states, next_states, terminated, potentials
-                        )
-
-                        # INFERENCE (for next step)
-                        with autocast(device_type=device_type, enabled=use_amp):
-                            logits, features = policy.forward_with_features(next_states)
-                            dist = Categorical(logits=logits, validate_args=False)
-                            next_actions = dist.sample()
-                            next_log_probs = dist.log_prob(next_actions)
-                            next_values = value_head(features, critic_aux).squeeze(-1)
-
-                        # EPISODE_TRACK - accumulate rewards, reset on done
-                        # Access through vec_env (not captured) to maintain nn.Module buffer semantics
-                        vec_env.episode_rewards.add_(shaped_rewards)
-                        # Capture episode rewards BEFORE reset (for logging finished episodes)
-                        finished_episode_rewards = vec_env.episode_rewards.clone()
-                        vec_env.episode_rewards.mul_(~dones)  # Reset for done agents
-
-                        # Return all values needed for buffer writes (done outside with Python int index)
-                        # NOTE: Buffer writes with tensor indices cause implicit .item() calls,
-                        # breaking the graph into multiple regions. We return values instead.
-                        return (
-                            next_states, next_actions, next_log_probs, next_values,
-                            next_potentials, logits,
-                            # Additional returns for buffer storage (written outside compiled function)
-                            current_states, shaped_rewards, dones, terminated, critic_aux,
-                            finished_episode_rewards  # Pre-reset rewards for logging
-                        )
-
-                    self._compiled_rollout_step = compiled_rollout_step
-
-                    # NOTE: We intentionally do NOT compile a separate inference function.
-                    # Having two compiled functions (compiled_rollout_step + compiled_inference)
-                    # that share the same model weights causes segfaults on ROCm when weights
-                    # are modified between calls (PPO update). The prefetch uses eager mode,
-                    # which is fine since it's only 1 call per update vs 128 for the rollout.
-
-                    # Compile PPO update function
-                    self._compiled_ppo_update = torch.compile(ppo_update, mode=compile_mode)
-
-                    # Compile GAE computation (27x speedup from loop optimization)
-                    # Use reduce-overhead for better CUDA graph capture of the loop
-                    self._compiled_gae = torch.compile(compute_gae, mode=compile_mode)
-
-                    print(f"   [JIT] torch.compile enabled ({compile_mode}) - fused rollout step + GAE")
+                    compiled = create_compiled_functions(
+                        policy=self.policy,
+                        value_head=self.value_head,
+                        vec_env=self.vec_env,
+                        reward_computer=self.reward_computer,
+                        device_type=self.device_type,
+                        use_amp=cfg.use_amp,
+                        privileged_critic=cfg.privileged_critic,
+                        compile_mode=cfg.compile_mode,
+                    )
+                    self._compiled_rollout_step = compiled.rollout_step
+                    self._compiled_ppo_update = compiled.ppo_update
+                    self._compiled_gae = compiled.gae
                 except RuntimeError as e:
                     if "FX" in str(e) or "dynamo" in str(e).lower():
                         print(f"   [JIT] Warning: torch.compile failed ({e}). Using eager mode.")
@@ -802,7 +471,47 @@ class PPOTrainer:
             optimizer_state = self.optimizer.state_dict()
 
             # Run warmup (modifies model, but we'll restore)
-            states = self._run_warmup_update(states, episode_rewards)
+            warmup_buffers = WarmupBuffers(
+                states=self._states_buf,
+                actions=self._actions_buf,
+                log_probs=self._log_probs_buf,
+                rewards=self._rewards_buf,
+                dones=self._dones_buf,
+                terminated=self._terminated_buf,
+                values=self._values_buf,
+                aux=self._aux_buf,
+            )
+            warmup_compiled = WarmupCompiledFunctions(
+                rollout_step=self._compiled_rollout_step,
+                ppo_update=self._compiled_ppo_update,
+                gae=self._compiled_gae,
+            )
+            states = run_warmup_update(
+                policy=self.policy,
+                value_head=self.value_head,
+                optimizer=self.optimizer,
+                scaler=self.scaler,
+                vec_env=self.vec_env,
+                reward_computer=self.reward_computer,
+                states=states,
+                episode_rewards=episode_rewards,
+                buffers=warmup_buffers,
+                compiled_fns=warmup_compiled,
+                device=self.device,
+                device_type=self.device_type,
+                steps_per_env=cfg.steps_per_env,
+                n_envs=cfg.n_envs,
+                gamma=cfg.gamma,
+                gae_lambda=cfg.gae_lambda,
+                eps_clip=cfg.eps_clip,
+                k_epochs=cfg.k_epochs,
+                entropy_coef=cfg.entropy_initial,
+                value_coef=cfg.value_coef,
+                n_minibatches=cfg.n_minibatches,
+                use_amp=cfg.use_amp,
+                entropy_floor=cfg.entropy_floor,
+                entropy_floor_penalty=cfg.entropy_floor_penalty,
+            )
 
             # Restore model state (discard warmup training)
             self.policy.load_state_dict(policy_state)
@@ -1054,8 +763,8 @@ class PPOTrainer:
                     episode_agg_tensor = torch.stack([
                         done_mask.sum(),
                         (all_step_rewards * done_mask).sum(),
-                        torch.where(all_step_dones, all_step_rewards, self._inf_const).min(),
-                        torch.where(all_step_dones, all_step_rewards, self._neg_inf_const).max(),
+                        torch.where(all_step_dones, all_step_rewards, self._metrics_consts.inf).min(),
+                        torch.where(all_step_dones, all_step_rewards, self._metrics_consts.neg_inf).max(),
                         (self.vec_env.last_episode_food * any_done_per_env).sum().float(),
                         (self.vec_env.last_episode_poison * any_done_per_env).sum().float(),
                     ])
@@ -1159,7 +868,19 @@ class PPOTrainer:
                 # Run validation if needed (before metrics submission)
                 val_metrics = None
                 if cfg.validation_interval > 0 and self.update_count % cfg.validation_interval == 0:
-                    val_metrics = self._run_validation_episodes()
+                    val_metrics = run_validation_episodes(
+                        policy=self.policy,
+                        vec_env=self.vec_env,
+                        reward_computer=self.reward_computer,
+                        n_envs=cfg.n_envs,
+                        validation_episodes=cfg.validation_episodes,
+                        validation_mode=cfg.validation_mode,
+                        validation_food=cfg.validation_food,
+                        validation_poison=cfg.validation_poison,
+                        spec=self.spec,
+                        device=self.device,
+                        create_env_fn=create_torch_vec_env,
+                    )
                     if cfg.validation_mode == "training":
                         states = self.vec_env.reset()
                         potentials = self.reward_computer.get_initial_potentials(states)
@@ -1216,31 +937,20 @@ class PPOTrainer:
                 
                 # Checkpoint
                 if self.checkpoint_interval > 0 and self.update_count % self.checkpoint_interval == 0:
-                    self._save_checkpoint()
-    
-    def _save_checkpoint(self):
-        """Save training checkpoint with full architecture metadata."""
-        checkpoint_path = os.path.join(
-            self.checkpoint_dir,
-            f"checkpoint_{self.config.mode}_u{self.update_count}_s{self.total_steps}.pth"
-        )
-        torch.save({
-            # Brain metadata (for architecture-agnostic loading)
-            'brain_type': self.config.brain_type,
-            'architecture': self._policy_arch_info,
-            'action_space': self.action_space.get_config(),
-            'mode': self.config.mode,
-            'seed': self.seed,
-            # Training state
-            'update': self.update_count,
-            'total_steps': self.total_steps,
-            'best_reward': self.best_reward,
-            # Model weights (cleaned of torch.compile prefixes)
-            'state_dict': _clean_state_dict(self.policy.state_dict()),
-            'value_head_state_dict': _clean_state_dict(self.value_head.state_dict()),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-        }, checkpoint_path)
-        print(f"   Checkpoint saved: {checkpoint_path}")
+                    save_training_checkpoint(
+                        policy=self.policy,
+                        value_head=self.value_head,
+                        optimizer=self.optimizer,
+                        checkpoint_dir=self.checkpoint_dir,
+                        mode=self.config.mode,
+                        update_count=self.update_count,
+                        total_steps=self.total_steps,
+                        best_reward=self.best_reward,
+                        brain_type=self.config.brain_type,
+                        architecture_info=self._policy_arch_info,
+                        action_space_config=self.action_space.get_config(),
+                        seed=self.seed,
+                    )
 
     def _process_pending_metrics(self):
         """
@@ -1346,91 +1056,6 @@ class PPOTrainer:
             validation_metrics=validation_metrics,
         )
 
-    def _run_validation_episodes(self) -> dict:
-        """
-        Run deterministic validation episodes.
-        
-        Returns metrics dict with mean reward, food, and poison.
-        Uses argmax for action selection (no exploration).
-        """
-        cfg = self.config
-        
-        # Select environment based on mode
-        if cfg.validation_mode == "fixed":
-            # Create temporary env with fixed density
-            val_env = create_torch_vec_env(
-                n_envs=cfg.n_envs, 
-                obs_spec=self.spec, 
-                device=self.device
-            )
-            val_env.set_curriculum_ranges(
-                cfg.validation_food, cfg.validation_food,
-                cfg.validation_poison, cfg.validation_poison
-            )
-            val_env.reset()
-        else:
-            # Use training env directly (faster, same randomization)
-            val_env = self.vec_env
-        
-        # Run episodes
-        total_reward = 0.0
-        total_food = 0
-        total_poison = 0
-        episodes_done = 0
-        
-        states = val_env.reset()
-        episode_rewards = torch.zeros(cfg.n_envs, device=self.device)
-        
-        # Run until we have enough completed episodes
-        max_steps = cfg.n_envs * 600  # Safety limit
-        steps = 0
-        
-        with torch.no_grad():
-            while episodes_done < cfg.validation_episodes and steps < max_steps:
-                states_t = states.float()
-
-                # Deterministic action selection (argmax instead of sample)
-                logits = self.policy(states_t)
-                actions = logits.argmax(dim=-1)
-
-                next_states, eating_info, terminated, truncated = val_env.step(actions)
-                dones = terminated | truncated
-                shaped_rewards = self.reward_computer.compute(eating_info, states, next_states, terminated)
-                episode_rewards += shaped_rewards
-
-                # Check for completed episodes
-                done_mask = dones.nonzero(as_tuple=False).squeeze(-1)
-                if done_mask.numel() > 0:
-                    for idx in done_mask:
-                        if episodes_done >= cfg.validation_episodes:
-                            break
-                        total_reward += episode_rewards[idx].item()
-                        total_food += val_env.last_episode_food[idx].item()
-                        total_poison += val_env.last_episode_poison[idx].item()
-                        episodes_done += 1
-                        episode_rewards[idx] = 0.0
-                
-                states = next_states
-                steps += cfg.n_envs
-        
-        # Compute means
-        n = max(episodes_done, 1)
-        metrics = {
-            'reward': total_reward / n,
-            'food': total_food / n,
-            'poison': total_poison / n,
-            'episodes': episodes_done,
-            'mode': cfg.validation_mode,
-        }
-        
-        # Print validation results
-        print(f"   [Validation] reward={metrics['reward']:.2f}, "
-              f"food={metrics['food']:.1f}, poison={metrics['poison']:.1f} "
-              f"({episodes_done} episodes, {cfg.validation_mode} env)")
-        
-        return metrics
-    
-    
     def _finalize(self) -> dict:
         """Save final model and return summary."""
         cfg = self.config
@@ -1487,17 +1112,16 @@ class PPOTrainer:
             print(f"{'='*60}")
         else:
             # Save with full metadata for architecture-agnostic loading
-            checkpoint = {
-                'brain_type': cfg.brain_type,
-                'architecture': self._policy_arch_info,
-                'action_space': self.action_space.get_config(),
-                'state_dict': _clean_state_dict(self.policy.state_dict()),
-                'mode': cfg.mode,
-                'training_steps': self.total_steps,
-                'seed': self.seed,
-            }
-            torch.save(checkpoint, cfg.output_path)
-            print(f"\n[PPO] Training complete: {cfg.output_path} (seed={self.seed})")
+            save_final_model(
+                policy=self.policy,
+                output_path=cfg.output_path,
+                mode=cfg.mode,
+                total_steps=self.total_steps,
+                brain_type=cfg.brain_type,
+                architecture_info=self._policy_arch_info,
+                action_space_config=self.action_space.get_config(),
+                seed=self.seed,
+            )
 
         # Close TensorBoard writer to flush all data
         if self.tb_writer:

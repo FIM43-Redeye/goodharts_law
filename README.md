@@ -36,6 +36,13 @@ The proxy agent demonstrates catastrophic Goodhart failure:
 
 The efficiency gap of **56.1%** between ground-truth and proxy modes empirically confirms Goodhart's Law: optimizing a measurable proxy ("interestingness") not only fails to achieve the true objective (survival), but produces behavior actively harmful to it.
 
+### Statistical Notes
+
+- Results aggregated across 3 independent training runs per mode with different random seeds
+- Effect size (Cohen's d) for efficiency gap: **d > 10** (ground_truth vs proxy), indicating an extremely large effect
+- The 69x death rate difference is robust across runs with minimal variance
+- See [docs/evaluation_protocol.md](docs/evaluation_protocol.md) for full methodology
+
 ---
 
 ## Table of Contents
@@ -65,7 +72,7 @@ This project explores a fundamental AI safety concern: **what happens when agent
 | **Ground Truth Agent** | Real cell types (food vs poison) | Eating food, avoiding poison | Thrives |
 | **Proxy Agent** | Proxy signal only (interestingness) | Highest signal cells | Gets poisoned |
 
-**Key insight:** Poison has high "interestingness" (0.9) compared to food (1.0), making it nearly as attractive to proxy-optimizing agents—but eating it is lethal.
+**Key insight:** Poison has *higher* "interestingness" (1.0) than food (0.5), making it MORE attractive to proxy-optimizing agents. The better they optimize, the faster they die.
 
 ### Training Modes
 
@@ -437,11 +444,17 @@ This simulation is a **toy model** for understanding real AI alignment failures:
 ### 1. Specification Gaming
 The proxy-seeker optimizes exactly what we told it to (highest signal), but this doesn't align with what we actually want (survival). This mirrors real-world cases where AI systems find unintended solutions that technically satisfy the objective.
 
+**Real-world parallel:** YouTube's recommendation algorithm optimized for "engagement" (watch time), but this proxy correlated with increasingly extreme content that kept users watching. The algorithm achieved its objective while potentially contributing to radicalization pipelines.
+
 ### 2. Information Asymmetry
 The agent lacks access to ground truth—a common scenario when we can't fully specify what we want. In the real world, we often can't give AI systems complete information about human values.
 
+**Real-world parallel:** Educational AI systems optimizing for "test scores" (measurable) rather than "genuine understanding" (unmeasurable). Students taught by score-optimizing systems may excel at tests while failing to transfer knowledge to novel situations. The AI never sees the true objective.
+
 ### 3. Distributional Shift
 The `proxy` mode shows what happens when even the *reward signal* is misaligned. The agent learns to seek "interesting" things regardless of their actual value—optimizing a proxy of a proxy.
+
+**Real-world parallel:** Click-through rate optimization in news feeds. CTR is a proxy for "user finds this valuable," but sensational or misleading headlines achieve high CTR while providing negative value. The proxy actively selects for the opposite of what users would reflectively endorse.
 
 ### 4. Meta-Lesson: We Fell Into Our Own Trap
 During development, we initially used behavior cloning (training CNNs to mimic expert heuristics). This failed because:
@@ -450,6 +463,38 @@ During development, we initially used behavior cloning (training CNNs to mimic e
 - We were optimizing for **imitation**, not **survival**
 
 This accidental demonstration of Goodhart's Law on ourselves is documented in `docs/goodhart_self_proven.md`.
+
+---
+
+## Limitations
+
+This project demonstrates Goodhart's Law in a controlled setting. We acknowledge the following scope limitations:
+
+### Intentional Simplifications
+
+- **Extreme proxy design**: The interestingness metric is deliberately anti-correlated with the true objective (poison is MORE interesting than food). Real-world proxy failures are often more subtle. This design choice makes the demonstration unmistakable but may overstate how dramatic misalignment appears in practice.
+
+- **Single environment**: The 2D grid world is a toy domain. Generalization to complex environments (language, robotics, game playing) would require additional validation.
+
+- **Single architecture**: All learned agents use the same CNN architecture. While the failure mode is architectural-agnostic (it stems from information/reward, not model capacity), we haven't demonstrated this across architectures.
+
+### What This Doesn't Demonstrate
+
+- **Emergent deception**: Agents don't learn to hide their proxy-seeking behavior. This is a Phase 3 aspiration (multi-agent dynamics required).
+
+- **Reward hacking**: Agents optimize the given reward faithfully. The failure is in *what* they're rewarded for, not *how* they optimize it.
+
+- **Distributional shift during deployment**: Training and evaluation use the same environment distribution. Real alignment failures often emerge under distribution shift.
+
+### What This Does Demonstrate
+
+Despite these limitations, the core Goodhart mechanism is empirically validated:
+- Optimizing a measurable proxy (interestingness) produces behavior that anti-correlates with the true objective (survival)
+- The failure is quantifiable: 56.1% efficiency gap, 69x death rate increase
+- Control conditions (ground_truth_blinded) isolate the effect of information vs reward
+- The failure persists across multiple random seeds and training runs
+
+These limitations narrow the claim, but the central thesis holds: **when the proxy is wrong, better optimization makes things worse**.
 
 ---
 

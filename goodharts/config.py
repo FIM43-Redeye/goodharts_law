@@ -156,8 +156,24 @@ def get_training_config() -> dict:
 def get_runtime_config() -> dict:
     """
     Get [runtime] config section.
-    
+
     Contains device selection and other runtime settings.
     """
     return get_config().get('runtime', {})
+
+
+def get_evaluation_config() -> dict:
+    """
+    Get [evaluation] config section.
+
+    Contains settings for model evaluation: n_envs, steps_per_env, runs, base_seed.
+    """
+    defaults = {
+        'n_envs': 8192,
+        'steps_per_env': 4096,
+        'runs': 3,
+        'base_seed': 42,
+    }
+    cfg = get_config().get('evaluation', {})
+    return {**defaults, **cfg}
 
