@@ -193,6 +193,7 @@ class TorchVecEnv(nn.Module):
         self.register_buffer('last_episode_food', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
         self.register_buffer('current_episode_poison', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
         self.register_buffer('last_episode_poison', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
+        self.register_buffer('last_episode_steps', torch.zeros(n_envs, dtype=torch.int32, device=device), persistent=False)
 
         # Episode rewards accumulator (for CUDA graph-compatible tracking)
         # Lives here because TorchVecEnv inherits from nn.Module, enabling stable buffer addresses
@@ -488,6 +489,13 @@ class TorchVecEnv(nn.Module):
         """
         grid_id = self.grid_indices[env_id]  # Keep as tensor, no .item()
 
+        # Save stats BEFORE reset (order matters!)
+        self.last_episode_food[env_id] = self.current_episode_food[env_id]
+        self.last_episode_poison[env_id] = self.current_episode_poison[env_id]
+        self.last_episode_steps[env_id] = self.agent_steps[env_id]
+        self.current_episode_food[env_id] = 0
+        self.current_episode_poison[env_id] = 0
+
         # Select random empty position
         new_y, new_x = self._random_empty_positions(self.grids[grid_id])
 
@@ -495,15 +503,10 @@ class TorchVecEnv(nn.Module):
         self.agent_y[env_id] = new_y
         self.agent_x[env_id] = new_x
 
+        # Reset state
         self.agent_energy[env_id] = self.initial_energy
         self.agent_steps[env_id] = 0
         self.dones[env_id] = False
-
-        # Update stats
-        self.last_episode_food[env_id] = self.current_episode_food[env_id]
-        self.last_episode_poison[env_id] = self.current_episode_poison[env_id]
-        self.current_episode_food[env_id] = 0
-        self.current_episode_poison[env_id] = 0
     
     def _spawn_agents_vectorized(self, env_ids: torch.Tensor):
         """Fully vectorized spawn using noise-based random selection.
@@ -549,6 +552,9 @@ class TorchVecEnv(nn.Module):
         ))
         self.last_episode_poison.copy_(torch.where(
             done_mask, self.current_episode_poison, self.last_episode_poison
+        ))
+        self.last_episode_steps.copy_(torch.where(
+            done_mask, self.agent_steps, self.last_episode_steps
         ))
         self.current_episode_food.copy_(torch.where(
             done_mask, self._zero_int32, self.current_episode_food
