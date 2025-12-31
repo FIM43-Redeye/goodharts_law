@@ -4,8 +4,8 @@ Saliency visualization for learned behaviors.
 Generates gradient-based saliency maps showing which parts of the input
 the neural network is attending to when making decisions.
 
-Crucial for demonstrating that proxy-trained models "look at" poison
-while ground-truth-trained models avoid it.
+This is a diagnostic tool for understanding what features any trained model
+attends to - useful for comparing models trained under different conditions.
 """
 import torch
 import torch.nn.functional as F
@@ -178,6 +178,22 @@ def _aggregate_channels(arr: np.ndarray) -> np.ndarray:
     return arr
 
 
+def _compute_saliency(
+    model: torch.nn.Module,
+    input_tensor: torch.Tensor,
+    method: str,
+) -> np.ndarray:
+    """Compute saliency using specified method."""
+    if method == 'gradient':
+        return compute_gradient_saliency(model, input_tensor)
+    elif method == 'guided':
+        return compute_guided_backprop_saliency(model, input_tensor)
+    elif method == 'integrated':
+        return compute_integrated_gradients(model, input_tensor)
+    else:
+        raise ValueError(f"Unknown method: {method}. Use 'gradient', 'guided', or 'integrated'")
+
+
 def visualize_saliency(
     model: torch.nn.Module,
     view: np.ndarray,
@@ -194,7 +210,7 @@ def visualize_saliency(
         view: Agent's view as numpy array (H, W) or (C, H, W)
         method: 'gradient', 'guided', or 'integrated'
         save_path: If provided, save figure to this path
-        title_prefix: Prefix for plot title (e.g., "Ground Truth Model")
+        title_prefix: Prefix for plot title (e.g., model name or description)
         show: If True, display the figure
 
     Returns:
@@ -223,14 +239,7 @@ def visualize_saliency(
         confidence = probs[0, action_idx].item()
 
     # Compute saliency
-    if method == 'gradient':
-        saliency = compute_gradient_saliency(model, input_tensor)
-    elif method == 'guided':
-        saliency = compute_guided_backprop_saliency(model, input_tensor)
-    elif method == 'integrated':
-        saliency = compute_integrated_gradients(model, input_tensor)
-    else:
-        raise ValueError(f"Unknown method: {method}")
+    saliency = _compute_saliency(model, input_tensor, method)
 
     # Aggregate multi-channel saliency to 2D
     saliency = _aggregate_channels(saliency)
@@ -285,8 +294,14 @@ def visualize_saliency(
         fig.update_yaxes(showticklabels=False, showgrid=False, autorange='reversed', row=1, col=i)
 
     if save_path:
-        fig.write_image(save_path, scale=2)
-        print(f"Saved: {save_path}")
+        try:
+            fig.write_image(save_path, scale=2)
+            print(f"Saved: {save_path}")
+        except ValueError as e:
+            if 'kaleido' in str(e).lower():
+                print(f"Note: Install kaleido to save images (pip install kaleido)")
+            else:
+                raise
 
     if show:
         fig.show()
@@ -295,21 +310,33 @@ def visualize_saliency(
 
 
 def compare_models_saliency(
-    ground_truth_model: torch.nn.Module,
-    proxy_model: torch.nn.Module,
+    models: list[tuple[torch.nn.Module, str]],
     view: np.ndarray,
     method: str = 'gradient',
     save_path: str | None = None,
     show: bool = True,
 ) -> go.Figure:
     """
-    Side-by-side comparison of saliency from ground-truth vs proxy models.
+    Side-by-side comparison of saliency from multiple models.
 
-    This is the key visualization for demonstrating Goodhart's Law:
-    show that the proxy model attends to poison (high interestingness)
-    while the ground-truth model avoids it.
+    This visualization helps compare what different models attend to
+    when viewing the same scene - useful for understanding how training
+    conditions affect learned attention patterns.
+
+    Args:
+        models: List of (model, label) tuples. Each model gets a column.
+        view: Agent's view as numpy array (H, W) or (C, H, W)
+        method: 'gradient', 'guided', or 'integrated'
+        save_path: If provided, save figure to this path
+        show: If True, display the figure
+
+    Returns:
+        Plotly Figure object
     """
-    device = next(ground_truth_model.parameters()).device
+    if len(models) < 2:
+        raise ValueError("Need at least 2 models for comparison")
+
+    device = next(models[0][0].parameters()).device
 
     # Handle different input shapes
     if view.ndim == 2:
@@ -317,31 +344,28 @@ def compare_models_saliency(
     else:
         input_tensor = torch.from_numpy(view).float().unsqueeze(0).to(device)
 
-    # Compute saliencies
-    if method == 'gradient':
-        sal_gt = compute_gradient_saliency(ground_truth_model, input_tensor)
-        sal_proxy = compute_gradient_saliency(proxy_model, input_tensor.clone())
-    elif method == 'guided':
-        sal_gt = compute_guided_backprop_saliency(ground_truth_model, input_tensor)
-        sal_proxy = compute_guided_backprop_saliency(proxy_model, input_tensor.clone())
-    else:
-        sal_gt = compute_integrated_gradients(ground_truth_model, input_tensor)
-        sal_proxy = compute_integrated_gradients(proxy_model, input_tensor.clone())
-
-    # Aggregate to 2D
-    sal_gt = _aggregate_channels(sal_gt)
-    sal_proxy = _aggregate_channels(sal_proxy)
     view_display = _aggregate_channels(view)
 
-    # Difference map
-    diff = sal_proxy - sal_gt
-    max_abs = max(abs(diff.min()), abs(diff.max())) or 1
+    # Compute saliencies for all models
+    saliencies = []
+    for model, label in models:
+        sal = _compute_saliency(model, input_tensor.clone(), method)
+        saliencies.append(_aggregate_channels(sal))
+
+    # Number of columns: view + each model + difference (if 2 models)
+    n_models = len(models)
+    show_diff = (n_models == 2)
+    n_cols = 1 + n_models + (1 if show_diff else 0)
+
+    # Build subplot titles
+    titles = ["Agent's View"] + [label for _, label in models]
+    if show_diff:
+        titles.append(f"Difference ({models[1][1]} - {models[0][1]})")
 
     # Create figure
     fig = make_subplots(
-        rows=1, cols=4,
-        subplot_titles=["Agent's View", "Ground Truth Model",
-                       "Proxy Model", "Difference (Proxy - GT)"],
+        rows=1, cols=n_cols,
+        subplot_titles=titles,
         horizontal_spacing=0.06,
     )
 
@@ -351,45 +375,49 @@ def compare_models_saliency(
         row=1, col=1
     )
 
-    # Plot 2: Ground truth saliency
-    fig.add_trace(
-        go.Heatmap(z=sal_gt, colorscale='Hot', showscale=False),
-        row=1, col=2
-    )
+    # Plot model saliencies
+    for i, sal in enumerate(saliencies):
+        fig.add_trace(
+            go.Heatmap(z=sal, colorscale='Hot', showscale=False),
+            row=1, col=2 + i
+        )
 
-    # Plot 3: Proxy saliency
-    fig.add_trace(
-        go.Heatmap(z=sal_proxy, colorscale='Hot', showscale=False),
-        row=1, col=3
-    )
-
-    # Plot 4: Difference (diverging colorscale)
-    fig.add_trace(
-        go.Heatmap(z=diff, colorscale='RdBu_r', zmid=0,
-                   zmin=-max_abs, zmax=max_abs, showscale=True,
-                   colorbar=dict(x=1.02, len=0.9)),
-        row=1, col=4
-    )
+    # Difference map (only for 2 models)
+    if show_diff:
+        diff = saliencies[1] - saliencies[0]
+        max_abs = max(abs(diff.min()), abs(diff.max())) or 1
+        fig.add_trace(
+            go.Heatmap(z=diff, colorscale='RdBu_r', zmid=0,
+                       zmin=-max_abs, zmax=max_abs, showscale=True,
+                       colorbar=dict(x=1.02, len=0.9)),
+            row=1, col=n_cols
+        )
 
     # Update layout
     fig.update_layout(
-        title=dict(text="Saliency Comparison: Ground Truth vs Proxy Training",
+        title=dict(text="Saliency Comparison",
                   x=0.5, font=dict(size=16, color=COLORS['text'])),
         plot_bgcolor=COLORS['paper'],
         paper_bgcolor=COLORS['background'],
         font=dict(color=COLORS['text']),
         height=400,
-        width=1400,
+        width=350 * n_cols,
     )
 
     # Make axes square and hide ticks
-    for i in range(1, 5):
+    for i in range(1, n_cols + 1):
         fig.update_xaxes(showticklabels=False, showgrid=False, row=1, col=i)
         fig.update_yaxes(showticklabels=False, showgrid=False, autorange='reversed', row=1, col=i)
 
     if save_path:
-        fig.write_image(save_path, scale=2)
-        print(f"Saved comparison to {save_path}")
+        try:
+            fig.write_image(save_path, scale=2)
+            print(f"Saved comparison to {save_path}")
+        except ValueError as e:
+            if 'kaleido' in str(e).lower():
+                print(f"Note: Install kaleido to save images (pip install kaleido)")
+            else:
+                raise
 
     if show:
         fig.show()
@@ -401,44 +429,43 @@ def load_model_from_path(model_path: str, device: torch.device = None) -> tuple[
     """
     Load a brain model with automatic architecture detection.
 
-    Wrapper around load_brain for backward compatibility.
-
     Returns:
-        (model, metadata) where metadata contains architecture info
+        (model, metadata) where metadata contains training info and architecture
     """
     if device is None:
         device = get_device(verbose=False)
 
     brain, metadata = load_brain(model_path, device=device)
 
-    # Print architecture info
-    arch = metadata.get('architecture', brain.get_architecture_info())
+    # Get architecture info from the brain itself (not metadata)
+    arch = brain.get_architecture_info()
+
     print(f"Loaded {metadata.get('brain_type', 'unknown')}: "
           f"{arch.get('input_channels')}ch x {arch.get('input_shape')} -> "
           f"hidden={arch.get('hidden_size')} -> {arch.get('output_size')} actions")
 
-    # Merge architecture into metadata for backward compat
-    if 'architecture' in metadata:
-        metadata.update(metadata['architecture'])
+    # Add architecture to metadata for convenience
+    metadata['architecture'] = arch
 
     return brain, metadata
 
 
-def find_default_model() -> str:
-    """Find the first available model in the models directory."""
+def find_models() -> list[Path]:
+    """Find all available models in the models directory."""
     models_dir = Path(__file__).parent.parent.parent / 'models'
 
-    # Prefer ground_truth.pth if it exists
-    preferred = models_dir / 'ground_truth.pth'
-    if preferred.exists():
-        return str(preferred)
+    if not models_dir.exists():
+        return []
 
-    # Otherwise, find any .pth file
-    pth_files = list(models_dir.glob('*.pth'))
-    if pth_files:
-        return str(pth_files[0])
+    return sorted(models_dir.glob('*.pth'), key=lambda p: p.stat().st_mtime, reverse=True)
 
-    raise FileNotFoundError(f"No .pth files found in {models_dir}")
+
+def get_model_label(metadata: dict, path: Path) -> str:
+    """Generate a human-readable label for a model."""
+    mode = metadata.get('mode')
+    if mode:
+        return mode.replace('_', ' ').title()
+    return path.stem.replace('_', ' ').title()
 
 
 def analyze_model_attention(
@@ -452,7 +479,7 @@ def analyze_model_attention(
     Load a model and generate saliency visualizations on sample views.
 
     Args:
-        model_path: Path to model weights. If None, auto-detects from models/
+        model_path: Path to model weights. If None, uses most recent model.
         config: Simulation config. If None, uses default config.
         output_dir: Where to save visualization images
         num_samples: Number of views to visualize
@@ -462,10 +489,13 @@ def analyze_model_attention(
     from goodharts.environments import create_vec_env
     from goodharts.modes import ObservationSpec
 
-    # Auto-detect model if not specified
+    # Find model if not specified
     if model_path is None:
-        model_path = find_default_model()
-        print(f"Auto-detected model: {model_path}")
+        available = find_models()
+        if not available:
+            raise FileNotFoundError("No .pth files found in models/")
+        model_path = str(available[0])
+        print(f"Using most recent model: {model_path}")
 
     if config is None:
         config = get_simulation_config()
@@ -475,11 +505,14 @@ def analyze_model_attention(
     # Load model with auto-detected architecture
     model, metadata = load_model_from_path(model_path, device)
 
-    # Collect sample views using TorchVecEnv
-    # Mode depends on input channels (4 = ground_truth, 1 = proxy)
-    mode = 'ground_truth' if metadata['input_channels'] == 4 else 'proxy'
-    print(f"Collecting {num_samples} sample views (mode: {mode})...")
+    # Get mode from metadata, with fallback
+    mode = metadata.get('mode', 'ground_truth')
+    if 'mode' not in metadata:
+        print(f"Mode not in metadata, defaulting to: {mode}")
+    else:
+        print(f"Using mode from metadata: {mode}")
 
+    # Collect sample views using TorchVecEnv
     obs_spec = ObservationSpec.for_mode(mode, config)
     env = create_vec_env(n_envs=5, obs_spec=obs_spec, config=config, device=device)
 
@@ -510,11 +543,90 @@ def analyze_model_attention(
             model, view,
             method='gradient',
             save_path=save_path,
-            title_prefix=model_name,
+            title_prefix=get_model_label(metadata, Path(model_path)),
             show=show,
         )
 
     print(f"Generated {num_samples} saliency visualizations in {output_dir}/")
+
+
+def compare_all_models(
+    config: dict | None = None,
+    output_dir: str = 'generated/visualizations',
+    num_samples: int = 3,
+    show: bool = True,
+):
+    """
+    Compare saliency across all available trained models.
+
+    Loads all models from models/ directory and generates comparison
+    visualizations showing what each model attends to on the same views.
+    """
+    from goodharts.configs.default_config import get_simulation_config
+    from goodharts.environments import create_vec_env
+    from goodharts.modes import ObservationSpec
+
+    if config is None:
+        config = get_simulation_config()
+
+    device = get_device()
+
+    # Find all models
+    model_paths = find_models()
+    if len(model_paths) < 2:
+        print(f"Found {len(model_paths)} models - need at least 2 for comparison")
+        return
+
+    print(f"Found {len(model_paths)} models: {[p.stem for p in model_paths]}")
+
+    # Load all models
+    models_with_labels = []
+    for path in model_paths:
+        try:
+            model, metadata = load_model_from_path(str(path), device)
+            label = get_model_label(metadata, path)
+            models_with_labels.append((model, label))
+        except Exception as e:
+            print(f"Warning: Could not load {path.name}: {e}")
+
+    if len(models_with_labels) < 2:
+        print("Not enough models loaded successfully")
+        return
+
+    # Use first model's mode for generating views (they should be compatible)
+    # since all models after the refactor use 2 channels
+    obs_spec = ObservationSpec.for_mode('ground_truth', config)
+    env = create_vec_env(n_envs=5, obs_spec=obs_spec, config=config, device=device)
+
+    # Collect sample views
+    sample_views = []
+    obs = env.reset()
+    sample_views.append(obs)
+    for _ in range(max(20, num_samples)):
+        actions = torch.randint(0, 8, (5,), device=device)
+        obs, _, _, _ = env.step(actions)
+        sample_views.append(obs)
+
+    all_views = torch.cat(sample_views, dim=0)
+
+    # Create output directory
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Generate comparison visualizations
+    print(f"Generating comparison saliency maps...")
+    for i in range(min(num_samples, len(all_views))):
+        view = all_views[i].cpu().numpy()
+        save_path = f"{output_dir}/comparison_saliency_{i}.png"
+
+        compare_models_saliency(
+            models_with_labels,
+            view,
+            method='gradient',
+            save_path=save_path,
+            show=show,
+        )
+
+    print(f"Generated {num_samples} comparison visualizations in {output_dir}/")
 
 
 if __name__ == "__main__":
@@ -522,7 +634,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Generate saliency visualizations for trained models")
     parser.add_argument('--model', type=str, default=None,
-                        help='Path to trained model (default: auto-detect from models/)')
+                        help='Path to trained model (default: most recent in models/)')
+    parser.add_argument('--compare', action='store_true',
+                        help='Compare all available models instead of analyzing one')
     parser.add_argument('--output', type=str, default='generated/visualizations',
                         help='Output directory for images')
     parser.add_argument('--samples', type=int, default=5,
@@ -531,9 +645,16 @@ if __name__ == "__main__":
                         help='Save images without displaying')
     args = parser.parse_args()
 
-    analyze_model_attention(
-        model_path=args.model,
-        output_dir=args.output,
-        num_samples=args.samples,
-        show=not args.no_show,
-    )
+    if args.compare:
+        compare_all_models(
+            output_dir=args.output,
+            num_samples=args.samples,
+            show=not args.no_show,
+        )
+    else:
+        analyze_model_attention(
+            model_path=args.model,
+            output_dir=args.output,
+            num_samples=args.samples,
+            show=not args.no_show,
+        )

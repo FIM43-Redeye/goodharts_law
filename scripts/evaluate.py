@@ -11,12 +11,19 @@ Collected metrics:
 - Deaths per 1000 steps (population death rate)
 - Efficiency (food / total consumed) - the key Goodhart metric
 
-Supports parallel mode testing, real-time dashboard, and structured JSON output.
+Supports parallel mode testing, real-time dashboard, multi-run aggregation,
+and unified report generation.
 
 Usage:
+    # Single evaluation
     python scripts/evaluate.py --mode ground_truth --timesteps 100000
     python scripts/evaluate.py --mode all --dashboard
-    python scripts/evaluate.py --mode all --deterministic --seed 42
+
+    # Multi-run with statistical aggregation
+    python scripts/evaluate.py --mode all --runs 5 --base-seed 42
+
+    # Full report with figures and markdown
+    python scripts/evaluate.py --full-report --runs 5 --timesteps 50000
 """
 
 import argparse
@@ -39,7 +46,10 @@ from goodharts.utils.seed import set_seed
 from goodharts.configs.default_config import get_simulation_config
 from goodharts.modes import get_all_mode_names
 from goodharts.config import get_training_config
-from goodharts.evaluation import EvaluationConfig, ModelTester
+from goodharts.evaluation import (
+    EvaluationConfig, ModelTester,
+    generate_seeds, aggregate_runs, RunResult, MultiRunAggregates,
+)
 
 
 def discover_models(models_dir: Path) -> dict[str, Path]:
@@ -209,6 +219,184 @@ def print_comparison(results: dict):
             print(f"  Note: Proxy survives longer ({-survival_gap:.0f} steps), but consumes poison")
 
 
+def run_multi_seed(
+    modes: list[str],
+    overrides: dict,
+    n_runs: int,
+    base_seed: int,
+    sequential: bool = False,
+) -> dict[str, list[dict]]:
+    """
+    Run evaluation multiple times with different seeds.
+
+    Returns:
+        Dict mapping mode -> list of per-run results
+    """
+    seeds = generate_seeds(n_runs, base_seed)
+    all_results = {mode: [] for mode in modes}
+
+    for run_idx, seed in enumerate(seeds):
+        print(f"\n{'='*60}")
+        print(f"RUN {run_idx + 1}/{n_runs} (seed={seed})")
+        print(f"{'='*60}")
+
+        # Update overrides with this run's seed
+        run_overrides = overrides.copy()
+        run_overrides['seed'] = seed
+
+        # Run evaluation
+        if sequential or len(modes) == 1:
+            results = run_sequential(modes, run_overrides)
+        else:
+            results = run_parallel(modes, run_overrides)
+
+        # Collect results
+        for mode, result in results.items():
+            if 'error' not in result:
+                all_results[mode].append(result)
+
+    return all_results
+
+
+def aggregate_multi_run_results(
+    multi_results: dict[str, list[dict]],
+    output_path: Path,
+) -> dict:
+    """
+    Aggregate results from multiple runs and save to JSON.
+
+    Returns:
+        Aggregated results dict
+    """
+    aggregated = {
+        'timestamp': datetime.now().isoformat(),
+        'n_runs': max(len(runs) for runs in multi_results.values()),
+        'modes': list(multi_results.keys()),
+        'results': {},
+    }
+
+    for mode, runs in multi_results.items():
+        if not runs:
+            continue
+
+        # Convert to RunResult format
+        run_results = []
+        for i, result in enumerate(runs):
+            agg = result.get('aggregates', {})
+            if agg:
+                run_results.append(RunResult(
+                    run_id=i,
+                    seed=result.get('seed', 0),
+                    n_deaths=agg.get('n_deaths', 0),
+                    total_timesteps=agg.get('total_timesteps', 0),
+                    overall_efficiency=agg.get('overall_efficiency', 0),
+                    survival_mean=agg.get('survival_mean', 0),
+                    survival_std=agg.get('survival_std', 0),
+                    deaths_per_1k_steps=agg.get('deaths_per_1k_steps', 0),
+                    food_per_1k_steps=agg.get('food_per_1k_steps', 0),
+                    poison_per_1k_steps=agg.get('poison_per_1k_steps', 0),
+                    food_per_death_mean=agg.get('food_per_death_mean', 0),
+                    poison_per_death_mean=agg.get('poison_per_death_mean', 0),
+                    reward_mean=agg.get('reward_mean', 0),
+                ))
+
+        # Aggregate
+        if run_results:
+            agg = aggregate_runs(mode, run_results)
+            aggregated['results'][mode] = {
+                'aggregates': {
+                    'n_runs': agg.n_runs,
+                    'seeds': agg.seeds,
+                    'overall_efficiency': agg.efficiency_mean,
+                    'efficiency_ci': [agg.efficiency_ci_low, agg.efficiency_ci_high],
+                    'survival_mean': agg.survival_mean_of_means,
+                    'survival_ci': [agg.survival_ci_low, agg.survival_ci_high],
+                    'deaths_per_1k_steps': agg.death_rate_mean,
+                    'food_per_1k_steps': agg.food_rate_mean,
+                    'poison_per_1k_steps': agg.poison_rate_mean,
+                    'total_deaths': agg.total_deaths,
+                    'total_timesteps': agg.total_timesteps,
+                },
+                # Flatten all deaths from all runs for distribution plots
+                'deaths': [
+                    death
+                    for result in runs
+                    for death in result.get('deaths', [])
+                ],
+            }
+
+    # Save aggregated results
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w') as f:
+        json.dump(aggregated, f, indent=2)
+
+    print(f"\n[Multi-Run] Aggregated results saved to: {output_path}")
+    return aggregated
+
+
+def run_full_report(
+    modes: list[str],
+    overrides: dict,
+    n_runs: int,
+    base_seed: int,
+    output_dir: Path,
+    sequential: bool = False,
+):
+    """
+    Run complete evaluation pipeline with report generation.
+
+    Steps:
+    1. Run multi-seed evaluation
+    2. Aggregate results
+    3. Generate visualizations
+    4. Generate markdown report
+    5. Print console summary
+    """
+    from goodharts.analysis.report import ReportGenerator, ReportConfig
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    report_dir = output_dir / timestamp
+
+    print("\n" + "=" * 60)
+    print("FULL REPORT PIPELINE")
+    print("=" * 60)
+    print(f"Modes: {', '.join(modes)}")
+    print(f"Runs: {n_runs}")
+    print(f"Base seed: {base_seed}")
+    print(f"Output: {report_dir}")
+
+    # Step 1: Multi-seed evaluation
+    print("\n[1/4] Running multi-seed evaluation...")
+    multi_results = run_multi_seed(modes, overrides, n_runs, base_seed, sequential)
+
+    # Step 2: Aggregate results
+    print("\n[2/4] Aggregating results...")
+    json_path = report_dir / 'results.json'
+    aggregated = aggregate_multi_run_results(multi_results, json_path)
+
+    # Step 3 & 4: Generate report (includes figures)
+    print("\n[3/4] Generating report and figures...")
+    config = ReportConfig(
+        title="Goodhart's Law Experiment Results",
+        output_dir=output_dir,
+        timestamp=timestamp,
+        include_figures=True,
+        include_power_analysis=True,
+    )
+    generator = ReportGenerator(config)
+    generator.add_data(str(json_path))
+    report_path = generator.generate()
+
+    # Step 5: Console summary
+    print("\n[4/4] Results summary:")
+    print(generator.generate_console_summary())
+
+    print(f"\nFull report generated at: {report_path}")
+    print(f"Figures directory: {config.figures_dir}")
+
+    return report_path
+
+
 def main():
     config = get_simulation_config()
     train_cfg = get_training_config()
@@ -263,11 +451,25 @@ def main():
     models.add_argument('--models-dir', type=Path, default=Path('models'),
                         help='Directory containing trained models')
     
+    # Multi-run
+    multi = parser.add_argument_group('Multi-run evaluation')
+    multi.add_argument('-r', '--runs', type=int, default=1, metavar='N',
+                       help='Number of evaluation runs with different seeds (default: 1)')
+    multi.add_argument('--base-seed', type=int, default=42, metavar='N',
+                       help='Base seed for reproducible multi-run (default: 42)')
+
+    # Full report
+    report = parser.add_argument_group('Report generation')
+    report.add_argument('--full-report', action='store_true',
+                        help='Run full pipeline: evaluate -> aggregate -> visualize -> report')
+    report.add_argument('--report-dir', type=Path, default=Path('generated/reports'),
+                        help='Output directory for reports (default: generated/reports)')
+
     # Legacy compatibility
     legacy = parser.add_argument_group('Legacy (for backwards compatibility)')
     legacy.add_argument('--episodes', '-n', type=int, default=None, metavar='N',
                         help='[DEPRECATED] Use --timesteps instead. Episodes to run.')
-    
+
     args = parser.parse_args()
     
     # Handle legacy --episodes flag
@@ -320,10 +522,38 @@ def main():
     print(f"Modes: {', '.join(modes_to_test)}")
     print(f"Timesteps: {args.timesteps:,}")
     print(f"Deterministic: {args.deterministic}")
-    if args.seed:
+    if args.runs > 1:
+        print(f"Runs: {args.runs} (base seed: {args.base_seed})")
+    elif args.seed:
         print(f"Seed: {args.seed}")
-    
-    # Run with or without dashboard
+
+    # Handle --full-report mode
+    if args.full_report:
+        # Full report mode: multi-run -> aggregate -> visualize -> report
+        run_full_report(
+            modes=modes_to_test,
+            overrides=overrides,
+            n_runs=args.runs if args.runs > 1 else 3,  # Default to 3 runs for reports
+            base_seed=args.base_seed,
+            output_dir=args.report_dir,
+            sequential=args.sequential,
+        )
+        return
+
+    # Handle multi-run mode (without full report)
+    if args.runs > 1:
+        multi_results = run_multi_seed(
+            modes=modes_to_test,
+            overrides=overrides,
+            n_runs=args.runs,
+            base_seed=args.base_seed,
+            sequential=args.sequential,
+        )
+        output_path = Path(args.output)
+        aggregate_multi_run_results(multi_results, output_path)
+        return
+
+    # Standard single-run mode
     dashboard = None
 
     if args.dashboard:
@@ -333,19 +563,19 @@ def main():
         total_timesteps = args.timesteps * n_envs
         dashboard = create_testing_dashboard(modes_to_test, total_timesteps)
         dashboard.start()
-    
+
     try:
         if len(modes_to_test) == 1 or args.sequential:
             results = run_sequential(modes_to_test, overrides, dashboard)
         else:
             results = run_parallel(modes_to_test, overrides, dashboard)
-        
+
         # Save combined results
         if len(results) > 1:
             output_path = Path(args.output)
             merge_results(results, output_path)
             print_comparison(results)
-        
+
     finally:
         if dashboard:
             if dashboard.is_alive():
