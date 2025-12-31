@@ -419,15 +419,15 @@ class ParallelStatsApp:
                 'checkpoint', mode,
                 (timesteps, food, poison, deaths, survival_times)
             ))
-        except:
-            pass
+        except queue.Full:
+            pass  # Dashboard will catch up on next update
 
     def send_complete(self, mode: str):
         """Signal mode completion."""
         try:
             self._queue.put_nowait(('complete', mode, None))
-        except:
-            pass
+        except queue.Full:
+            pass  # Dashboard will detect completion via other means
 
     def stop(self, timeout: float = 2.0):
         """Stop dashboard gracefully."""
