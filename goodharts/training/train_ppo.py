@@ -167,10 +167,8 @@ def main():
                          help='Show live training dashboard')
     monitor.add_argument('-v', '--verbose', action='store_true', dest='hyper_verbose',
                          help='Debug mode: print at every major step')
-    monitor.add_argument('--log', action='store_true', dest='force_log',
-                         help='Force file logging (for debugging)')
     monitor.add_argument('--no-log', action='store_true', dest='no_log',
-                         help='Disable file logging even in multi-mode')
+                         help='Disable TensorBoard file logging')
 
     # Experiment settings
     experiment = parser.add_argument_group('Experiment')
@@ -184,6 +182,8 @@ def main():
                             help='Full determinism (slower, for debugging)')
     experiment.add_argument('--analyze', action='store_true',
                             help='Run evaluation after training and generate comparison stats')
+    experiment.add_argument('--popart-beta-min', type=float, default=None, metavar='BETA',
+                            help='PopArt EMA min decay rate (smaller = slower adaptation)')
 
     # Utility
     utility = parser.add_argument_group('Utility')
@@ -221,6 +221,8 @@ def main():
             overrides['total_timesteps'] = 50_000
     if args.gpu_log_interval_ms is not None:
         overrides['gpu_log_interval_ms'] = args.gpu_log_interval_ms
+    if args.popart_beta_min is not None:
+        overrides['popart_beta_min'] = args.popart_beta_min
 
     # Handle timesteps (--updates is a convenience conversion)
     n_envs = args.n_envs or train_cfg.get('n_envs', 64)
@@ -276,14 +278,8 @@ def main():
     _reset_signal_state()
     reset_training_state()  # Clear any stale global state from previous runs
 
-    # Determine file logging: --log enables, --no-log disables
-    if args.force_log:
-        log_to_file = True
-    elif args.no_log:
-        log_to_file = False
-    else:
-        # Default: logging disabled (use --log to enable TensorBoard logging)
-        log_to_file = False
+    # File logging: enabled by default, --no-log disables
+    log_to_file = not args.no_log
 
     # Handle --profile-trace separately (requires special profiler setup)
     if args.profile_trace:
