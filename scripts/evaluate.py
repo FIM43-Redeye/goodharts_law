@@ -45,7 +45,7 @@ from goodharts.utils.device import get_device
 from goodharts.utils.seed import set_seed
 from goodharts.configs.default_config import get_simulation_config
 from goodharts.modes import get_all_mode_names
-from goodharts.config import get_training_config
+from goodharts.config import get_training_config, get_evaluation_config
 from goodharts.evaluation import (
     EvaluationConfig, ModelTester,
     generate_seeds, aggregate_runs, RunResult, MultiRunAggregates,
@@ -400,8 +400,9 @@ def run_full_report(
 def main():
     config = get_simulation_config()
     train_cfg = get_training_config()
+    eval_cfg = get_evaluation_config()
     all_modes = get_all_mode_names(config)
-    
+
     parser = argparse.ArgumentParser(
         description='Testing for trained Goodhart agents.',
         epilog='Config precedence: CLI args > config.toml',
@@ -412,10 +413,10 @@ def main():
     scope = parser.add_argument_group('Scope')
     scope.add_argument('-m', '--mode', default='ground_truth', metavar='MODE',
                        help=f'Mode(s): {", ".join(all_modes)}, "all", or comma-separated')
-    scope.add_argument('-t', '--timesteps', type=int, default=1000, metavar='N',
-                       help='Steps per environment (multiplied by n_envs for total, default: 1000)')
-    scope.add_argument('-e', '--n-envs', type=int, default=None, metavar='N',
-                       help='Parallel environments per mode')
+    scope.add_argument('-t', '--timesteps', type=int, default=eval_cfg['steps_per_env'], metavar='N',
+                       help=f'Steps per environment (default: {eval_cfg["steps_per_env"]})')
+    scope.add_argument('-e', '--n-envs', type=int, default=eval_cfg['n_envs'], metavar='N',
+                       help=f'Parallel environments per mode (default: {eval_cfg["n_envs"]})')
     scope.add_argument('-s', '--sequential', action='store_true',
                        help='Test modes sequentially (saves VRAM)')
     
@@ -453,10 +454,10 @@ def main():
     
     # Multi-run
     multi = parser.add_argument_group('Multi-run evaluation')
-    multi.add_argument('-r', '--runs', type=int, default=1, metavar='N',
-                       help='Number of evaluation runs with different seeds (default: 1)')
-    multi.add_argument('--base-seed', type=int, default=42, metavar='N',
-                       help='Base seed for reproducible multi-run (default: 42)')
+    multi.add_argument('-r', '--runs', type=int, default=eval_cfg['runs'], metavar='N',
+                       help=f'Number of evaluation runs with different seeds (default: {eval_cfg["runs"]})')
+    multi.add_argument('--base-seed', type=int, default=eval_cfg['base_seed'], metavar='N',
+                       help=f'Base seed for reproducible multi-run (default: {eval_cfg["base_seed"]})')
 
     # Full report
     report = parser.add_argument_group('Report generation')
@@ -502,6 +503,7 @@ def main():
     # Build overrides
     overrides = {
         'total_timesteps': args.timesteps,
+        'n_envs': args.n_envs,
         'deterministic': args.deterministic,
         'seed': args.seed,
         'temperature': args.temperature,
@@ -511,16 +513,14 @@ def main():
         'output_path': args.output,
         'model_path': args.model,
     }
-    
-    if args.n_envs:
-        overrides['n_envs'] = args.n_envs
-    
+
     # Remove None values
     overrides = {k: v for k, v in overrides.items() if v is not None}
-    
+
+    total_steps = args.timesteps * args.n_envs
     print(f"\nTesting: {len(modes_to_test)} mode(s)")
     print(f"Modes: {', '.join(modes_to_test)}")
-    print(f"Timesteps: {args.timesteps:,}")
+    print(f"Envs: {args.n_envs:,} x {args.timesteps:,} steps = {total_steps:,} total steps")
     print(f"Deterministic: {args.deterministic}")
     if args.runs > 1:
         print(f"Runs: {args.runs} (base seed: {args.base_seed})")
