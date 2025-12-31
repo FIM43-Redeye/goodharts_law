@@ -554,16 +554,13 @@ class TestingDashboardProcess:
         except queue.Full:
             pass
 
-    # Backwards compatibility aliases
+    # Backwards compatibility aliases (no-ops, kept to prevent AttributeError)
     def send_episode(self, mode: str, episode):
-        """Legacy compatibility - convert episode to checkpoint."""
-        from dataclasses import asdict
-        ep = asdict(episode) if hasattr(episode, '__dataclass_fields__') else episode
-        # Can't fully reconstruct, but this keeps old code from crashing
+        """Legacy compatibility - no-op, checkpoint-based updates replaced this."""
         pass
 
     def send_progress(self, mode: str, steps: int, deaths: int):
-        """Legacy compatibility."""
+        """Legacy compatibility - no-op, checkpoint-based updates replaced this."""
         pass
 
     def is_alive(self) -> bool:

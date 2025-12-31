@@ -51,17 +51,6 @@ def run_survival_test(behavior_setup_func, behavior_name: str,
     for run in range(num_runs):
         config = get_simulation_config()
         
-        # Override steps_per_episode to prevent auto-resets in VecEnv
-        # VecEnv reads this from get_training_config() if not passed, BUT
-        # VecEnv also reads 'max_steps' from passed config if integrated properly?
-        # Actually VecEnv reads: self.max_steps = train_cfg.get('steps_per_episode', 500)
-        # We need to hack the training config singleton or patch it? 
-        # Easier: Modifying VecEnv to read from main config?
-        # No, let's rely on the fact that we can't easily change `max_steps` 
-        # without reloading config or patching get_training_config.
-        
-        # However, checking vec_env.py:
-        # train_cfg = get_training_config()
         setup_config = behavior_setup_func(num_agents)
         config['AGENTS_SETUP'] = setup_config
 
