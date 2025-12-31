@@ -348,8 +348,8 @@ class BrainViewApp:
         # Send to dashboard process
         try:
             self._queue.put_nowait(state)
-        except:
-            pass  # Drop if queue full
+        except queue.Full:
+            pass  # Drop if queue full - dashboard will catch up
 
     def stop(self, timeout: float = 2.0):
         """Stop dashboard gracefully."""
