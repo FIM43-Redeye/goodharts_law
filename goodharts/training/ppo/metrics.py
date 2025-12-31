@@ -286,16 +286,19 @@ class BackgroundBookkeeper:
             value_loss=m['value_loss'],
             entropy=m['entropy'],
             explained_var=m['explained_var'],
-            avg_reward=m['reward_sum'] / max(m['n_episodes'], 1),
-            min_reward=m['reward_min'],
-            max_reward=m['reward_max'],
-            n_episodes=m['n_episodes'],
             best_reward=self.best_reward,
             profiler_summary=profiler_summary,
             validation_metrics=work.validation_metrics,
             action_probs=m['action_probs'],
             mode=work.mode,
-            food_sum=m['food_sum'],
-            poison_sum=m['poison_sum'],
+            # Episode stats as dict (legacy format for episode_stats field)
+            episode_stats=None,  # Not using legacy dict format
+            # Episode aggregates (new format - individual fields)
+            episodes_count=m['n_episodes'],
+            reward_sum=m['reward_sum'],
+            reward_min=m['reward_min'],
+            reward_max=m['reward_max'],
+            food_sum=int(m['food_sum']),
+            poison_sum=int(m['poison_sum']),
         )
         self.async_logger.log_update(log_payload)

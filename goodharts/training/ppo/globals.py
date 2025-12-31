@@ -13,7 +13,9 @@ _COMPILE_LOCK = threading.Lock()
 
 # Global warmup state - shared across sequential/parallel training runs
 # Once warmup is done for one mode, subsequent modes skip it
-_WARMUP_LOCK = threading.Lock()
+# Uses RLock (reentrant) because check_warmup_done() may be called inside
+# a with get_warmup_lock() block (same thread needs to acquire twice)
+_WARMUP_LOCK = threading.RLock()
 _WARMUP_DONE = False
 
 # Global abort flag - checked by all trainers to enable coordinated shutdown
@@ -73,6 +75,6 @@ def get_compile_lock() -> threading.Lock:
     return _COMPILE_LOCK
 
 
-def get_warmup_lock() -> threading.Lock:
+def get_warmup_lock() -> threading.RLock:
     """Get the warmup lock for thread-safe warmup state access."""
     return _WARMUP_LOCK
