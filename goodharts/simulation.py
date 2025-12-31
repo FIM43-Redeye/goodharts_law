@@ -20,13 +20,6 @@ from goodharts.modes import ObservationSpec, get_mode_for_requirement
 logger = get_logger("simulation")
 
 
-# Death detection thresholds based on reward values
-# Poison penalty is -10 (plus move cost and death penalty), so <= -15 indicates poison
-POISON_REWARD_THRESHOLD = -15
-# Death penalty alone is -10, so starvation (energy depleted) gives ~ -10
-STARVATION_REWARD_THRESHOLD = -9
-
-
 class AgentWrapper:
     """
     Wraps an agent in the VecEnv to provide an object-oriented interface 
