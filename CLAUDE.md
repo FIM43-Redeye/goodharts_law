@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Goodhart's Law Simulation is an AI safety demonstration that uses reinforcement learning to show how proxy metric optimization fails. Agents navigate a 2D grid world distinguishing food from poison. Ground-truth agents see real cell types and thrive; proxy agents see only "interestingness" values and inevitably get poisoned.
 
-**Stack:** Python 3.9+, PyTorch (GPU-native), NumPy, Matplotlib
+**Stack:** Python 3.9+, PyTorch (GPU-native), NumPy, Plotly/Dash
 
 ## Common Commands
 
@@ -14,14 +14,27 @@ Goodhart's Law Simulation is an AI safety demonstration that uses reinforcement 
 # Install
 pip install -e .
 
-# Run visual demo
-python main.py                                    # Default demo
-python main.py --learned                          # All agent types
-python main.py --brain-view --agent ground_truth  # Neural net visualization
+# Visualization dashboards
+python main.py --brain-view -m ground_truth       # Single-agent neural net visualization
+python main.py --parallel-stats                   # Multi-mode statistics comparison
+python scripts/brain_view.py -m proxy --speed 100 # Direct script with options
+python scripts/parallel_stats.py --modes ground_truth,proxy --envs 256
 
 # Train
 python -m goodharts.training.train_ppo --mode ground_truth --timesteps 100000
 python -m goodharts.training.train_ppo --mode all --dashboard
+
+# Evaluate
+python scripts/evaluate.py --mode all --timesteps 50000    # Single evaluation run
+python scripts/evaluate.py --mode all --runs 5 --base-seed 42  # Multi-run with aggregation
+python scripts/evaluate.py --full-report --runs 5          # Full report with figures
+
+# Visualize results
+python -m goodharts.analysis.visualize --input generated/eval_results.json --all
+python -m goodharts.analysis.report --input generated/eval_results.json
+
+# Power analysis
+python -c "from goodharts.analysis import print_power_table; print_power_table()"
 
 # Test
 pytest tests/ -v                                  # All tests
@@ -49,7 +62,15 @@ User → main.py or train_ppo → Load TOML Config → TorchVecEnv (GPU) → Beh
 
 - **Neural Network** (`behaviors/brains/base_cnn.py`): 3-layer CNN + 2 FC layers. Dynamic input channels based on observation format. Outputs 8-directional action logits.
 
-- **PPO Training** (`training/ppo/`): PPOTrainer orchestrates training. AsyncLogger offloads GPU syncs to separate thread for performance.
+- **PPO Training** (`training/ppo/`): Modular PPO implementation:
+  - `trainer.py`: Main training orchestrator (PPOTrainer)
+  - `ppo_config.py`: Configuration dataclass with TOML loading
+  - `algorithms.py`: GAE computation and PPO update logic
+  - `models.py`: ValueHead, PopArtValueHead for value function
+  - `metrics.py`: Async GPU-to-CPU metrics transfer with double-buffered pinned memory
+  - `async_logger.py`: Background thread for logging without GPU sync
+  - `monitoring.py`: GPU utilization sampling (sysfs/nvidia-smi)
+  - `globals.py`: Thread-safe warmup/abort state for parallel training
 
 ## Configuration
 
@@ -80,3 +101,7 @@ Key env var: `GOODHARTS_DEVICE` (force device: `cuda:1`, `cpu`, `tpu`)
 - `goodharts/modes.py`: ObservationSpec and RewardComputer
 - `goodharts/training/ppo/trainer.py`: PPO training loop
 - `goodharts/configs/default_config.py`: CellType registry and get_config()
+- `goodharts/visualization/`: Plotly/Dash dashboards (brain_view.py, parallel_stats.py)
+- `goodharts/evaluation/`: Evaluation infrastructure (evaluator.py, multi_run.py)
+- `goodharts/analysis/`: Statistical analysis (stats_helpers.py, power.py, visualize.py, report.py)
+- `scripts/evaluate.py`: CLI for evaluation with multi-run and report generation

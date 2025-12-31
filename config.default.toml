@@ -11,13 +11,38 @@
 #   - interestingness: What proxy-metric agents observe (the misleading signal)
 #   - color: RGB for visualization
 #
-# TODO (Goodhart Documentation):
-#   Explain the design rationale for these interestingness values:
-#   - Why is poison MORE interesting (1.0) than food (0.5)?
-#   - How does this create an "anti-correlated" proxy metric?
-#   - What real-world scenarios does this model? (engagement metrics, clickbait, etc.)
-#   - Why is this a SHARPER demonstration than having similar values?
-#   - What would happen if interestingness perfectly correlated with energy_delta?
+# Interestingness Design Rationale
+# --------------------------------
+# The interestingness values deliberately create an ANTI-CORRELATED proxy metric:
+# poison has interestingness=1.0 while food has only interestingness=0.5. This
+# means an agent optimizing for the proxy will preferentially seek out the
+# harmful option, demonstrating Goodhart's Law in its starkest form.
+#
+# Why anti-correlation matters:
+#   When we optimize for a proxy metric instead of the true objective, the
+#   proxy becomes "gamed" - but the failure mode depends on the correlation.
+#   With positive correlation, proxy-optimizers still do okay. With zero
+#   correlation, they wander randomly. With NEGATIVE correlation, they
+#   systematically pursue harm. This simulation shows the worst case.
+#
+# Real-world parallels:
+#   - Engagement metrics: Outrage, fear, and controversy drive more clicks
+#     than nuanced, accurate reporting. The "interesting" content is harmful.
+#   - Clickbait vs. substance: Sensational headlines outcompete useful ones.
+#   - Social media algorithms: Divisive content spreads faster than truth.
+#   - Academic metrics: Citation counts can reward controversial claims over
+#     careful science.
+#
+# Why this makes a sharper demonstration:
+#   If food and poison had equal interestingness, proxy agents would eat both
+#   equally, producing a subtle 50/50 failure. By making poison MORE attractive,
+#   proxy agents actively seek it out, producing visible, dramatic collapse.
+#   The failure is unmistakable: proxy agents consistently die.
+#
+# The counterfactual:
+#   If interestingness perfectly matched energy_delta, there would be no
+#   Goodhart failure at all - the proxy would BE the ground truth. This is
+#   the impossible ideal we wish we had for real-world metrics.
 
 [cell_types.empty]
 color = [26, 26, 46]
@@ -76,7 +101,7 @@ count = 5
 view_range = 5           # Observation radius (creates 11x11 view)
 energy_start = 1.0
 energy_move_cost = 0.01  # Energy cost per move (direct value, no scaling)
-move_cost_exponent = 1.5
+move_cost_exponent = 1.5 # Semi-stub, for moving more than one space at a time
 max_move_distance = 1
 death_penalty_ratio = 4.0  # Death penalty as multiple of food reward
 
@@ -110,11 +135,11 @@ value_coef = 0.5
 
 # Entropy scheduling: prevents premature collapse while allowing full convergence
 # Two-phase approach:
-#   Phase 1 (0-70%): entropy_coef decays, floor stays constant (stable learning)
-#   Phase 2 (70-100%): entropy_coef at final, floor decays to 0 (allow determinism)
+#   Phase 1 (0-100%): entropy_coef decays, floor stays constant (stable learning)
+#   Phase 2 (UNUSED): entropy_coef at final, floor decays to 0 (allow determinism)
 entropy_initial = 0.1    # Strong exploration early
-entropy_final = 0.01     # Minimal when near-optimal
-entropy_decay_fraction = 0.7  # Coef decay duration; floor decays AFTER this
+entropy_final = 0.001     # Minimal when near-optimal
+entropy_decay_fraction = 1.0  # Coef decay duration; floor decays AFTER this
 entropy_floor = 0.5      # Min entropy during Phase 1 (log(8)/4)
 entropy_floor_penalty = 0.05  # Penalty coefficient for floor violation
 
@@ -131,6 +156,7 @@ steps_per_episode = 512  # Max steps before forced reset
 # Architecture
 brain_type = "base_cnn"
 value_head_type = "popart"
+popart_beta_min = 0.001         # Min EMA decay for PopArt (smaller = slower adaptation, more stable)
 popart_rescale_weights = true   # Rescale fc weights when stats change (required for correct values)
 action_space_type = "discrete_grid"
 

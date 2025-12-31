@@ -6,13 +6,39 @@ so this agent cannot distinguish food from poison based on cell type.
 With poison being MORE interesting (1.0) than food (0.5), this agent
 will actively PREFER poison. This is the Goodhart's Law trap.
 
-TODO (Goodhart Documentation):
-    Explain why this behavior embodies Goodhart's Law:
-    - What is the "proxy metric" and why is it a proxy?
-    - Why can't this agent distinguish food from poison?
-    - How does optimizing for interestingness lead to eating poison?
-    - Connect this to real-world examples of specification gaming
-    - Why is poison being MORE interesting than food a sharper demonstration?
+Goodhart's Law in Action:
+    "When a measure becomes a target, it ceases to be a good measure."
+
+    THE PROXY METRIC: "Interestingness" is a measurable signal that correlates
+    with valuable resources - food is interesting (0.5), poison is interesting
+    (1.0). But interestingness is NOT the true objective (survival/energy).
+    It's a proxy: easy to measure, but fundamentally disconnected from what
+    actually matters.
+
+    INFORMATION BLINDNESS: The proxy observation encoding places the same
+    interestingness value in both channels. Food appears as (0.5, 0.5), poison
+    as (1.0, 1.0). The agent perceives different magnitudes but has no channel
+    that distinguishes cell TYPES. The encoding itself destroys the information
+    needed to survive.
+
+    WHY OPTIMIZATION FAILS: This agent greedily maximizes interestingness.
+    Since poison (1.0) > food (0.5), the agent systematically PREFERS poison.
+    It achieves perfect performance on the proxy metric while dying. This is
+    the core Goodhart failure: optimizing the measure, not the goal.
+
+    REAL-WORLD PARALLELS:
+    - Recommendation algorithms maximizing engagement (clicks, watch time)
+      instead of user wellbeing, leading to addictive or harmful content
+    - Companies optimizing metrics that look good on reports but don't
+      reflect actual value creation
+    - ML models learning spurious correlations that ace benchmarks but
+      fail catastrophically in deployment
+
+    WHY ANTI-CORRELATION SHARPENS THE DEMONSTRATION: If poison had equal
+    interestingness to food, failures would be random (50% chance). By making
+    poison MORE interesting, the failure becomes systematic and dramatic -
+    the better the agent optimizes, the faster it dies. This makes the
+    Goodhart trap unmistakable rather than attributable to noise.
 """
 import torch
 from goodharts.behaviors.base import BehaviorStrategy
