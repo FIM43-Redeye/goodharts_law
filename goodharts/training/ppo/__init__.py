@@ -16,8 +16,9 @@ Usage:
 from .models import ValueHead, Profiler
 from goodharts.modes import RewardComputer
 from .algorithms import compute_gae, ppo_update
-from .trainer import (
-    PPOTrainer, PPOConfig,
+from .trainer import PPOTrainer
+from .ppo_config import PPOConfig
+from .globals import (
     request_abort, clear_abort, is_abort_requested, reset_training_state
 )
 
