@@ -63,6 +63,12 @@ import torch
 from goodharts.utils.device import get_device
 
 
+# Reward clipping bounds to prevent extreme values from destabilizing training.
+# These are conservative limits; typical rewards are in [-2, 1] range.
+REWARD_CLIP_MIN = -20.0
+REWARD_CLIP_MAX = 20.0
+
+
 @dataclass
 class ObservationSpec:
     """
@@ -232,9 +238,9 @@ class RewardComputer(ABC):
         # Update for next step
         self.prev_potentials = next_potentials
 
-        # 3. Combine and clip
+        # 3. Combine and clip (prevent extreme rewards from destabilizing training)
         total_rewards = base_rewards + shaping
-        total_rewards = torch.clamp(total_rewards, -20.0, 20.0)
+        total_rewards = torch.clamp(total_rewards, REWARD_CLIP_MIN, REWARD_CLIP_MAX)
 
         return total_rewards
 
@@ -278,9 +284,9 @@ class RewardComputer(ABC):
 
         shaping = (target_potentials * self.gamma) - prev_potentials
 
-        # 3. Combine and clip
+        # 3. Combine and clip (prevent extreme rewards from destabilizing training)
         total_rewards = base_rewards + shaping
-        total_rewards = torch.clamp(total_rewards, -20.0, 20.0)
+        total_rewards = torch.clamp(total_rewards, REWARD_CLIP_MIN, REWARD_CLIP_MAX)
 
         return total_rewards, next_potentials
 

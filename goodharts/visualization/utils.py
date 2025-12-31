@@ -5,7 +5,6 @@ Provides efficient tensor-to-image conversion for visualization.
 """
 import numpy as np
 import torch
-import plotly.graph_objects as go
 
 from goodharts.configs.default_config import CellType
 
@@ -131,67 +130,3 @@ def grid_with_agent_to_rgb(
                 rgb[ny, nx] = [0, 255, 255]
 
     return rgb
-
-
-def create_heatmap_figure(
-    data: np.ndarray,
-    title: str,
-    colorscale: str = 'Hot',
-    showscale: bool = True,
-) -> go.Figure:
-    """
-    Create a Plotly heatmap figure.
-
-    Args:
-        data: 2D array to visualize
-        title: Figure title
-        colorscale: Plotly colorscale name
-        showscale: Whether to show colorbar
-
-    Returns:
-        Plotly figure
-    """
-    from goodharts.visualization.components import apply_dark_theme
-
-    fig = go.Figure(data=go.Heatmap(
-        z=data,
-        colorscale=colorscale,
-        showscale=showscale,
-    ))
-
-    fig.update_layout(
-        title=title,
-        yaxis=dict(scaleanchor='x', constrain='domain', autorange='reversed'),
-    )
-    fig.update_xaxes(showticklabels=False)
-    fig.update_yaxes(showticklabels=False)
-
-    return apply_dark_theme(fig)
-
-
-def create_image_figure(
-    rgb: np.ndarray,
-    title: str = '',
-) -> go.Figure:
-    """
-    Create a Plotly figure from RGB array.
-
-    Args:
-        rgb: (H, W, 3) uint8 array
-        title: Optional figure title
-
-    Returns:
-        Plotly figure displaying the image
-    """
-    from goodharts.visualization.components import apply_dark_theme
-
-    fig = go.Figure(data=go.Image(z=rgb))
-
-    fig.update_layout(
-        title=title,
-        yaxis=dict(scaleanchor='x', constrain='domain'),
-    )
-    fig.update_xaxes(showticklabels=False)
-    fig.update_yaxes(showticklabels=False)
-
-    return apply_dark_theme(fig)

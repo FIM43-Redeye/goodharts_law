@@ -272,8 +272,10 @@ class BackgroundBookkeeper:
                     duration_ms = start_event.elapsed_time(end_event)
                     summaries.append(f"{name}:{duration_ms:.1f}ms")
                 profiler_summary = " | ".join(summaries)
-            except Exception:
-                pass
+            except RuntimeError:
+                # CUDA event timing can fail if events weren't recorded properly
+                # This is non-critical - just skip profiler summary
+                profiler_summary = "(profiler timing unavailable)"
 
         # Log via AsyncLogger
         log_payload = LogPayload(

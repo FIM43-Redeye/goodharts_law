@@ -18,12 +18,9 @@ from goodharts.modes import (
     get_mode_for_requirement,
     _get_modes,
 )
-from goodharts.configs.default_config import get_simulation_config, CellType
+from goodharts.configs.default_config import CellType
 
-
-@pytest.fixture
-def config():
-    return get_simulation_config()
+# Note: config fixture is provided by conftest.py
 
 
 @pytest.fixture

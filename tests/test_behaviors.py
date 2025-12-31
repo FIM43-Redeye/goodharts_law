@@ -1,13 +1,8 @@
 """Tests for behavior implementations."""
 import pytest
 import torch
-from goodharts.configs.default_config import get_simulation_config
 
-
-@pytest.fixture
-def config():
-    return get_simulation_config()
-
+# Note: config fixture is provided by conftest.py
 
 
 class MockAgent:
