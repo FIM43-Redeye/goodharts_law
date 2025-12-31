@@ -21,12 +21,9 @@ from goodharts.behaviors.action_space import (
     index_to_action,
     num_actions,
 )
-from goodharts.configs.default_config import get_simulation_config, CellType
+from goodharts.configs.default_config import CellType
 
-
-@pytest.fixture
-def config():
-    return get_simulation_config()
+# Note: config fixture is provided by conftest.py
 
 
 class TestBehaviorRegistry:

@@ -12,18 +12,9 @@ import torch.nn as nn
 
 from goodharts.behaviors.brains.base_cnn import BaseCNN
 from goodharts.behaviors.action_space import num_actions
-from goodharts.configs.default_config import get_simulation_config
 from goodharts.modes import ObservationSpec
 
-
-@pytest.fixture
-def device():
-    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-
-@pytest.fixture
-def config():
-    return get_simulation_config()
+# Note: config and device fixtures are provided by conftest.py
 
 
 class TestCNNArchitecture:
