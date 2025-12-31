@@ -637,11 +637,11 @@ def action_to_index(dx: int, dy: int, max_move_distance: int = 1) -> int:
 
 
 # =============================================================================
-# DEBUG
+# Developer Utilities
 # =============================================================================
 
 def print_action_space(space: ActionSpace | str = 'discrete_grid', max_move_distance: int = 1) -> None:
-    """Print action space for debugging."""
+    """Print action space details for inspection."""
     if isinstance(space, str):
         space = create_action_space(space, max_move_distance)
 

@@ -101,9 +101,10 @@ class TorchVecEnv(nn.Module):
 
         # Freeze energy during training: agents don't die, enabling exploration
         # Used for proxy mode where agents can't learn from energy consequences
-        self.freeze_energy = obs_spec.freeze_energy_in_training
+        # Use private attribute + property so setting freeze_energy updates multiplier
+        self._freeze_energy = obs_spec.freeze_energy_in_training
         # Branchless multiplier: 0.0 when frozen (skip energy updates), 1.0 otherwise
-        self._energy_enabled = 0.0 if self.freeze_energy else 1.0
+        self._energy_enabled = 0.0 if self._freeze_energy else 1.0
 
         # Build interestingness lookup table: cell_value -> interestingness
         # Used for proxy mode observations
@@ -138,9 +139,8 @@ class TorchVecEnv(nn.Module):
         self._cell_food = self.CellType.FOOD.value
         self._cell_poison = self.CellType.POISON.value
         self.food_reward = self.CellType.FOOD.energy_reward
-        self.poison_reward = self.CellType.FOOD.interestingness  # For proxy mode
         self.poison_penalty = self.CellType.POISON.energy_penalty
-        self.poison_interestingness = self.CellType.POISON.interestingness  # For proxy mode
+        # Note: interestingness values are handled via _interestingness_lut (line 116)
 
         # Action deltas - must match policy's action space (constant)
         self.max_move_distance = config.get('MAX_MOVE_DISTANCE', 1)
@@ -206,9 +206,31 @@ class TorchVecEnv(nn.Module):
         self._density_poison_mid = (default_poison + default_poison) / 2.0
         self._density_poison_scale = 1.0
 
+        # Privileged view buffer: ground truth encoding for value function
+        # Only used when is_proxy_mode=True (ground_truth_blinded, proxy)
+        # For ground_truth modes, privileged view == regular view (no extra buffer needed)
+        if self.is_proxy_mode:
+            self.register_buffer('_privileged_view_buffer', torch.zeros(
+                (n_envs, self.n_channels, self.view_size, self.view_size),
+                dtype=torch.float32, device=device
+            ), persistent=False)
+        else:
+            self._privileged_view_buffer = None
+
         # Initialize
         self.reset()
-    
+
+    @property
+    def freeze_energy(self) -> bool:
+        """Whether energy updates are frozen (agents can't die)."""
+        return self._freeze_energy
+
+    @freeze_energy.setter
+    def freeze_energy(self, value: bool):
+        """Set freeze_energy and update the branchless multiplier."""
+        self._freeze_energy = value
+        self._energy_enabled = 0.0 if value else 1.0
+
     def set_curriculum_ranges(self, food_min: int, food_max: int,
                                poison_min: int, poison_max: int):
         """Set curriculum ranges for per-environment randomization."""
@@ -742,6 +764,10 @@ class TorchVecEnv(nn.Module):
         The proxy agent sees the same value in both channels, making
         food and poison indistinguishable - only magnitude matters.
         Poison has higher interestingness (1.0 > 0.5), creating the Goodhart trap.
+
+        For proxy modes, also computes ground truth encoding into _privileged_view_buffer
+        for the value function (asymmetric actor-critic). This reuses the same
+        views_int tensor, so only the encoding step is duplicated (trivial cost).
         """
         r = self.view_radius
         vs = self.view_size
@@ -749,7 +775,7 @@ class TorchVecEnv(nn.Module):
         # Pad grids with circular wrapping (grid is float32, no conversion needed)
         padded_grids = F.pad(self.grids, (r, r, r, r), mode='circular')
 
-        # VECTORIZED VIEW EXTRACTION using unfold
+        # VECTORIZED VIEW EXTRACTION using unfold (expensive - done once)
         windows = padded_grids.unfold(1, vs, 1).unfold(2, vs, 1)
 
         # Index by agent positions to get each agent's view
@@ -759,18 +785,24 @@ class TorchVecEnv(nn.Module):
         if self.is_proxy_mode:
             # PROXY MODE: Both channels get the same interestingness value
             # Agent cannot distinguish food from poison, only sees magnitude
-            # Lookup interestingness from cell values
             clamped_views = views_int.clamp(0, len(self._interestingness_lut) - 1)
             interestingness = self._interestingness_lut[clamped_views]  # (n_envs, vs, vs)
 
             # Both channels get the same value
             self._view_buffer[:, 0, :, :] = interestingness
             self._view_buffer[:, 1, :, :] = interestingness
+
+            # PRIVILEGED VIEW: Ground truth encoding for value function
+            # Computed from same views_int - only cost is 2 comparisons (trivial)
+            self._privileged_view_buffer[:, 0, :, :] = (views_int == self._cell_food).float()
+            self._privileged_view_buffer[:, 1, :, :] = (views_int == self._cell_poison).float()
+            self._privileged_view_buffer[:, :, r, r] = 0.0
         else:
             # GROUND TRUTH MODE: Binary encoding
             # Channel 0: is_food, Channel 1: is_poison
             self._view_buffer[:, 0, :, :] = (views_int == self._cell_food).float()
             self._view_buffer[:, 1, :, :] = (views_int == self._cell_poison).float()
+            # Privileged view == regular view (no separate buffer needed)
 
         # Blank center (agent's own cell)
         self._view_buffer[:, :, r, r] = 0.0
@@ -801,6 +833,56 @@ class TorchVecEnv(nn.Module):
 
         # Stack into buffer (returns new tensor, doesn't mutate)
         return torch.stack([food_normalized, poison_normalized], dim=1)
+
+    def get_privileged_view(self) -> torch.Tensor:
+        """
+        Get ground truth observation for privileged critic (asymmetric actor-critic).
+
+        Returns the GROUND TRUTH one-hot encoding for value function use:
+        - Channel 0: is_food (1.0 where cell is food, 0.0 elsewhere)
+        - Channel 1: is_poison (1.0 where cell is poison, 0.0 elsewhere)
+
+        Returns:
+            (n_envs, 2, view_size, view_size) tensor with ground truth encoding
+
+        For proxy modes (ground_truth_blinded, proxy), returns the pre-computed
+        _privileged_view_buffer that was populated during _get_observations().
+        For ground truth modes, returns the regular view buffer (same content).
+
+        IMPORTANT: Must be called AFTER _get_observations() in the same step,
+        as it returns the cached buffer computed there.
+        """
+        if self._privileged_view_buffer is not None:
+            # Proxy mode: return pre-computed ground truth view
+            return self._privileged_view_buffer
+        else:
+            # Ground truth mode: privileged view == regular view
+            return self._view_buffer
+
+    def get_critic_aux(self) -> torch.Tensor:
+        """
+        Get combined auxiliary inputs for privileged critic.
+
+        Returns flattened tensor combining:
+        - Normalized density info: [food_density, poison_density] (2 values)
+        - Flattened ground truth view: is_food and is_poison channels (2 * H * W values)
+
+        Total size: 2 + 2 * view_size^2
+
+        For ground truth modes, the privileged view is the same as the policy view.
+        For proxy modes, the privileged view reveals food vs poison that the policy can't see.
+
+        IMPORTANT: Must be called AFTER _get_observations() in the same step.
+        """
+        density = self.get_density_info()  # (n_envs, 2)
+        priv_view = self.get_privileged_view()  # (n_envs, 2, H, W)
+        priv_flat = priv_view.reshape(self.n_envs, -1)  # (n_envs, 2*H*W)
+        return torch.cat([density, priv_flat], dim=-1)  # (n_envs, 2 + 2*H*W)
+
+    @property
+    def num_critic_aux(self) -> int:
+        """Number of auxiliary inputs for privileged critic."""
+        return 2 + 2 * self.view_size * self.view_size
 
 
 def create_torch_vec_env(
