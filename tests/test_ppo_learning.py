@@ -56,16 +56,9 @@ class TestPPOLearning(unittest.TestCase):
         print("\nRunning TorchEnv Learning Dynamics Test...")
         trainer = PPOTrainer(config)
         
-        # Capture initial metrics (hacky way: run one update and check logs/dashboard if we had one, 
-        # but here we can just check the first update's return from a modified train loop or checking buffers?
-        # Actually PPOTrainer.train() returns a summary. 
-        # But we want to monitor progress. 
-        # Let's run it step-by-step or check the final vs initial performance?
-        # For a unit test, running the full train() is easiest.
-        
-        # We'll check the summary returned by train() if it contains history, 
-        # BUT standard trainer.train() only returns final summary.
-        # We can subclass or mock logger.
+        # PPOTrainer.train() returns a final summary with best_reward.
+        # For this sanity check, we verify that training completes and
+        # shows learning (positive best_reward on a solvable environment).
         
         # Let's just run it and assert on the FINAL entropy being lower than initial guess 
         # and checking regarding NaNs.

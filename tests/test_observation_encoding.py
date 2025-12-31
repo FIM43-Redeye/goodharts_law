@@ -219,7 +219,11 @@ class TestProxyEncoding:
         will actively PREFER poison over food, making the failure mode more dramatic.
         The proxy metric (interestingness) is actively anti-correlated with true value.
 
-        TODO: Explain WHY this design choice makes the Goodhart demonstration stronger.
+        Why this makes the demonstration stronger:
+        - With equal interestingness, proxy agents would randomly eat food/poison (~50% efficiency)
+        - With poison MORE interesting, proxy agents ACTIVELY SEEK the harmful option
+        - This shows Goodhart's Law at its worst: the proxy doesn't just fail, it backfires
+        - The result is worse-than-random performance, a dramatic failure mode
         """
         food_i = CellType.FOOD.interestingness
         poison_i = CellType.POISON.interestingness
