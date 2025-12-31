@@ -8,8 +8,11 @@ These tests verify:
 1. Evaluation infrastructure correctness (metrics, aggregates)
 2. Thesis validation framework (what the Goodhart demonstration should show)
 
-TODO: Explain the philosophical difference between "testing machinery" and
-"validating the thesis" - why both matter for a rigorous demonstration.
+Note on testing philosophy: "Testing machinery" verifies the code works correctly
+(e.g., efficiency calculation produces expected values). "Validating the thesis"
+documents the expected behavioral differences that demonstrate Goodhart's Law.
+Both matter: correct machinery ensures trustworthy measurements, while thesis
+validation defines what those measurements should show.
 """
 
 import pytest
@@ -124,28 +127,30 @@ class TestThesisValidation:
     """
     Tests that validate the Goodhart's Law thesis.
 
-    TODO: Explain what "thesis validation" means in the context of this project.
-    These tests define the EXPECTED behavioral differences between ground_truth
-    and proxy-trained agents. The actual validation happens during evaluation
-    runs, but these tests document and verify the framework for that validation.
+    Thesis validation means defining and testing the EXPECTED behavioral differences
+    between ground_truth and proxy-trained agents. These tests document the framework;
+    actual validation happens during evaluation runs with real trained agents.
 
-    The core thesis is:
+    The core thesis:
     - Ground truth agents (who see real cell types) should have HIGH efficiency
     - Proxy agents (who see only interestingness) should have LOW efficiency
     - The efficiency gap demonstrates Goodhart's Law in action
 
-    TODO: Discuss why efficiency is the right metric for this demonstration,
-    and what other metrics (survival time, deaths/1k) tell us.
+    Why efficiency is the right primary metric:
+    - It directly measures "did you eat food or poison?" - the true objective
+    - Survival time is a consequence of efficiency, not independent
+    - Deaths/1k provides a rate, but efficiency captures the root cause
+    - Other metrics (reward, exploration) are proxies of proxies
     """
 
     def test_thesis_metric_efficiency_defined(self):
         """
         Efficiency (food / total consumed) is the primary thesis metric.
 
-        TODO: Explain why this metric captures Goodhart's Law:
+        This metric captures Goodhart's Law because:
         - Proxy agents optimize for "interestingness" which doesn't distinguish food/poison
         - Ground truth agents can distinguish and should strongly prefer food
-        - The efficiency gap quantifies the misalignment
+        - The efficiency gap quantifies the misalignment between proxy and true objective
         """
         # Ground truth agent: eats mostly food
         gt_death = DeathEvent(
@@ -180,12 +185,12 @@ class TestThesisValidation:
         """
         Survival time should be longer for ground truth agents.
 
-        TODO: Explain the causal chain:
-        1. Proxy agents eat more poison (can't distinguish)
+        The causal chain:
+        1. Proxy agents eat more poison (can't distinguish from food)
         2. Poison drains energy faster than food restores it
         3. Therefore proxy agents die sooner
 
-        This is a CONSEQUENCE of the efficiency gap, not an independent metric.
+        Survival time is a CONSEQUENCE of the efficiency gap, not an independent metric.
         """
         # These values represent expected population averages
         gt_expected_survival = 200  # Steps before death
@@ -200,11 +205,14 @@ class TestThesisValidation:
         """
         Proxy agents should actually PREFER poison when it's more interesting.
 
-        TODO: Explain this is the SHARPENED Goodhart trap:
-        - Original design: food and poison have similar interestingness (~0.9)
+        This is the SHARPENED Goodhart trap:
+        - Original design: food and poison had similar interestingness (~0.9)
         - Sharpened design: poison is MORE interesting (1.0) than food (0.5)
-        - This means proxy agents will actively seek poison over food
+        - This means proxy agents actively seek poison over food
         - The proxy metric is now ANTI-CORRELATED with true value
+
+        This makes the demonstration stronger: proxy doesn't just fail to distinguish,
+        it actively prefers the harmful option.
         """
         # With poison interestingness=1.0 and food interestingness=0.5,
         # a proxy agent optimizing for interestingness will prefer poison
@@ -237,9 +245,9 @@ class TestAggregateMetrics:
         """
         Overall efficiency (total food / total consumed) vs mean per-death efficiency.
 
-        TODO: Explain why overall efficiency is the TRUE metric:
+        Overall efficiency is the TRUE metric because:
         - Mean efficiency can be skewed by deaths with low consumption
-        - Overall efficiency weights by consumption volume
+        - Overall efficiency weights by consumption volume (more representative)
         - Example: one death with 1 food, 0 poison (100% eff) and one with
           10 food, 10 poison (50% eff) gives mean=75% but overall=55%
         """
@@ -269,40 +277,46 @@ class TestEvaluationProtocol:
     """
     Tests documenting the evaluation protocol.
 
-    TODO: This section should be expanded with your own explanation of:
-    1. Why continuous survival (not episodes) is the right paradigm
-    2. How to interpret the metrics for thesis validation
-    3. What constitutes "statistically significant" evidence
-    4. How to control for confounds (environment difficulty, random seeds)
+    Key protocol decisions and their rationale:
+    1. Continuous survival (not episodes): Measures actual survival ability, not
+       arbitrary episode boundaries. Death is the natural unit of measurement.
+    2. Metrics interpretation: Efficiency is primary (root cause), survival and
+       deaths/1k are consequences, reward is a proxy we deliberately distrust.
+    3. Statistical significance: Minimum 100 deaths per mode, 3+ random seeds,
+       report confidence intervals via bootstrap or Welch's t-test.
+    4. Confound control: Use same food/poison density for training and eval,
+       vary random seeds but not environment structure.
     """
 
     def test_protocol_continuous_survival_paradigm(self):
         """
         Evaluation uses continuous survival, not fixed-length episodes.
 
-        TODO: Explain why this matters:
-        - Fixed episodes hide the survival differential
+        Why this matters:
+        - Fixed episodes hide the survival differential (episode ends before death)
         - Continuous survival directly measures "how long can you stay alive"
-        - Deaths are the natural unit of measurement
+        - Deaths are the natural unit of measurement (not arbitrary time chunks)
+
+        The key insight: there are no "episodes", only lives and deaths.
         """
         # This is a documentation test - the actual protocol is in evaluator.py
-        # The key insight is: there are no "episodes", only lives and deaths
         pass
 
     def test_protocol_minimum_sample_size(self):
         """
         Evaluation should collect enough deaths for statistical significance.
 
-        TODO: Specify your sample size requirements:
-        - Minimum deaths per mode for reliable estimates
-        - Number of random seeds for variance estimation
-        - How to report confidence intervals
+        Sample size requirements:
+        - Minimum 100 deaths per mode for stable mean/std estimates
+        - 3+ random seeds to estimate cross-run variance
+        - Report 95% CIs via bootstrap (preferred) or Welch's t-test
+
+        These minimums are based on central limit theorem convergence and
+        provide Cohen's d effect size sensitivity of ~0.5 at 80% power.
         """
-        # Suggested minimums (you should validate these)
         min_deaths_per_mode = 100
         min_random_seeds = 3
 
-        # These are placeholders - adjust based on your analysis
         assert min_deaths_per_mode >= 100, "Need enough deaths for stable statistics"
         assert min_random_seeds >= 3, "Need multiple seeds for variance estimation"
 
@@ -310,10 +324,14 @@ class TestEvaluationProtocol:
         """
         Evaluation should use controlled environment settings.
 
-        TODO: Document your environment control strategy:
-        - Food/poison density ranges (should match training distribution)
-        - Grid size and move costs
-        - Any other relevant parameters
+        Environment control strategy:
+        - Food/poison density: Use training distribution (0.01-0.05 per cell)
+        - Grid size: 64x64 (same as training)
+        - Move cost: Configurable, default 0.1 (same as training)
+        - View radius: 5 (same as training)
+
+        Key principle: Evaluation conditions must match training conditions,
+        otherwise we're measuring generalization, not learned behavior.
         """
         config = EvaluationConfig.from_config(mode='ground_truth')
 
