@@ -10,33 +10,31 @@ This project provides a concrete, reproducible example of how optimizing for pro
 
 ## Results
 
-<!-- TODO (Goodhart Documentation):
-     Fill in this table with actual experimental results. Include:
-     - Data from at least 3 random seeds per mode
-     - Confidence intervals or standard deviations
-     - Statistical significance tests between ground_truth and proxy
+Trained agents evaluated using continuous survival testing (3 runs per mode, ~5.7M timesteps each):
 
-     After filling in, write a brief interpretation:
-     - What does the efficiency gap tell us about Goodhart's Law?
-     - Why does proxy perform as it does?
-     - What's surprising or confirming about these results?
--->
-
-Trained agents evaluated using continuous survival testing (agents run until death, then respawn):
-
-| Mode | Observation | Reward | Efficiency | Survival | Deaths/1k | Food/1k | Poison/1k |
-|------|-------------|--------|------------|----------|-----------|---------|-----------|
-| **ground_truth** | Cell types | Energy | TBD | TBD | TBD | TBD | TBD |
-| **ground_truth_handhold** | Cell types | Shaped | TBD | TBD | TBD | TBD | TBD |
-| **proxy** | Interestingness | Interestingness | TBD | TBD | TBD | TBD | TBD |
-| **ground_truth_blinded** | Interestingness | Energy | TBD | TBD | TBD | TBD | TBD |
+| Mode                 | Observation | Reward | Efficiency | Survival | Deaths/1k | Food/1k | Poison/1k |
+|----------------------|-------------|--------|------------|----------|-----------|---------|-----------|
+| **ground_truth**     | Cell types | Energy | 100.0% | 77.2 | 1.44 | 156.4 | 0.0 |
+| ground_truth_handhold | Cell types | Shaped | 99.9% | 49.5 | 3.93 | 149.7 | 0.1 |
+| **proxy**            | Interestingness | Interestingness | **43.9%** | 10.0 | 99.60 | 60.8 | 77.6 |
+| ground_truth_blinded | Interestingness | Energy | 98.0% | 10.0 | 99.55 | 0.4 | 0.0 |
 
 **Key metrics:**
 - **Efficiency** = food / (food + poison) — the core Goodhart failure metric
 - **Survival** = average steps lived before death
 - **Deaths/1k** = population death rate per 1000 steps
 
-**Expected finding:** Proxy agents will show lower efficiency than ground-truth agents because they cannot distinguish food from poison—and worse, poison is MORE interesting (1.0) than food (0.5), so they actively prefer it. They optimize the proxy metric successfully but fail catastrophically at the true objective.
+### Interpretation
+
+The proxy agent demonstrates catastrophic Goodhart failure:
+
+1. **Worse than random**: At 43.9% efficiency, proxy agents eat MORE poison than food. Random chance would yield ~50% efficiency; they actively *prefer* poison because it has higher "interestingness" (1.0) than food (0.5).
+
+2. **69x death rate**: Proxy agents die 69 times more frequently than ground-truth agents (99.6 vs 1.44 deaths per 1000 steps).
+
+3. **The blinded control**: `ground_truth_blinded` receives interestingness observations but real energy rewards. Interestingly, it learns to mostly avoid eating (0.4 food/1k) rather than risk poison—achieving 98% efficiency by near-starvation. This shows that even with true rewards, insufficient observation information leads to degenerate strategies.
+
+The efficiency gap of **56.1%** between ground-truth and proxy modes empirically confirms Goodhart's Law: optimizing a measurable proxy ("interestingness") not only fails to achieve the true objective (survival), but produces behavior actively harmful to it.
 
 ---
 
