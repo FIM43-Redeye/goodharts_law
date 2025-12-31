@@ -1198,7 +1198,6 @@ class PPOTrainer:
                     gpu_tensor=metrics_values,
                     update_count=self.update_count,
                     total_steps=self.total_steps,
-                    best_reward=self.bookkeeper.best_reward,
                     mode=cfg.mode,
                     profiler_events=profiler_events,
                     profiler_enabled=cfg.profile_enabled,

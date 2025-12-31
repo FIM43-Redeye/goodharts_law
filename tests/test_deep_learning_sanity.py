@@ -31,6 +31,7 @@ class TestPPODeepSanity(unittest.TestCase):
             log_to_file=False,
             use_amp=False,
             compile_models=False,
+            compile_env=False,  # Both compile flags off for fast tests
             skip_warmup=True,
             use_torch_env=True,
             hyper_verbose=True # <--- TRIGGERS DEBUG PRINTS
