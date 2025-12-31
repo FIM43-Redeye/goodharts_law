@@ -4,16 +4,56 @@ ModeSpec: Central registry for training/behavior modes.
 Defines observation format, reward type, and special training flags per mode.
 This enables automatic configuration without hardcoding mode names throughout.
 
-TODO (Goodhart Documentation):
-    Explain how the mode system enables the Goodhart demonstration:
-    - What is the relationship between observation_channels and information access?
-    - How do different reward_types create different optimization pressures?
-    - Why is separating "what you see" from "what you're rewarded for" important?
-    - Walk through each mode and its role in the experimental design:
-        * ground_truth: full information baseline (aligned agent)
-        * proxy: interestingness-only observations AND rewards (Goodhart failure)
-        * ground_truth_blinded: interestingness observations, energy rewards (control)
-        * ground_truth_handhold: shaped rewards for easier learning (curriculum)
+The Mode System and Goodhart's Law:
+
+    This module is the heart of the Goodhart demonstration. It separates two independent
+    axes that are often conflated in real systems: what an agent observes (information
+    access) and what it is optimized for (reward signal).
+
+    OBSERVATION-REWARD SEPARATION:
+    The key insight of Goodhart's Law is that optimizing a measurable proxy diverges
+    from the true objective. Here, observation_channels define what the agent sees,
+    while reward_type defines what it is trained to maximize. These can be configured
+    independently, creating controlled experimental conditions.
+
+    INFORMATION ASYMMETRY:
+    - Ground truth observations: [food, poison] channels encode cell types directly.
+      The agent sees Food=[1,0], Poison=[0,1], Empty=[0,0]. Perfect information.
+    - Proxy observations: [interestingness, interestingness] channels. Both food and
+      poison appear as [i, i] where i is the interestingness value. The agent cannot
+      distinguish them; it sees only magnitude, not meaning.
+
+    MODE ROLES IN EXPERIMENTAL DESIGN:
+
+    ground_truth (aligned baseline):
+        Sees reality (food vs poison), rewarded for survival (energy).
+        This agent learns the true task and thrives. The control for "what success
+        looks like" when alignment is perfect.
+
+    proxy (Goodhart failure case):
+        Sees only interestingness, rewarded for interestingness consumption.
+        Cannot distinguish food from poison. Optimizes eagerly for the proxy metric,
+        consuming everything "interesting" including poison. Inevitable death despite
+        high proxy scores. This is the central demonstration of Goodhart's Law.
+
+    ground_truth_blinded (information asymmetry control):
+        Sees interestingness (blinded), but rewarded for energy (ground truth).
+        Tests whether the reward signal alone is sufficient for learning. If this
+        agent fails like proxy, the problem is observation blindness. If it succeeds,
+        agents can learn correct behavior from consequence alone.
+
+    ground_truth_handhold (curriculum/pedagogy mode):
+        Sees reality, rewarded with shaped/normalized rewards and potential-based
+        guidance toward food. Used when raw energy rewards are too sparse for
+        efficient learning. Same information access as ground_truth, different
+        optimization dynamics.
+
+    WHY THIS MATTERS FOR AI ALIGNMENT:
+    Real-world AI systems routinely optimize measurable proxies (engagement, clicks,
+    test scores) that diverge from human intent (genuine satisfaction, informed choice,
+    actual learning). This mode system makes the proxy-objective gap experimentally
+    visible: same environment, same agent architecture, different information and
+    incentive structures produce radically different outcomes.
 """
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod

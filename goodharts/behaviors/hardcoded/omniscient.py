@@ -4,12 +4,25 @@ Omniscient behavior that sees ground truth cell types.
 Uses 2-channel encoding: [food, poison] for full observability.
 This agent can distinguish food from poison perfectly.
 
-TODO (Goodhart Documentation):
-    Explain why this behavior represents the "aligned" baseline:
-    - What information does this agent have access to?
-    - Why does full observability lead to optimal behavior?
-    - How does this contrast with ProxySeeker's information asymmetry?
-    - What does "ground truth" mean in the context of AI alignment?
+Alignment Through Full Observability:
+    This agent represents the "aligned" baseline in our Goodhart's Law demonstration.
+    It receives the 2-channel ground truth encoding: channel 0 marks food (beneficial),
+    channel 1 marks poison (harmful). With this information, it can perfectly distinguish
+    what helps from what harms.
+
+    Because the agent's observations match reality, its greedy optimization (pursue food,
+    avoid poison) produces optimal behavior. It survives not by luck, but because its
+    optimization target aligns with the true objective of staying alive.
+
+    Contrast this with ProxySeeker, which sees only a single "interestingness" channel
+    where food and poison appear identical. ProxySeeker optimizes for the measurable
+    proxy (interestingness) rather than the true goal (survival), and dies as a result.
+    This is Goodhart's Law in action: "When a measure becomes a target, it ceases to
+    be a good measure."
+
+    In AI alignment terms, "ground truth" means access to the real state of the world
+    or true human values. Misalignment often emerges from information asymmetry: an AI
+    system optimizing for what it can measure rather than what actually matters.
 """
 import torch
 from goodharts.behaviors.base import BehaviorStrategy

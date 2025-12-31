@@ -4,18 +4,18 @@ PPO Trainer - Main training orchestrator.
 Provides a clean, subclassable interface for PPO training.
 Can be extended for multi-agent scenarios.
 """
+import logging
 import os
 import time
-import threading
-import queue
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.distributions import Categorical
 from torch.profiler import record_function
-from dataclasses import dataclass
 from typing import Optional
 
 from goodharts.configs.default_config import get_simulation_config
@@ -32,680 +32,17 @@ from .models import Profiler, ValueHead, PopArtValueHead
 from .algorithms import compute_gae, ppo_update
 from .async_logger import AsyncLogger, LogPayload
 
-
-class GPUMonitor:
-    """
-    Background thread that logs GPU utilization at fixed intervals.
-
-    Uses sysfs (AMD, ~0.02ms) or nvidia-smi (NVIDIA) to sample GPU use %.
-    Starts after warmup, stops when training ends. Output is CSV with
-    millisecond timestamps for correlation with training events.
-    """
-
-    def __init__(self, interval_ms: int = 50, output_path: str = "gpu_utilization.csv"):
-        self.interval_ms = interval_ms
-        self.output_path = output_path
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self._start_time_ms: int = 0
-        self._sysfs_path: Optional[str] = None  # Fast path for AMD
-        self._nvidia_cmd: Optional[list] = None  # Fallback for NVIDIA
-
-    def _detect_amd_card(self) -> Optional[str]:
-        """
-        Find the active AMD GPU's sysfs path by testing utilization.
-
-        Returns path like '/sys/class/drm/card1/device/gpu_busy_percent'
-        or None if not found.
-        """
-        import glob
-
-        candidates = glob.glob('/sys/class/drm/card*/device/gpu_busy_percent')
-        if not candidates:
-            return None
-
-        # If only one card, use it
-        if len(candidates) == 1:
-            return candidates[0]
-
-        # Multiple cards: find the one PyTorch is using by running a quick workload
-        try:
-            import torch
-            if not torch.cuda.is_available():
-                return None
-
-            # Baseline read
-            baseline = {}
-            for path in candidates:
-                with open(path) as f:
-                    baseline[path] = int(f.read().strip())
-
-            # Quick GPU work
-            x = torch.randn(1024, 1024, device='cuda')
-            for _ in range(20):
-                x = x @ x
-            torch.cuda.synchronize()
-
-            # Find which card spiked
-            for path in candidates:
-                with open(path) as f:
-                    now = int(f.read().strip())
-                if now > baseline[path] + 20:  # Significant increase
-                    return path
-
-            # Fallback: return first card with vendor 0x1002 (AMD)
-            for path in candidates:
-                vendor_path = os.path.join(os.path.dirname(path), 'vendor')
-                if os.path.exists(vendor_path):
-                    with open(vendor_path) as f:
-                        if '0x1002' in f.read():
-                            return path
-        except Exception:
-            pass
-
-        return candidates[0]  # Last resort
-
-    def start(self):
-        """Start the monitoring thread."""
-        import subprocess
-
-        # Try AMD sysfs first (fast: ~0.02ms per read)
-        self._sysfs_path = self._detect_amd_card()
-        if self._sysfs_path:
-            card = self._sysfs_path.split('/')[4]  # Extract 'card1' from path
-            print(f"   [GPUMonitor] Using sysfs ({card}) - {self.interval_ms}ms intervals")
-        else:
-            # Fallback to nvidia-smi (slower: ~5ms per read)
-            try:
-                result = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=utilization.gpu",
-                     "--format=csv,noheader,nounits"],
-                    capture_output=True, text=True, timeout=2
-                )
-                if result.returncode == 0:
-                    self._nvidia_cmd = ["nvidia-smi", "--query-gpu=utilization.gpu",
-                                        "--format=csv,noheader,nounits"]
-                    print(f"   [GPUMonitor] Using nvidia-smi - {self.interval_ms}ms intervals")
-                else:
-                    print(f"   [GPUMonitor] No supported GPU monitoring found")
-                    return
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                print(f"   [GPUMonitor] No supported GPU monitoring found")
-                return
-
-        # Write CSV header
-        with open(self.output_path, 'w') as f:
-            f.write("timestamp_ms,gpu_use_pct\n")
-
-        self._start_time_ms = int(time.time() * 1000)
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._worker, daemon=True, name="GPUMonitor")
-        self._thread.start()
-
-    def stop(self):
-        """Stop the monitoring thread and wait for it to finish."""
-        if self._thread is None:
-            return
-        self._stop_event.set()
-        self._thread.join(timeout=2.0)
-        self._thread = None
-        print(f"   [GPUMonitor] Stopped")
-
-    def _worker(self):
-        """Background thread: samples GPU utilization."""
-        import subprocess
-
-        interval_s = self.interval_ms / 1000.0
-
-        with open(self.output_path, 'a') as f:
-            while not self._stop_event.is_set():
-                try:
-                    if self._sysfs_path:
-                        # Fast path: direct sysfs read (~0.02ms)
-                        with open(self._sysfs_path) as gpu_file:
-                            use_pct = int(gpu_file.read().strip())
-                    else:
-                        # NVIDIA fallback
-                        result = subprocess.run(
-                            self._nvidia_cmd, capture_output=True, text=True, timeout=1
-                        )
-                        use_pct = int(result.stdout.strip().split('\n')[0])
-
-                    elapsed_ms = int(time.time() * 1000) - self._start_time_ms
-                    f.write(f"{elapsed_ms},{use_pct}\n")
-                    f.flush()
-                except Exception:
-                    pass  # Skip failed samples
-
-                self._stop_event.wait(interval_s)
-
-
-@dataclass
-class PendingMetrics:
-    """
-    Context for async metrics transfer.
-
-    GPU starts transfer, continues to next update. CPU processes this later.
-    By the time we need it (next update end), transfer finished long ago.
-
-    Episode data (n_episodes, reward_sum, etc.) is in the transferred tensor,
-    extracted in _process_pending_metrics after transfer completes.
-    """
-    n_metrics: int  # Length of metrics in pinned buffer
-    update_count: int
-    total_steps: int
-    sps_instant: float
-    sps_rolling: float
-    sps_global: float
-    profiler_summary: str
-    validation_metrics: Optional[dict]
-
-
-@dataclass
-class BookkeepingWork:
-    """
-    Work item for background bookkeeping thread.
-
-    Contains everything needed to process metrics without touching GPU.
-    All timing data is captured at submission time on main thread.
-    """
-    buffer_idx: int           # Which pinned buffer to read from (0 or 1)
-    n_metrics: int            # How many elements to read
-    update_count: int
-    total_steps: int
-    best_reward: float        # Current best (for updating)
-    mode: str
-    profiler_events: list     # CUDA event pairs for async profiler summary
-    profiler_enabled: bool    # Whether profiling is enabled
-    validation_metrics: Optional[dict]
-    # Timing data for SPS calculation (captured on main thread)
-    submit_time: float        # time.perf_counter() at submission
-    update_start_time: float  # When this update started
-    prev_update_steps: int    # Steps at end of previous update
-    training_start_time: float  # When training started (for global SPS)
-
-
-class BackgroundBookkeeper:
-    """
-    Processes metrics in background thread while main thread continues GPU work.
-
-    Uses double-buffered pinned memory to eliminate data races:
-    - Main thread writes to buffer A, signals "A ready"
-    - Background thread reads from A while main writes to B
-    - No locks needed - each buffer has exactly one owner at a time
-
-    This eliminates the ~10-20ms GPU idle time that occurred when the main
-    thread did bookkeeping between PPO updates.
-    """
-
-    def __init__(
-        self,
-        buffer_size: int,
-        async_logger,  # AsyncLogger instance
-        device: torch.device,
-    ):
-        self.async_logger = async_logger
-        self.device = device
-
-        # Double-buffered pinned memory
-        self.buffers = [
-            torch.empty(buffer_size, dtype=torch.float32, pin_memory=True),
-            torch.empty(buffer_size, dtype=torch.float32, pin_memory=True),
-        ]
-        self.events = [
-            torch.cuda.Event(),
-            torch.cuda.Event(),
-        ]
-        self.current_buffer = 0  # Which buffer main thread writes to
-
-        # Communication with background thread
-        self._work_queue: queue.Queue[Optional[BookkeepingWork]] = queue.Queue()
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-        # Buffer ownership: set = available to write, cleared = being read
-        # Main thread waits on buffer before writing, background sets after reading
-        # This prevents the race condition where main overwrites buffer being read
-        self.buffer_available = [threading.Event(), threading.Event()]
-        self.buffer_available[0].set()  # Buffer 0 initially free
-        self.buffer_available[1].set()  # Buffer 1 initially free
-
-        # Shared state (updated by background, read by main for display)
-        # These are updated atomically (single assignment) so no lock needed
-        self.best_reward = float('-inf')
-        self.episode_count = 0
-
-        # SPS tracking (background thread maintains rolling window)
-        self._sps_window: list[tuple[int, float]] = []  # (steps, time) pairs
-
-    @property
-    def pinned_buffer(self) -> torch.Tensor:
-        """Current buffer for main thread to write to."""
-        return self.buffers[self.current_buffer]
-
-    @property
-    def current_event(self) -> torch.cuda.Event:
-        """Current event for main thread to record."""
-        return self.events[self.current_buffer]
-
-    def start(self):
-        """Start background processing thread."""
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._worker, daemon=True, name="BackgroundBookkeeper"
-        )
-        self._thread.start()
-
-    def stop(self):
-        """Stop background thread, process remaining work."""
-        if self._thread is None:
-            return
-        self._work_queue.put(None)  # Sentinel
-        # Release any potentially blocked submit() to prevent deadlock
-        self.buffer_available[0].set()
-        self.buffer_available[1].set()
-        self._stop_event.set()
-        self._thread.join(timeout=2.0)
-        self._thread = None
-
-    def submit(
-        self,
-        gpu_tensor: torch.Tensor,
-        update_count: int,
-        total_steps: int,
-        best_reward: float,
-        mode: str,
-        profiler_events: list,
-        profiler_enabled: bool,
-        validation_metrics: Optional[dict],
-        update_start_time: float,
-        prev_update_steps: int,
-        training_start_time: float,
-    ):
-        """
-        Copy metrics to pinned buffer and signal background thread.
-
-        Returns IMMEDIATELY - does not block. GPU can continue working.
-        Profiler events are passed as a list to avoid sync on main thread.
-        """
-        buf_idx = self.current_buffer
-        n = len(gpu_tensor)
-
-        # Wait if background thread is still reading this buffer
-        # (Should be instant - background finishes in ~5ms, next submit ~800ms later)
-        # Only blocks in the rare case where background falls behind
-        self.buffer_available[buf_idx].wait()
-        self.buffer_available[buf_idx].clear()  # Mark as in-use
-
-        # Copy to pinned buffer (non-blocking DMA)
-        self.buffers[buf_idx][:n].copy_(gpu_tensor, non_blocking=True)
-
-        # Record event so background thread knows when copy is done
-        self.events[buf_idx].record()
-
-        # Capture timing NOW (on main thread, accurate)
-        submit_time = time.perf_counter()
-
-        # Queue work for background thread
-        work = BookkeepingWork(
-            buffer_idx=buf_idx,
-            n_metrics=n,
-            update_count=update_count,
-            total_steps=total_steps,
-            best_reward=best_reward,
-            mode=mode,
-            profiler_events=profiler_events,
-            profiler_enabled=profiler_enabled,
-            validation_metrics=validation_metrics,
-            submit_time=submit_time,
-            update_start_time=update_start_time,
-            prev_update_steps=prev_update_steps,
-            training_start_time=training_start_time,
-        )
-        self._work_queue.put(work)
-
-        # Swap to other buffer for next submission
-        self.current_buffer = 1 - self.current_buffer
-
-    def _worker(self):
-        """Background thread: processes metrics, computes SPS, creates LogPayload."""
-        while True:
-            try:
-                work = self._work_queue.get(timeout=0.1)
-            except queue.Empty:
-                if self._stop_event.is_set():
-                    break
-                continue
-
-            if work is None:  # Sentinel - stop
-                break
-
-            self._process_work(work)
-
-    def _process_work(self, work: BookkeepingWork):
-        """Process one update's metrics (runs in background thread)."""
-        try:
-            # Wait for GPU->CPU copy to complete (should be instant)
-            self.events[work.buffer_idx].synchronize()
-
-            # Read from pinned buffer (safe now that copy is done)
-            cpu_array = self.buffers[work.buffer_idx][:work.n_metrics].numpy()
-            m = unpack_metrics(cpu_array)
-
-            # Compute profiler summary from events (sync already done above)
-            # Since DMA event was recorded AFTER profiler ticks, all profiler
-            # events are guaranteed complete by now - no additional sync needed
-            if work.profiler_enabled and work.profiler_events:
-                times = {}
-                for name, start_evt, end_evt in work.profiler_events:
-                    dt = start_evt.elapsed_time(end_evt) / 1000.0  # ms -> seconds
-                    times[name] = times.get(name, 0.0) + dt
-                total = sum(times.values())
-                if total > 0:
-                    parts = []
-                    for k, v in sorted(times.items(), key=lambda x: x[1], reverse=True):
-                        pct = v / total * 100
-                        parts.append(f"{k}: {v:.2f}s ({pct:.0f}%)")
-                    profiler_summary = " | ".join(parts)
-                else:
-                    profiler_summary = "No data"
-            else:
-                profiler_summary = "Profiling disabled"
-
-            # Update running totals
-            if m['n_episodes'] > 0:
-                if m['reward_max'] > self.best_reward:
-                    self.best_reward = m['reward_max']
-                self.episode_count += m['n_episodes']
-
-            # Compute SPS metrics
-            update_steps = work.total_steps - work.prev_update_steps
-            update_time = work.submit_time - work.update_start_time
-
-            sps_instant = update_steps / update_time if update_time > 0 else 0
-
-            # Rolling window (last 4 updates)
-            self._sps_window.append((update_steps, update_time))
-            if len(self._sps_window) > 4:
-                self._sps_window.pop(0)
-
-            window_steps = sum(s for s, t in self._sps_window)
-            window_time = sum(t for s, t in self._sps_window)
-            sps_rolling = window_steps / window_time if window_time > 0 else 0
-
-            # Global SPS
-            total_elapsed = work.submit_time - work.training_start_time
-            sps_global = work.total_steps / total_elapsed if total_elapsed > 0 else 0
-
-            # Prepare episode stats
-            ep_stats = None
-            if m['n_episodes'] > 0:
-                ep_stats = {
-                    'reward': m['reward_sum'] / m['n_episodes'],
-                    'food': m['food_sum'] / m['n_episodes'],
-                    'poison': m['poison_sum'] / m['n_episodes'],
-                }
-
-            # Create LogPayload and queue to async logger
-            log_payload = LogPayload(
-                policy_loss=m['policy_loss'],
-                value_loss=m['value_loss'],
-                entropy=m['entropy'],
-                explained_var=m['explained_var'],
-                action_probs=m['action_probs'],
-                update_count=work.update_count,
-                total_steps=work.total_steps,
-                best_reward=work.best_reward,  # Use value at submission time
-                mode=work.mode,
-                episode_stats=ep_stats,
-                profiler_summary=profiler_summary,
-                sps_instant=sps_instant,
-                sps_rolling=sps_rolling,
-                sps_global=sps_global,
-                validation_metrics=work.validation_metrics,
-                episodes_count=m['n_episodes'],
-                reward_sum=m['reward_sum'],
-                reward_min=m['reward_min'] if m['n_episodes'] > 0 else 0.0,
-                reward_max=m['reward_max'] if m['n_episodes'] > 0 else 0.0,
-                food_sum=m['food_sum'],
-                poison_sum=m['poison_sum'],
-            )
-            self.async_logger.log_update(log_payload)
-        finally:
-            # Always release buffer for main thread, even on error
-            self.buffer_available[work.buffer_idx].set()
-
-
-# =============================================================================
-# METRICS SCHEMA - Single source of truth for GPU->CPU metrics transfer
-# =============================================================================
-# Order matters! Pack on GPU in this order, unpack on CPU in same order.
-# To add a metric: add here, add to pack list, it unpacks automatically.
-
-METRICS_SCHEMA = [
-    # Episode aggregates (computed on GPU from finished episodes)
-    ('n_episodes', int),
-    ('reward_sum', float),
-    ('reward_min', float),
-    ('reward_max', float),
-    ('food_sum', int),
-    ('poison_sum', int),
-    # PPO training metrics
-    ('policy_loss', float),
-    ('value_loss', float),
-    ('entropy', float),
-    ('explained_var', float),
-    # Action probs follow (variable length, not in schema)
-]
-
-N_SCALAR_METRICS = len(METRICS_SCHEMA)
-
-
-def unpack_metrics(cpu_array) -> dict:
-    """Unpack transferred metrics according to schema."""
-    result = {}
-    for i, (name, dtype) in enumerate(METRICS_SCHEMA):
-        result[name] = dtype(cpu_array[i])
-    # Action probs are the tail
-    result['action_probs'] = cpu_array[N_SCALAR_METRICS:].tolist()
-    return result
-
-
-# Note: TORCHINDUCTOR_CACHE_DIR is set in train_ppo.py before torch is imported
-# This ensures the cache persists across runs
-
-# Lock to serialize torch.compile() calls across threads.
-# Dynamo has global state that is not thread-safe during compilation.
-# This only affects startup; compiled models run in parallel fine.
-_COMPILE_LOCK = threading.Lock()
-
-# Global warmup state - shared across sequential/parallel training runs
-# Once warmup is done for one mode, subsequent modes skip it
-_WARMUP_LOCK = threading.Lock()
-_WARMUP_DONE = False
-
-# Global abort flag - checked by all trainers to enable coordinated shutdown
-_ABORT_LOCK = threading.Lock()
-_ABORT_REQUESTED = False
-
-
-def request_abort():
-    """Signal all trainers to abort gracefully."""
-    global _ABORT_REQUESTED
-    with _ABORT_LOCK:
-        _ABORT_REQUESTED = True
-
-
-def clear_abort():
-    """Clear the abort flag (call before starting new training)."""
-    global _ABORT_REQUESTED
-    with _ABORT_LOCK:
-        _ABORT_REQUESTED = False
-
-
-def is_abort_requested() -> bool:
-    """Check if abort has been requested."""
-    with _ABORT_LOCK:
-        return _ABORT_REQUESTED
-
-
-def reset_training_state():
-    """
-    Reset all global training state.
-
-    Call this after an aborted run to ensure clean state for the next run.
-    This is important because globals persist across runs in the same process.
-    """
-    global _WARMUP_DONE, _ABORT_REQUESTED
-    with _WARMUP_LOCK:
-        _WARMUP_DONE = False
-    with _ABORT_LOCK:
-        _ABORT_REQUESTED = False
-
-
-@dataclass
-class PPOConfig:
-    """
-    Configuration for PPO training.
-
-    Use PPOConfig.from_config() to load defaults from config.toml,
-    with CLI arguments as optional overrides.
-    """
-    mode: str = 'ground_truth'
-    brain_type: str = 'base_cnn'
-    value_head_type: str = 'popart'  # 'simple' or 'popart'
-    action_space_type: str = 'discrete_grid'
-    max_move_distance: int = 1
-    n_envs: int = 192  # Larger batches = less GPU burstiness
-    total_timesteps: int = 100_000
-    lr: float = 3e-4
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
-    eps_clip: float = 0.2
-    k_epochs: int = 4
-    steps_per_env: int = 128
-    n_minibatches: int = 1
-    value_coef: float = 0.5
-
-    # Entropy scheduling: prevents premature collapse while allowing full convergence
-    entropy_initial: float = 0.1      # Strong exploration early
-    entropy_final: float = 0.001      # Minimal when near-optimal
-    entropy_decay_fraction: float = 0.7  # Decay over 70% of training
-    entropy_floor: float = 0.5        # Min entropy during learning phase
-    entropy_floor_penalty: float = 0.05  # Penalty coefficient for floor violation
-
-    # Learning rate decay: reduces LR over training for fine-tuning
-    lr_decay: bool = False            # Enable LR decay
-    lr_final: float = 3e-5            # Final LR (10x lower than initial)
-
-    # Clip decay: tightens trust region over training to reduce late oscillation
-    eps_clip_final: float = 0.1       # Final clip (tighter than initial 0.2)
-    output_path: str = 'models/ppo_agent.pth'
-    log_to_file: bool = True
-    log_dir: str = 'generated/logs'
-    use_amp: bool = False
-    compile_models: bool = True
-    compile_mode: str = 'max-autotune'  # reduce-overhead, max-autotune, max-autotune-no-cudagraphs
-    compile_env: bool = True  # torch.compile the environment step for better GPU utilization
-    # TensorBoard is always enabled (unified logging)
-    skip_warmup: bool = False
-    use_torch_env: bool = True
-    hyper_verbose: bool = False
-    clean_cache: bool = False
-    profile_enabled: bool = True  # Disable with --no-profile for production
-    benchmark_mode: bool = False  # Skip saving, just measure throughput
-    gpu_log_interval_ms: int = 0  # GPU utilization logging interval (0 = disabled)
-    cuda_graphs: bool = False     # Use CUDA/HIP graphs for inference (experimental)
-
-    # Reproducibility
-    seed: Optional[int] = None  # None = random seed (logged for reproducibility)
-    deterministic: bool = False  # Full determinism (slower)
-
-    # Validation episodes (periodic eval without exploration)
-    validation_interval: int = 0     # Every N updates (0 = disabled)
-    validation_episodes: int = 16     # Episodes per validation
-    validation_mode: str = "training" # "training" or "fixed"
-    validation_food: int = 100        # Fixed mode: food count
-    validation_poison: int = 50       # Fixed mode: poison count
-
-    # Privileged critic: value function sees episode density (food/poison counts)
-    # This helps explain variance from episode difficulty without affecting policy
-    privileged_critic: bool = True   # Enable density info for value head
-
-    # PopArt weight rescaling: when True, rescale fc weights when stats change
-    # to preserve outputs. When False, only normalize returns (simpler but
-    # value outputs will drift with stats - may be more stable in some cases).
-    popart_rescale_weights: bool = True
-
-    @classmethod
-    def from_config(cls, mode: str = 'ground_truth', **overrides) -> 'PPOConfig':
-        """
-        Create PPOConfig from config.toml with optional CLI overrides.
-
-        TOML provides all defaults; explicit kwargs override them.
-        Missing TOML keys will raise KeyError - no silent fallbacks.
-
-        Args:
-            mode: Training mode (ground_truth, proxy, etc.)
-            **overrides: Any PPOConfig fields to override
-
-        Returns:
-            PPOConfig with values from config file + overrides
-
-        Raises:
-            KeyError: If required config keys are missing from TOML
-        """
-        from goodharts.config import get_agent_config
-        train_cfg = get_training_config()
-        agent_cfg = get_agent_config()
-
-        # Build config from TOML - no fallbacks, missing keys will crash
-        config_values = {
-            'mode': mode,
-            'brain_type': train_cfg['brain_type'],
-            'value_head_type': train_cfg['value_head_type'],
-            'action_space_type': train_cfg['action_space_type'],
-            'max_move_distance': agent_cfg['max_move_distance'],
-            'n_envs': train_cfg['n_envs'],
-            'lr': train_cfg['learning_rate'],
-            'gamma': train_cfg['gamma'],
-            'gae_lambda': train_cfg['gae_lambda'],
-            'eps_clip': train_cfg['eps_clip'],
-            'k_epochs': train_cfg['k_epochs'],
-            'steps_per_env': train_cfg['steps_per_env'],
-            'n_minibatches': train_cfg['n_minibatches'],
-            'value_coef': train_cfg['value_coef'],
-            # Entropy scheduling
-            'entropy_initial': train_cfg['entropy_initial'],
-            'entropy_final': train_cfg['entropy_final'],
-            'entropy_decay_fraction': train_cfg['entropy_decay_fraction'],
-            'entropy_floor': train_cfg['entropy_floor'],
-            'entropy_floor_penalty': train_cfg['entropy_floor_penalty'],
-            # LR decay
-            'lr_decay': train_cfg.get('lr_decay', False),
-            'lr_final': train_cfg.get('lr_final', 3e-5),
-            # Clip decay
-            'eps_clip_final': train_cfg.get('eps_clip_final', 0.1),
-            'use_amp': train_cfg['use_amp'],
-            'compile_models': train_cfg['compile_models'],
-            'compile_mode': train_cfg.get('compile_mode', 'max-autotune'),
-            'compile_env': train_cfg.get('compile_env', True),  # Compile env.step() by default
-            # Validation
-            'validation_interval': train_cfg['validation_interval'],
-            'validation_episodes': train_cfg['validation_episodes'],
-            'validation_mode': train_cfg['validation_mode'],
-            'validation_food': train_cfg['validation_food'],
-            'validation_poison': train_cfg['validation_poison'],
-            # PopArt options
-            'popart_rescale_weights': train_cfg.get('popart_rescale_weights', True),
-        }
-
-        # Apply overrides (CLI args take precedence)
-        for key, value in overrides.items():
-            if value is not None:  # Only override if explicitly set
-                config_values[key] = value
-
-        return cls(**config_values)
+# Extracted modules
+from .monitoring import GPUMonitor
+from .ppo_config import PPOConfig
+from .metrics import (
+    METRICS_SCHEMA, N_SCALAR_METRICS, unpack_metrics,
+    PendingMetrics, BookkeepingWork, BackgroundBookkeeper
+)
+from .globals import (
+    request_abort, clear_abort, is_abort_requested, reset_training_state,
+    mark_warmup_done, check_warmup_done, get_compile_lock, get_warmup_lock,
+)
 
 
 def _vprint(msg: str, verbose: bool):
@@ -852,14 +189,14 @@ class PPOTrainer:
 
         # Initial inference to get first actions (same as main loop)
         potentials = self.reward_computer.get_initial_potentials(states)
-        density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
+        critic_aux = self.vec_env.get_critic_aux() if self._aux_buf is not None else None
         with torch.no_grad():
             with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                 logits, features = self.policy.forward_with_features(states.float())
                 dist = Categorical(logits=logits, validate_args=False)
                 actions = dist.sample()
                 log_probs = dist.log_prob(actions)
-                values = self.value_head(features, density_info).squeeze(-1)
+                values = self.value_head(features, critic_aux).squeeze(-1)
 
         for step in range(cfg.steps_per_env):
             with torch.no_grad():
@@ -869,7 +206,7 @@ class PPOTrainer:
                     (
                         next_states, next_actions, next_log_probs, next_values,
                         next_potentials, logits,
-                        _current_states, _shaped_rewards, _dones, _terminated, _density_info,
+                        _current_states, _shaped_rewards, _dones, _terminated, _critic_aux,
                         _finished_episode_rewards
                     ) = self._compiled_rollout_step(
                         actions, log_probs, values, states, potentials
@@ -884,13 +221,13 @@ class PPOTrainer:
                     potentials = next_potentials.clone()
                 else:
                     # Fallback: eager mode
-                    density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
+                    critic_aux = self.vec_env.get_critic_aux() if self._aux_buf is not None else None
                     with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                         logits, features = self.policy.forward_with_features(states.float())
                         dist = Categorical(logits=logits, validate_args=False)
                         actions = dist.sample()
                         log_probs = dist.log_prob(actions)
-                        values = self.value_head(features, density_info).squeeze(-1)
+                        values = self.value_head(features, critic_aux).squeeze(-1)
 
                     current_states = states.clone()
                     next_states, eating_info, terminated, truncated = self.vec_env.step(actions)
@@ -906,7 +243,7 @@ class PPOTrainer:
                     terminated_buf[step] = terminated
                     values_buf[step] = values
                     if self._aux_buf is not None:
-                        self._aux_buf[step] = density_info
+                        self._aux_buf[step] = critic_aux
 
                     episode_rewards += shaped_rewards
                     episode_rewards *= (~dones)
@@ -916,8 +253,8 @@ class PPOTrainer:
         with torch.no_grad():
             states_t = states.float()
             _, features = self.policy.forward_with_features(states_t)
-            bootstrap_density = self.vec_env.get_density_info() if self._aux_buf is not None else None
-            next_value = self.value_head(features, bootstrap_density).squeeze(-1)
+            bootstrap_aux = self.vec_env.get_critic_aux() if self._aux_buf is not None else None
+            next_value = self.value_head(features, bootstrap_aux).squeeze(-1)
 
         # Compute GAE (pass tensors directly, no stacking needed)
         # Use terminated_buf - only zero bootstrap on true death
@@ -1008,32 +345,32 @@ class PPOTrainer:
         if self.gpu_monitor is not None:
             try:
                 self.gpu_monitor.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Cleanup: gpu_monitor.stop() failed: {e}")
             self.gpu_monitor = None
 
         # Stop bookkeeper before async_logger (bookkeeper submits to async_logger)
         if hasattr(self, 'bookkeeper') and self.bookkeeper is not None:
             try:
                 self.bookkeeper.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Cleanup: bookkeeper.stop() failed: {e}")
             self.bookkeeper = None
 
         # Shutdown async logger (flushes any pending logs)
         if self.async_logger:
             try:
                 self.async_logger.shutdown(timeout=2.0)
-            except Exception:
-                pass  # Best effort
+            except Exception as e:
+                logger.debug(f"Cleanup: async_logger.shutdown() failed: {e}")
             self.async_logger = None
 
         # Close TensorBoard writer
         if self.tb_writer:
             try:
                 self.tb_writer.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Cleanup: tb_writer.close() failed: {e}")
             self.tb_writer = None
 
         # Release environment (frees GPU tensors)
@@ -1042,8 +379,8 @@ class PPOTrainer:
                 # VecEnv doesn't have an explicit close(), but we can
                 # release references to allow garbage collection
                 del self.vec_env
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Cleanup: vec_env deletion failed: {e}")
             self.vec_env = None
 
         # Release model tensors
@@ -1063,8 +400,8 @@ class PPOTrainer:
         if self.device and self.device.type == 'cuda':
             try:
                 torch.cuda.empty_cache()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Cleanup: torch.cuda.empty_cache() failed: {e}")
     
     def _setup(self):
         """Initialize environment, networks, and logging."""
@@ -1124,12 +461,14 @@ class PPOTrainer:
         self.policy = create_brain(cfg.brain_type, self.spec, output_size=n_actions).to(self.device)
 
         # Value head - configurable between simple and PopArt
-        # Privileged critic: value head sees density info that policy doesn't
-        num_aux = 2 if cfg.privileged_critic else 0  # (food_density, poison_density)
+        # Privileged critic: value head sees ground truth view + density that policy may not see
+        # For proxy modes, this gives the critic info the policy can't access
+        num_aux = self.vec_env.num_critic_aux if cfg.privileged_critic else 0
         if cfg.value_head_type == 'popart':
             self.value_head = PopArtValueHead(
                 input_size=self.policy.hidden_size,
                 num_aux_inputs=num_aux,
+                beta_min=cfg.popart_beta_min,
                 rescale_weights=cfg.popart_rescale_weights,
             ).to(self.device)
         elif cfg.value_head_type == 'simple':
@@ -1191,7 +530,7 @@ class PPOTrainer:
         self._terminated_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.bool)
         self._values_buf = torch.zeros(scalar_shape, device=self.device, dtype=torch.float32)
 
-        # Privileged critic: density info buffer (food_density, poison_density per step)
+        # Privileged critic: auxiliary info buffer (density + ground truth view per step)
         if self._num_aux_inputs > 0:
             aux_shape = (cfg.steps_per_env, cfg.n_envs, self._num_aux_inputs)
             self._aux_buf = torch.zeros(aux_shape, device=self.device, dtype=torch.float32)
@@ -1216,7 +555,7 @@ class PPOTrainer:
         # Key insight: Compiling ENV_STEP + REWARD_SHAPE + INFERENCE into ONE function
         # eliminates graph boundaries between all three operations. This fuses many
         # small kernels into fewer large ones, reducing kernel launch overhead.
-        with _COMPILE_LOCK:
+        with get_compile_lock():
             if cfg.compile_models and hasattr(torch, 'compile') and not is_tpu(self.device):
                 try:
                     compile_mode = cfg.compile_mode
@@ -1274,8 +613,8 @@ class PPOTrainer:
                         next_states, eating_info, terminated, truncated = vec_env.step(actions)
                         dones = terminated | truncated
 
-                        # Get density info for privileged critic (after step)
-                        density_info = vec_env.get_density_info() if privileged_critic else None
+                        # Get critic aux (density + privileged view) for value function
+                        critic_aux = vec_env.get_critic_aux() if privileged_critic else None
 
                         # REWARD_SHAPE (stateless)
                         shaped_rewards, next_potentials = reward_computer.compute_stateless(
@@ -1288,7 +627,7 @@ class PPOTrainer:
                             dist = Categorical(logits=logits, validate_args=False)
                             next_actions = dist.sample()
                             next_log_probs = dist.log_prob(next_actions)
-                            next_values = value_head(features, density_info).squeeze(-1)
+                            next_values = value_head(features, critic_aux).squeeze(-1)
 
                         # EPISODE_TRACK - accumulate rewards, reset on done
                         # Access through vec_env (not captured) to maintain nn.Module buffer semantics
@@ -1304,7 +643,7 @@ class PPOTrainer:
                             next_states, next_actions, next_log_probs, next_values,
                             next_potentials, logits,
                             # Additional returns for buffer storage (written outside compiled function)
-                            current_states, shaped_rewards, dones, terminated, density_info,
+                            current_states, shaped_rewards, dones, terminated, critic_aux,
                             finished_episode_rewards  # Pre-reset rewards for logging
                         )
 
@@ -1423,6 +762,17 @@ class PPOTrainer:
         states = self.vec_env.reset()
         _vprint("Environment reset done", v)
 
+        # Debug: verify observation encoding (once at startup)
+        if v:
+            _vprint(f"Observation mode: is_proxy_mode={self.vec_env.is_proxy_mode}", v)
+            _vprint(f"Channel names: {self.vec_env.channel_names}", v)
+            sample_obs = states[0]  # First agent's observation
+            _vprint(f"Observation shape: {sample_obs.shape}", v)
+            _vprint(f"Observation range: min={sample_obs.min():.3f}, max={sample_obs.max():.3f}", v)
+            if sample_obs.max() > 0:
+                unique_vals = sample_obs.unique().tolist()
+                _vprint(f"Unique values in obs: {unique_vals[:10]}", v)
+
         # Initialize reward computer
         _vprint("Initializing reward computer...", v)
         self.reward_computer.initialize(states)  # stays on GPU
@@ -1435,11 +785,10 @@ class PPOTrainer:
         # - Any remaining JIT compilation
         # This is discarded; real training starts fresh after.
         # For sequential/parallel training, warmup only runs once.
-        global _WARMUP_DONE
         should_warmup = not cfg.skip_warmup
 
-        with _WARMUP_LOCK:
-            if _WARMUP_DONE:
+        with get_warmup_lock():
+            if check_warmup_done():
                 should_warmup = False
                 print(f"   [Warmup] Skipped (already done)", flush=True)
 
@@ -1464,8 +813,7 @@ class PPOTrainer:
             print(f"   [Warmup] Complete ({warmup_elapsed:.1f}s) - weights restored", flush=True)
 
             # Mark warmup as done globally
-            with _WARMUP_LOCK:
-                _WARMUP_DONE = True
+            mark_warmup_done()
 
             # Reset environment state for clean start
             states = self.vec_env.reset()
@@ -1502,14 +850,14 @@ class PPOTrainer:
         potentials = self.reward_computer.get_initial_potentials(states)
 
         # Initial inference to get first actions (eager mode - only runs once)
-        density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
+        critic_aux = self.vec_env.get_critic_aux() if self._aux_buf is not None else None
         with torch.no_grad():
             with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                 logits, features = self.policy.forward_with_features(states.float())
                 dist = Categorical(logits=logits, validate_args=False)
                 actions = dist.sample()
                 log_probs = dist.log_prob(actions)
-                values = self.value_head(features, density_info).squeeze(-1)
+                values = self.value_head(features, critic_aux).squeeze(-1)
         last_logits = logits
 
         # Flag to trigger fresh inference after PPO update
@@ -1542,13 +890,13 @@ class PPOTrainer:
             # This runs once per rollout (~0.8% overhead vs prefetch complexity)
             if needs_initial_inference:
                 with torch.no_grad():
-                    density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
+                    critic_aux = self.vec_env.get_critic_aux() if self._aux_buf is not None else None
                     with autocast(device_type=self.device_type, enabled=cfg.use_amp):
                         logits, features = self.policy.forward_with_features(states.float())
                         dist = Categorical(logits=logits, validate_args=False)
                         actions = dist.sample()
                         log_probs = dist.log_prob(actions)
-                        values = self.value_head(features, density_info).squeeze(-1)
+                        values = self.value_head(features, critic_aux).squeeze(-1)
                     potentials = self.reward_computer.get_initial_potentials(states)
                 needs_initial_inference = False
 
@@ -1564,7 +912,7 @@ class PPOTrainer:
                         (
                             next_states, next_actions, next_log_probs, next_values,
                             next_potentials, logits,
-                            current_states, shaped_rewards, dones, terminated, density_info,
+                            current_states, shaped_rewards, dones, terminated, critic_aux,
                             finished_episode_rewards  # Pre-reset rewards for logging
                         ) = self._compiled_rollout_step(
                             actions, log_probs, values, states, potentials
@@ -1581,7 +929,7 @@ class PPOTrainer:
                     terminated_buf[step_i] = terminated
                     values_buf[step_i] = values
                     if self._aux_buf is not None:
-                        self._aux_buf[step_i] = density_info
+                        self._aux_buf[step_i] = critic_aux
                     finished_dones_buf[step_i] = dones
                     finished_rewards_buf[step_i] = finished_episode_rewards  # Use pre-reset value
 
@@ -1598,7 +946,7 @@ class PPOTrainer:
                             eating_info, current_states, next_states, terminated, potentials
                         )
 
-                    next_density_info = self.vec_env.get_density_info() if self._aux_buf is not None else None
+                    next_critic_aux = self.vec_env.get_critic_aux() if self._aux_buf is not None else None
 
                     with record_function("INFERENCE"):
                         with autocast(device_type=self.device_type, enabled=cfg.use_amp):
@@ -1606,7 +954,7 @@ class PPOTrainer:
                             dist = Categorical(logits=logits, validate_args=False)
                             next_actions = dist.sample()
                             next_log_probs = dist.log_prob(next_actions)
-                            next_values = self.value_head(features, next_density_info).squeeze(-1)
+                            next_values = self.value_head(features, next_critic_aux).squeeze(-1)
 
                     # EPISODE_TRACK (eager path only) - must happen BEFORE buffer store
                     # so finished_episode_rewards captures the final value before reset
@@ -1626,7 +974,7 @@ class PPOTrainer:
                         terminated_buf[step_i] = terminated
                         values_buf[step_i] = values
                         if self._aux_buf is not None:
-                            self._aux_buf[step_i] = next_density_info
+                            self._aux_buf[step_i] = next_critic_aux
                         finished_dones_buf[step_i] = dones
                         finished_rewards_buf[step_i] = finished_episode_rewards  # Use pre-reset value
 
@@ -1662,9 +1010,9 @@ class PPOTrainer:
                     with torch.no_grad():
                         states_t = states.float()
                         _, features = self.policy.forward_with_features(states_t)
-                        # Get current density for bootstrap value (privileged critic)
-                        bootstrap_density = self.vec_env.get_density_info() if self._aux_buf is not None else None
-                        next_value = self.value_head(features, bootstrap_density).squeeze(-1)
+                        # Get current critic aux for bootstrap value (privileged critic)
+                        bootstrap_aux = self.vec_env.get_critic_aux() if self._aux_buf is not None else None
+                        next_value = self.value_head(features, bootstrap_aux).squeeze(-1)
 
                     # Compute GAE (pass pre-allocated tensors directly, no stacking)
                     # Use terminated_buf (not dones_buf) - only zero bootstrap on true death
@@ -1680,6 +1028,13 @@ class PPOTrainer:
                         self.value_head.update_stats(returns.flatten(), self.optimizer)
 
                 self.profiler.tick("GAE Calc")
+
+                # Debug: sample reward statistics (verbose mode only)
+                if v and self.update_count % 50 == 0:
+                    _vprint(f"Reward buffer stats: mean={rewards_buf.mean():.4f}, std={rewards_buf.std():.4f}, "
+                           f"min={rewards_buf.min():.4f}, max={rewards_buf.max():.4f}", v)
+                    _vprint(f"Value buffer stats: mean={values_buf.mean():.4f}, std={values_buf.std():.4f}", v)
+                    _vprint(f"Returns stats: mean={returns.mean():.4f}, std={returns.std():.4f}", v)
 
                 # EPISODE LOGGING - Fixed-size GPU aggregates, NO sync until after PPO
                 with record_function("BUFFER_FLATTEN"):
