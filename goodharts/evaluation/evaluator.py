@@ -335,11 +335,9 @@ class ModelTester:
         """Initialize environment, load model, set up tracking."""
         cfg = self.config
 
-        # Reproducibility
-        if cfg.deterministic or cfg.seed is not None:
-            self.seed = set_seed(cfg.seed, deterministic=cfg.deterministic)
-        else:
-            self.seed = None
+        # Reproducibility: ALWAYS set a seed for reproducibility logging
+        # If no seed provided, generate one and log it so runs can be reproduced
+        self.seed = set_seed(cfg.seed, deterministic=cfg.deterministic)
 
         # Load simulation config
         sim_config = get_simulation_config()
@@ -659,13 +657,12 @@ class ModelTester:
         print(f"\n{'='*65}")
         print(f"SURVIVAL ANALYSIS: {self.config.mode}")
         print(f"{'='*65}")
-        print(f"Deaths: {agg.n_deaths:,}  |  Survivors: {self.n_survivors:,}  |  Timesteps: {self.total_steps:,}")
+        print(f"Deaths: {agg.n_deaths:,}  |  Timesteps: {self.total_steps:,}")
         print(f"Time: {elapsed:.1f}s  |  {deaths_per_sec:.1f} deaths/s  |  {steps_per_sec:,.0f} steps/s")
         print(f"-"*65)
         print(f"{'Metric':<25} {'Mean':>12} {'Std':>10} {'Min':>8} {'Max':>8}")
         print(f"-"*65)
-        surv_note = f" (+{self.n_survivors} survivors)" if self.n_survivors > 0 else ""
-        print(f"{'Survival Time (steps)':<25} {agg.survival_mean:>12.1f} {agg.survival_std:>10.1f} {agg.survival_min:>8} {agg.survival_max:>8}{surv_note}")
+        print(f"{'Survival Time (steps)':<25} {agg.survival_mean:>12.1f} {agg.survival_std:>10.1f} {agg.survival_min:>8} {agg.survival_max:>8}")
         print(f"{'Food per Death':<25} {agg.food_per_death_mean:>12.1f} {agg.food_per_death_std:>10.1f}")
         print(f"{'Poison per Death':<25} {agg.poison_per_death_mean:>12.1f} {agg.poison_per_death_std:>10.1f}")
         print(f"-"*65)

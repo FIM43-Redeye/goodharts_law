@@ -62,7 +62,7 @@ class PPOConfig:
     cuda_graphs: bool = False     # Use CUDA/HIP graphs for inference (experimental)
 
     # Reproducibility
-    seed: Optional[int] = None  # None = random seed (logged for reproducibility)
+    seed: Optional[int] = 42  # Default 42 for reproducibility; None = random
     deterministic: bool = False  # Full determinism (slower)
 
     # Validation episodes (periodic eval without exploration)

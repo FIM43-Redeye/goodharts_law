@@ -61,6 +61,44 @@ def discover_models(models_dir: Path) -> dict[str, Path]:
     return models
 
 
+def prompt_for_seed(is_multi_run: bool = False) -> int | None:
+    """
+    Interactively prompt user for seed choice.
+
+    Args:
+        is_multi_run: If True, prompts for base_seed (multi-run mode)
+
+    Returns:
+        Seed value (42, custom int, or None for random)
+    """
+    seed_type = "base seed" if is_multi_run else "seed"
+    print(f"\nNo {seed_type} specified. For reproducibility, choose a seed:")
+    print("  [y] Use seed 42 (recommended for reproducibility)")
+    print("  [n] Use random seed (results will vary between runs)")
+    print("  [number] Use a custom seed")
+
+    while True:
+        try:
+            response = input(f"Seed choice [y/n/number]: ").strip().lower()
+
+            if response in ('y', 'yes', ''):
+                print(f"Using {seed_type} 42")
+                return 42
+            elif response in ('n', 'no', 'random'):
+                print(f"Using random {seed_type}")
+                return None
+            else:
+                # Try to parse as integer
+                seed = int(response)
+                print(f"Using {seed_type} {seed}")
+                return seed
+        except ValueError:
+            print(f"Invalid input. Enter 'y' for 42, 'n' for random, or a number.")
+        except (KeyboardInterrupt, EOFError):
+            print("\nUsing random seed (interrupted)")
+            return None
+
+
 def run_single_mode(mode: str, overrides: dict, dashboard=None) -> dict:
     """Run testing for a single mode."""
     config = EvaluationConfig.from_config(mode=mode, **overrides)
@@ -456,8 +494,8 @@ def main():
     multi = parser.add_argument_group('Multi-run evaluation')
     multi.add_argument('-r', '--runs', type=int, default=eval_cfg['runs'], metavar='N',
                        help=f'Number of evaluation runs with different seeds (default: {eval_cfg["runs"]})')
-    multi.add_argument('--base-seed', type=int, default=eval_cfg['base_seed'], metavar='N',
-                       help=f'Base seed for reproducible multi-run (default: {eval_cfg["base_seed"]})')
+    multi.add_argument('--base-seed', type=int, default=None, metavar='N',
+                       help='Base seed for reproducible multi-run (prompted if not specified)')
 
     # Full report
     report = parser.add_argument_group('Report generation')
@@ -500,12 +538,38 @@ def main():
             parser.error(f"Invalid mode: {args.mode}. Valid: {', '.join(all_modes)}, or 'all'")
         modes_to_test = [args.mode]
     
+    # Handle seed interactively if not specified
+    # Priority: explicit --seed/--base-seed > --deterministic (uses 42) > prompt user
+    is_multi_run = args.runs > 1
+
+    if is_multi_run:
+        # Multi-run mode: use base_seed
+        if args.base_seed is not None:
+            base_seed = args.base_seed
+        elif args.deterministic:
+            base_seed = 42
+            print(f"Note: Using base seed {base_seed} for deterministic multi-run evaluation")
+        else:
+            base_seed = prompt_for_seed(is_multi_run=True)
+        # Store for later use
+        args.base_seed = base_seed
+        seed = args.seed  # Single-run seed not used in multi-run
+    else:
+        # Single-run mode: use seed
+        if args.seed is not None:
+            seed = args.seed
+        elif args.deterministic:
+            seed = 42
+            print(f"Note: Using seed {seed} for deterministic evaluation")
+        else:
+            seed = prompt_for_seed(is_multi_run=False)
+
     # Build overrides
     overrides = {
         'total_timesteps': args.timesteps,
         'n_envs': args.n_envs,
         'deterministic': args.deterministic,
-        'seed': args.seed,
+        'seed': seed,
         'temperature': args.temperature,
         'food_count': args.food,
         'poison_count': args.poison,
@@ -522,10 +586,12 @@ def main():
     print(f"Modes: {', '.join(modes_to_test)}")
     print(f"Envs: {args.n_envs:,} x {args.timesteps:,} steps = {total_steps:,} total steps")
     print(f"Deterministic: {args.deterministic}")
-    if args.runs > 1:
-        print(f"Runs: {args.runs} (base seed: {args.base_seed})")
-    elif args.seed:
-        print(f"Seed: {args.seed}")
+    if is_multi_run:
+        seed_desc = str(args.base_seed) if args.base_seed is not None else "random"
+        print(f"Runs: {args.runs} (base seed: {seed_desc})")
+    else:
+        seed_desc = str(seed) if seed is not None else "random"
+        print(f"Seed: {seed_desc}")
 
     # Handle --full-report mode
     if args.full_report:

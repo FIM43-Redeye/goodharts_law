@@ -176,8 +176,10 @@ def main():
                             help=f'Neural network architecture [default: {default_brain}]')
     experiment.add_argument('--entropy', type=float, default=None, metavar='COEF',
                             help='Entropy coefficient for exploration')
-    experiment.add_argument('--seed', type=int, default=None, metavar='N',
-                            help='Random seed for reproducibility')
+    experiment.add_argument('--seed', type=int, default=42, metavar='N',
+                            help='Random seed (default: 42 for reproducibility)')
+    experiment.add_argument('--random-seed', action='store_true',
+                            help='Use random seed instead of default 42')
     experiment.add_argument('--deterministic', action='store_true',
                             help='Full determinism (slower, for debugging)')
     experiment.add_argument('--analyze', action='store_true',
@@ -254,9 +256,14 @@ def main():
     if args.no_profile:
         overrides['profile_enabled'] = False
 
-    # Handle seed and deterministic mode
-    if args.seed is not None:
-        overrides['seed'] = args.seed
+    # Handle seed: default is 42 for reproducibility
+    # --random-seed overrides to use a random seed
+    if args.random_seed:
+        overrides['seed'] = None  # Will generate random seed in trainer
+        print(f"   Using random seed (results will vary between runs)")
+    else:
+        overrides['seed'] = args.seed  # Default 42 or user-specified
+
     if args.deterministic:
         overrides['deterministic'] = True
 
