@@ -105,16 +105,20 @@ class ReportGenerator:
         results = self.data.get('results', {})
         for mode, result in results.items():
             deaths = result.get('deaths', [])
-            mode_data[mode] = [
-                {
-                    'efficiency': d.get('efficiency', 0),
+            mode_data[mode] = []
+            for d in deaths:
+                food = d.get('food_eaten', 0)
+                poison = d.get('poison_eaten', 0)
+                total = food + poison
+                # Compute efficiency from food/poison (property not serialized to JSON)
+                efficiency = food / total if total > 0 else 1.0
+                mode_data[mode].append({
+                    'efficiency': efficiency,
                     'survival_steps': d.get('survival_time', 0),
-                    'food_eaten': d.get('food_eaten', 0),
-                    'poison_eaten': d.get('poison_eaten', 0),
+                    'food_eaten': food,
+                    'poison_eaten': poison,
                     'total_reward': d.get('total_reward', 0),
-                }
-                for d in deaths
-            ]
+                })
 
         return mode_data
 
@@ -165,10 +169,14 @@ class ReportGenerator:
         """Generate executive summary section."""
         lines = ['## Executive Summary', '']
 
-        # Goodhart Failure Index
-        if 'ground_truth' in mode_data and 'proxy' in mode_data:
-            gt_eff = np.mean([d['efficiency'] for d in mode_data['ground_truth']])
-            px_eff = np.mean([d['efficiency'] for d in mode_data['proxy']])
+        # Goodhart Failure Index - use aggregate efficiency from results (not per-death mean)
+        results = self.data.get('results', {})
+        gt_agg = results.get('ground_truth', {}).get('aggregates', {})
+        px_agg = results.get('proxy', {}).get('aggregates', {})
+
+        if gt_agg and px_agg:
+            gt_eff = gt_agg.get('overall_efficiency', 0)
+            px_eff = px_agg.get('overall_efficiency', 0)
             gfi = compute_goodhart_failure_index(gt_eff, px_eff)
 
             lines.append(f'**Goodhart Failure Index: {gfi:.1%}**')
@@ -425,13 +433,15 @@ class ReportGenerator:
             Formatted string for terminal output
         """
         lines = []
-        mode_data = self._extract_mode_data()
-        self._compute_comparisons(mode_data)
+        results = self.data.get('results', {})
 
-        # Goodhart Failure Index header
-        if 'ground_truth' in mode_data and 'proxy' in mode_data:
-            gt_eff = np.mean([d['efficiency'] for d in mode_data['ground_truth']])
-            px_eff = np.mean([d['efficiency'] for d in mode_data['proxy']])
+        # Goodhart Failure Index header - use aggregate efficiency
+        gt_agg = results.get('ground_truth', {}).get('aggregates', {})
+        px_agg = results.get('proxy', {}).get('aggregates', {})
+
+        if gt_agg and px_agg:
+            gt_eff = gt_agg.get('overall_efficiency', 0)
+            px_eff = px_agg.get('overall_efficiency', 0)
             gfi = compute_goodhart_failure_index(gt_eff, px_eff)
 
             lines.append('=' * 80)
@@ -442,14 +452,10 @@ class ReportGenerator:
             lines.append(f"{'EVALUATION RESULTS':^80}")
             lines.append('=' * 80)
 
-        # Results table
-        cohens_d_header = "Cohen's d"
+        # Results table - use aggregate stats (not per-death which gives different values)
         lines.append('')
-        lines.append(f"{'Mode':<20} {'Efficiency [95% CI]':<25} {'Survival':>12} {'p-value':>12} {cohens_d_header:>12}")
+        lines.append(f"{'Mode':<25} {'Efficiency':>12} {'Survival':>12} {'Deaths':>12} {'Deaths/1k':>12}")
         lines.append('-' * 80)
-
-        results = self.data.get('results', {})
-        eff_comp = self.comparisons.get('efficiency')
 
         for mode in sorted(results.keys()):
             agg = results[mode].get('aggregates', {})
@@ -458,24 +464,10 @@ class ReportGenerator:
 
             eff = agg.get('overall_efficiency', 0)
             surv = agg.get('survival_mean', 0)
+            deaths = agg.get('total_deaths', agg.get('n_deaths', 0))
+            d1k = agg.get('deaths_per_1k_steps', 0)
 
-            # Get CI for this mode
-            if mode == 'ground_truth' and eff_comp:
-                ci_low, ci_high = eff_comp.ci_a[0] / 100, eff_comp.ci_a[1] / 100
-                eff_str = f'{eff:.1%} [{ci_low:.1%}, {ci_high:.1%}]'
-                p_str = '-'
-                d_str = '-'
-            elif mode == 'proxy' and eff_comp:
-                ci_low, ci_high = eff_comp.ci_b[0] / 100, eff_comp.ci_b[1] / 100
-                eff_str = f'{eff:.1%} [{ci_low:.1%}, {ci_high:.1%}]'
-                p_str = format_p_value(eff_comp.p_value) + eff_comp.significance_stars
-                d_str = f'{eff_comp.cohens_d:.2f}'
-            else:
-                eff_str = f'{eff:.1%}'
-                p_str = '-'
-                d_str = '-'
-
-            lines.append(f'{mode:<20} {eff_str:<25} {surv:>12.1f} {p_str:>12} {d_str:>12}')
+            lines.append(f'{mode:<25} {eff:>11.1%} {surv:>12.1f} {deaths:>12,} {d1k:>12.2f}')
 
         lines.append('=' * 80)
 

@@ -163,11 +163,24 @@ def plot_consumption_comparison(data: dict[str, list[dict]], output_dir: Path):
     print(f"Saved: {output_path}")
 
 
-def plot_efficiency_comparison(data: dict[str, list[dict]], output_dir: Path):
+def plot_efficiency_comparison(
+    data: dict[str, list[dict]],
+    output_dir: Path,
+    aggregates: dict[str, dict] = None,
+):
     """Bar chart comparing efficiency (food / total consumed) across modes."""
     modes = list(data.keys())
-    means = [np.mean([e['efficiency'] for e in data[m]]) * 100 for m in modes]
-    stds = [np.std([e['efficiency'] for e in data[m]]) * 100 for m in modes]
+
+    # Use aggregate efficiency if available (more accurate than per-death mean)
+    if aggregates:
+        means = [aggregates.get(m, {}).get('overall_efficiency', 0) * 100 for m in modes]
+        # No std for aggregate efficiency - it's a ratio, not a sample mean
+        stds = [0 for _ in modes]
+    else:
+        # Fallback to per-death mean (less accurate due to short-lived deaths bias)
+        means = [np.mean([e['efficiency'] for e in data[m]]) * 100 for m in modes]
+        stds = [np.std([e['efficiency'] for e in data[m]]) * 100 for m in modes]
+
     colors = [MODE_COLORS.get(m, '#888888') for m in modes]
     labels = [MODE_NAMES.get(m, m) for m in modes]
 
@@ -203,7 +216,7 @@ def plot_efficiency_comparison(data: dict[str, list[dict]], output_dir: Path):
     print(f"Saved: {output_path}")
 
 
-def plot_goodhart_summary(data: dict[str, list[dict]], output_dir: Path):
+def plot_goodhart_summary(data: dict[str, list[dict]], output_dir: Path, aggregates: dict[str, dict] = None):
     """
     Summary figure showing Goodhart's Law effect.
 
@@ -215,6 +228,14 @@ def plot_goodhart_summary(data: dict[str, list[dict]], output_dir: Path):
 
     gt_data = data['ground_truth']
     proxy_data = data['proxy']
+
+    # Use aggregate efficiency if available
+    if aggregates:
+        gt_agg_eff = aggregates.get('ground_truth', {}).get('overall_efficiency')
+        proxy_agg_eff = aggregates.get('proxy', {}).get('overall_efficiency')
+    else:
+        gt_agg_eff = None
+        proxy_agg_eff = None
 
     metrics = [
         ('total_reward', 'Reward', 'Average Episode Reward'),
@@ -229,22 +250,26 @@ def plot_goodhart_summary(data: dict[str, list[dict]], output_dir: Path):
     )
 
     for i, (key, short_name, title) in enumerate(metrics, 1):
-        gt_vals = [e[key] for e in gt_data]
-        proxy_vals = [e[key] for e in proxy_data]
-
-        if key == 'efficiency':
-            gt_vals = [v * 100 for v in gt_vals]
-            proxy_vals = [v * 100 for v in proxy_vals]
-
-        gt_mean, gt_std = np.mean(gt_vals), np.std(gt_vals)
-        proxy_mean, proxy_std = np.mean(proxy_vals), np.std(proxy_vals)
+        # Use aggregate efficiency if available (more accurate)
+        if key == 'efficiency' and gt_agg_eff is not None and proxy_agg_eff is not None:
+            gt_mean = gt_agg_eff * 100
+            proxy_mean = proxy_agg_eff * 100
+            gt_std, proxy_std = 0, 0  # No std for aggregate ratio
+        else:
+            gt_vals = [e[key] for e in gt_data]
+            proxy_vals = [e[key] for e in proxy_data]
+            if key == 'efficiency':
+                gt_vals = [v * 100 for v in gt_vals]
+                proxy_vals = [v * 100 for v in proxy_vals]
+            gt_mean, gt_std = np.mean(gt_vals), np.std(gt_vals)
+            proxy_mean, proxy_std = np.mean(proxy_vals), np.std(proxy_vals)
 
         suffix = '%' if key == 'efficiency' else ''
 
         fig.add_trace(go.Bar(
             x=['Ground Truth', 'Proxy'],
             y=[gt_mean, proxy_mean],
-            error_y=dict(type='data', array=[gt_std, proxy_std], visible=True),
+            error_y=dict(type='data', array=[gt_std, proxy_std], visible=True) if gt_std > 0 else None,
             marker_color=['#22c79a', '#ff6b6b'],
             text=[f'{gt_mean:.1f}{suffix}', f'{proxy_mean:.1f}{suffix}'],
             textposition='outside',
@@ -553,6 +578,7 @@ def plot_efficiency_comparison_annotated(
     show_ci: bool = True,
     show_pvalue: bool = True,
     show_effect_size: bool = True,
+    aggregates: dict[str, dict] = None,
 ) -> Path:
     """
     Efficiency bar chart with statistical annotations.
@@ -569,6 +595,7 @@ def plot_efficiency_comparison_annotated(
         show_ci: Show confidence intervals (default True)
         show_pvalue: Show p-value annotation (default True)
         show_effect_size: Show Cohen's d (default True)
+        aggregates: Optional aggregate stats per mode
 
     Returns:
         Path to saved figure
@@ -579,17 +606,30 @@ def plot_efficiency_comparison_annotated(
     labels = [MODE_NAMES.get(m, m) for m in modes]
     colors = [MODE_COLORS.get(m, '#888888') for m in modes]
 
-    # Compute statistics
-    efficiencies = {m: [e['efficiency'] * 100 for e in data[m]] for m in modes}
-    means = [np.mean(efficiencies[m]) for m in modes]
-
-    # Compute CIs
-    if show_ci:
-        from goodharts.analysis.stats_helpers import compute_confidence_interval
-        cis = [compute_confidence_interval(efficiencies[m]) for m in modes]
-        errors = [means[i] - cis[i][0] for i in range(len(modes))]
+    # Use aggregate efficiency if available (more accurate than per-death mean)
+    if aggregates:
+        means = [aggregates.get(m, {}).get('overall_efficiency', 0) * 100 for m in modes]
+        # Use CI from aggregates if available, otherwise no error bars
+        errors = []
+        for m in modes:
+            ci = aggregates.get(m, {}).get('efficiency_ci')
+            if ci and len(ci) == 2:
+                errors.append((means[modes.index(m)] - ci[0] * 100))
+            else:
+                errors.append(0)
     else:
-        errors = [np.std(efficiencies[m]) for m in modes]
+        # Fallback to per-death statistics
+        efficiencies = {m: [e['efficiency'] * 100 for e in data[m]] for m in modes}
+        means = [np.mean(efficiencies[m]) for m in modes]
+        if show_ci:
+            from goodharts.analysis.stats_helpers import compute_confidence_interval
+            cis = [compute_confidence_interval(efficiencies[m]) for m in modes]
+            errors = [means[i] - cis[i][0] for i in range(len(modes))]
+        else:
+            errors = [np.std(efficiencies[m]) for m in modes]
+
+    # For statistical comparison, still use per-death data (need samples for t-test)
+    efficiencies = {m: [e['efficiency'] * 100 for e in data[m]] for m in modes}
 
     fig = go.Figure()
 
@@ -803,7 +843,7 @@ def plot_goodhart_summary_annotated(
 # JSON data loading (for multi-run results)
 # -----------------------------------------------------------------------------
 
-def load_json_results(path: str) -> dict[str, list[dict]]:
+def load_json_results(path: str) -> tuple[dict[str, list[dict]], dict[str, dict]]:
     """
     Load evaluation results from JSON format.
 
@@ -814,38 +854,48 @@ def load_json_results(path: str) -> dict[str, list[dict]]:
         path: Path to JSON file
 
     Returns:
-        Mode -> list of episode/death dicts
+        Tuple of (deaths_by_mode, aggregates_by_mode)
+        - deaths_by_mode: Mode -> list of per-death dicts
+        - aggregates_by_mode: Mode -> aggregate stats dict
     """
     with open(path, 'r') as f:
         data = json.load(f)
 
     results = defaultdict(list)
+    aggregates = {}
+
+    def extract_death(death: dict) -> dict:
+        """Extract death data, computing efficiency from food/poison."""
+        food = death.get('food_eaten', 0)
+        poison = death.get('poison_eaten', 0)
+        total = food + poison
+        # Compute efficiency (property not serialized to JSON)
+        efficiency = food / total if total > 0 else 1.0
+        return {
+            'total_reward': death.get('total_reward', 0),
+            'food_eaten': food,
+            'poison_eaten': poison,
+            'survival_steps': death.get('survival_time', 0),
+            'efficiency': efficiency,
+        }
 
     # Handle multi-mode structure (from scripts/evaluate.py)
     if 'results' in data:
         for mode, mode_data in data['results'].items():
             if 'deaths' in mode_data:
                 for death in mode_data['deaths']:
-                    results[mode].append({
-                        'total_reward': death.get('total_reward', 0),
-                        'food_eaten': death.get('food_eaten', 0),
-                        'poison_eaten': death.get('poison_eaten', 0),
-                        'survival_steps': death.get('survival_time', 0),
-                        'efficiency': death.get('efficiency', 0),
-                    })
+                    results[mode].append(extract_death(death))
+            if 'aggregates' in mode_data:
+                aggregates[mode] = mode_data['aggregates']
     # Handle single-mode structure
     elif 'deaths' in data:
         mode = data.get('mode', 'unknown')
         for death in data['deaths']:
-            results[mode].append({
-                'total_reward': death.get('total_reward', 0),
-                'food_eaten': death.get('food_eaten', 0),
-                'poison_eaten': death.get('poison_eaten', 0),
-                'survival_steps': death.get('survival_time', 0),
-                'efficiency': death.get('efficiency', 0),
-            })
+            results[mode].append(extract_death(death))
+        if 'aggregates' in data:
+            aggregates[mode] = data['aggregates']
 
-    return dict(results)
+    return dict(results), aggregates
 
 
 def generate_all_figures(
@@ -853,6 +903,7 @@ def generate_all_figures(
     output_dir: Path,
     annotated: bool = True,
     distributions: bool = True,
+    aggregates: dict[str, dict] = None,
 ) -> list[Path]:
     """
     Generate all standard figures for a Goodhart experiment.
@@ -876,15 +927,15 @@ def generate_all_figures(
     plot_consumption_comparison(data, output_dir)
     paths.append(output_dir / 'consumption_comparison.png')
 
-    plot_efficiency_comparison(data, output_dir)
+    plot_efficiency_comparison(data, output_dir, aggregates=aggregates)
     paths.append(output_dir / 'efficiency_comparison.png')
 
-    plot_goodhart_summary(data, output_dir)
+    plot_goodhart_summary(data, output_dir, aggregates=aggregates)
     paths.append(output_dir / 'goodhart_summary.png')
 
     # Annotated plots
     if annotated:
-        path = plot_efficiency_comparison_annotated(data, output_dir)
+        path = plot_efficiency_comparison_annotated(data, output_dir, aggregates=aggregates)
         if path:
             paths.append(path)
 
@@ -932,8 +983,9 @@ def main():
     print(f"\nLoading results from {args.input}")
 
     # Detect file format
+    aggregates = None
     if args.input.endswith('.json'):
-        data = load_json_results(args.input)
+        data, aggregates = load_json_results(args.input)
     else:
         data = load_results(args.input)
 
@@ -947,7 +999,7 @@ def main():
     distributions = args.distributions or args.all
 
     # Generate figures
-    paths = generate_all_figures(data, output_dir, annotated, distributions)
+    paths = generate_all_figures(data, output_dir, annotated, distributions, aggregates=aggregates)
 
     print(f"\nGenerated {len(paths)} figures in {output_dir}/")
 
