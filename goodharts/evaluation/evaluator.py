@@ -488,30 +488,37 @@ class ModelTester:
     def _process_deaths(self, terminated: torch.Tensor):
         """Extract metrics from agents that died (starvation)."""
         death_indices = terminated.nonzero(as_tuple=True)[0]
+        n_deaths = death_indices.shape[0]
+        if n_deaths == 0:
+            return
 
-        for idx in death_indices:
-            i = idx.item()
+        # Batch GPU->CPU transfer: one sync instead of 6*n_deaths syncs
+        # Stack all metrics we need, transfer once, then unpack on CPU
+        survival_times = self._survival_times[death_indices].tolist()
+        foods = self.vec_env.last_episode_food[death_indices].tolist()
+        poisons = self.vec_env.last_episode_poison[death_indices].tolist()
+        rewards = self._life_rewards[death_indices].tolist()
+        energies = self._last_energy[death_indices].tolist()
 
-            survival_time = self._survival_times[i].item()
-
+        # Create DeathEvent objects on CPU (no more GPU sync)
+        mode = self.config.mode
+        for i in range(n_deaths):
             death = DeathEvent(
-                mode=self.config.mode,
+                mode=mode,
                 death_id=self.death_count,
-                survival_time=survival_time,
-                food_eaten=self.vec_env.last_episode_food[i].item(),
-                poison_eaten=self.vec_env.last_episode_poison[i].item(),
-                total_reward=self._life_rewards[i].item(),
-                final_energy=self._last_energy[i].item(),
+                survival_time=survival_times[i],
+                food_eaten=foods[i],
+                poison_eaten=poisons[i],
+                total_reward=rewards[i],
+                final_energy=energies[i],
             )
             self.deaths.append(death)
+            self._checkpoint_survivals.append(survival_times[i])
             self.death_count += 1
 
-            # Track survival time for dashboard checkpoint
-            self._checkpoint_survivals.append(survival_time)
-
-            # Reset trackers for this env (agent has respawned)
-            self._life_rewards[i] = 0
-            self._survival_times[i] = 0
+        # Batch reset trackers (stays on GPU)
+        self._life_rewards[death_indices] = 0
+        self._survival_times[death_indices] = 0
 
     def _update_dashboard(self):
         """Send checkpoint update to dashboard."""
