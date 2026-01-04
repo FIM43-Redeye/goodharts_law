@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Goodhart's Law Simulation is an AI safety demonstration that uses reinforcement learning to show how proxy metric optimization fails. Agents navigate a 2D grid world distinguishing food from poison. Ground-truth agents see real cell types and thrive; proxy agents see only "interestingness" values and inevitably get poisoned.
 
-**Stack:** Python 3.9+, PyTorch (GPU-native), NumPy, Plotly/Dash
+**Stack:** Python 3.9+, PyTorch (GPU-native), NumPy, matplotlib, Plotly/Dash
 
 ## Common Commands
 
@@ -14,24 +14,26 @@ Goodhart's Law Simulation is an AI safety demonstration that uses reinforcement 
 # Install
 pip install -e .
 
-# Visualization dashboards
-python main.py --brain-view -m ground_truth       # Single-agent neural net visualization
-python main.py --parallel-stats                   # Multi-mode statistics comparison
-python scripts/brain_view.py -m proxy --speed 100 # Direct script with options
-python scripts/parallel_stats.py --modes ground_truth,proxy --envs 256
-
 # Train
-python -m goodharts.training.train_ppo --mode ground_truth --timesteps 100000
-python -m goodharts.training.train_ppo --mode all --dashboard
+python main.py train --mode ground_truth --updates 128
+python main.py train --mode all --dashboard
 
 # Evaluate
-python scripts/evaluate.py --mode all --timesteps 50000    # Single evaluation run
-python scripts/evaluate.py --mode all --runs 5 --base-seed 42  # Multi-run with aggregation
-python scripts/evaluate.py --full-report --runs 5          # Full report with figures
+python main.py evaluate --mode all --runs 5 --full-report
+python main.py evaluate --mode all --timesteps 50000       # Single run
 
-# Visualize results
+# Visualization dashboards
+python main.py brain-view -m ground_truth                  # Neural network visualization (matplotlib)
+python main.py brain-view -m proxy --speed 100
+python main.py parallel-stats                              # Multi-mode statistics (Dash)
+python main.py parallel-stats --modes ground_truth,proxy --envs 256
+
+# Regenerate report from existing results
+python main.py report                                      # Auto-detect latest results
+python main.py report --input generated/reports/*/results.json
+
+# Visualize results directly
 python -m goodharts.analysis.visualize --input generated/eval_results.json --all
-python -m goodharts.analysis.report --input generated/eval_results.json
 
 # Power analysis
 python -c "from goodharts.analysis import print_power_table; print_power_table()"
@@ -95,13 +97,15 @@ Key env var: `GOODHARTS_DEVICE` (force device: `cuda:1`, `cpu`, `tpu`)
 
 ## Key Files
 
+- `main.py`: Unified CLI dispatcher (train, evaluate, brain-view, parallel-stats, report)
+- `goodharts/cli/`: CLI modules (evaluate.py, brain_view.py, parallel_stats.py, report.py)
 - `goodharts/simulation.py`: Main simulation orchestrator
 - `goodharts/environments/torch_env.py`: GPU-native vectorized environment
 - `goodharts/behaviors/registry.py`: Behavior auto-discovery
 - `goodharts/modes.py`: ObservationSpec and RewardComputer
 - `goodharts/training/ppo/trainer.py`: PPO training loop
 - `goodharts/configs/default_config.py`: CellType registry and get_config()
-- `goodharts/visualization/`: Plotly/Dash dashboards (brain_view.py, parallel_stats.py)
+- `goodharts/visualization/`: matplotlib brain view, Dash parallel stats dashboard
 - `goodharts/evaluation/`: Evaluation infrastructure (evaluator.py, multi_run.py)
 - `goodharts/analysis/`: Statistical analysis (stats_helpers.py, power.py, visualize.py, report.py)
-- `scripts/evaluate.py`: CLI for evaluation with multi-run and report generation
+- `scripts/`: Development tools only (profiling, benchmarking, tracing)

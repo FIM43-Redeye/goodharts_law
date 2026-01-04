@@ -193,6 +193,32 @@ EpisodeMetrics = DeathEvent
 
 
 @dataclass
+class SurvivorSnapshot:
+    """
+    Snapshot of an agent still alive at evaluation end.
+
+    These are RIGHT-CENSORED observations - we know the agent lived AT LEAST
+    this long and consumed AT LEAST this much food/poison, but the true values
+    are unknown (would be higher if they continued living).
+
+    Including survivors is crucial for accurate distributions, especially for
+    ground_truth mode where deaths are rare. Without survivors, we'd only see
+    the "unlucky" agents who happened to die during evaluation.
+    """
+    mode: str
+    survivor_id: int
+    survival_time: int  # Steps survived SO FAR (lower bound)
+    food_eaten: int     # Food eaten SO FAR (lower bound)
+    poison_eaten: int   # Poison eaten SO FAR (lower bound)
+
+    @property
+    def efficiency(self) -> float:
+        """Current efficiency (may change as agent continues living)."""
+        total = self.food_eaten + self.poison_eaten
+        return self.food_eaten / total if total > 0 else 1.0
+
+
+@dataclass
 class ModeAggregates:
     """
     Aggregate statistics for a mode across all deaths.
@@ -304,6 +330,8 @@ class ModelTester:
 
         # Death event collection (not episodes!)
         self.deaths: list[DeathEvent] = []
+        # Survivor snapshots (agents still alive at evaluation end)
+        self.survivors: list[SurvivorSnapshot] = []
         self.aggregates: Optional[ModeAggregates] = None
 
         # Running state
@@ -544,11 +572,31 @@ class ModelTester:
             self._update_dashboard()  # Final checkpoint
             self.dashboard.send_complete(self.config.mode)
 
-        # Count survivors (agents still alive at end of evaluation)
-        # Their survival times are valid data - they lived AT LEAST this long
-        survivor_times = self._survival_times[self._survival_times > 0].cpu().tolist()
-        self.n_survivors = len(survivor_times)
-        self.survivor_times = survivor_times
+        # Capture survivors (agents still alive at end of evaluation)
+        # These are RIGHT-CENSORED observations - they lived AT LEAST this long
+        survivor_mask = self._survival_times > 0
+        survivor_indices = survivor_mask.nonzero(as_tuple=True)[0]
+
+        if survivor_indices.numel() > 0:
+            # Batch GPU->CPU transfer for survivor data
+            surv_times = self._survival_times[survivor_indices].tolist()
+            surv_foods = self.vec_env.current_episode_food[survivor_indices].tolist()
+            surv_poisons = self.vec_env.current_episode_poison[survivor_indices].tolist()
+
+            mode = self.config.mode
+            for i, idx in enumerate(survivor_indices.tolist()):
+                survivor = SurvivorSnapshot(
+                    mode=mode,
+                    survivor_id=idx,
+                    survival_time=surv_times[i],
+                    food_eaten=surv_foods[i],
+                    poison_eaten=surv_poisons[i],
+                )
+                self.survivors.append(survivor)
+
+        self.n_survivors = len(self.survivors)
+        # Legacy: keep survivor_times list for backwards compatibility
+        self.survivor_times = [s.survival_time for s in self.survivors]
 
         # Compute aggregates (now includes survivor data)
         self._compute_aggregates()
@@ -568,6 +616,7 @@ class ModelTester:
             },
             'metadata': {
                 'total_deaths': len(self.deaths),
+                'n_survivors': self.n_survivors,
                 'actual_timesteps': self.total_steps,
                 'total_food_consumed': self.total_food,
                 'total_poison_consumed': self.total_poison,
@@ -577,6 +626,7 @@ class ModelTester:
             },
             'aggregates': asdict(self.aggregates) if self.aggregates else None,
             'deaths': [asdict(d) for d in self.deaths],
+            'survivors': [asdict(s) for s in self.survivors],
         }
 
         # Save JSON
@@ -640,8 +690,18 @@ class ModelTester:
         )
 
     def _save_json(self, result: dict):
-        """Save results to JSON file."""
-        output_path = Path(self.config.output_path)
+        """Save results to JSON file.
+
+        When running multi-mode evaluations, each mode saves to a unique file
+        (e.g., generated/eval_results_ground_truth.json) to prevent overwrites.
+        The CLI script then merges these into a single combined JSON.
+        """
+        base_path = Path(self.config.output_path)
+
+        # Use mode-specific filename to prevent overwrites in multi-mode runs
+        mode_filename = f"{base_path.stem}_{self.config.mode}{base_path.suffix}"
+        output_path = base_path.parent / mode_filename
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(output_path, 'w') as f:

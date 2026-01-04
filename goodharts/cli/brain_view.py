@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Brain View: Single-agent neural network visualization.
 
@@ -6,26 +5,22 @@ Shows what a trained agent sees, how its neural network processes
 the observation, and what actions it chooses.
 
 Usage:
-    python scripts/brain_view.py --mode ground_truth
-    python scripts/brain_view.py --mode proxy --model models/ppo_proxy.pth
-    python scripts/brain_view.py --mode ground_truth --speed 100 --steps 1000
+    python main.py brain-view --mode ground_truth
+    python main.py brain-view --mode proxy --model models/ppo_proxy.pth
+    python main.py brain-view --mode ground_truth --speed 100 --steps 1000
 """
 import argparse
-import sys
-import time
 from pathlib import Path
 
-# Ensure project root is in path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 import torch
+import torch.nn.functional as F
 
 from goodharts.utils.device import get_device
 from goodharts.configs.default_config import get_simulation_config
 from goodharts.modes import ObservationSpec, get_all_mode_names
 from goodharts.environments import create_vec_env
 from goodharts.behaviors.brains import load_brain
-from goodharts.visualization import create_brain_view_app
+from goodharts.visualization.brain_view import create_brain_view
 
 
 def main():
@@ -48,8 +43,6 @@ def main():
                         help='Freeze agent energy for clean visualization (default: True)')
     parser.add_argument('--no-freeze-energy', action='store_false', dest='freeze_energy',
                         help='Allow agent to die normally')
-    parser.add_argument('--port', type=int, default=8050,
-                        help='Dashboard server port (default: 8050)')
     args = parser.parse_args()
 
     device = get_device()
@@ -71,43 +64,44 @@ def main():
     vec_env = create_vec_env(n_envs=1, obs_spec=spec, config=config, device=device)
 
     if args.freeze_energy:
-        # Disable energy consumption for visualization
         vec_env._energy_enabled = 0.0
 
     grid_size = (config['GRID_HEIGHT'], config['GRID_WIDTH'])
 
-    # Start visualization dashboard
-    app = create_brain_view_app(args.mode, brain, grid_size=grid_size, port=args.port)
-    app.start()
-
-    # Give dashboard time to start
-    time.sleep(1.0)
+    # Create visualization (matplotlib-based, runs in main thread)
+    view = create_brain_view(args.mode, brain, grid_size=grid_size)
 
     print(f"\nBrain View: {args.mode}")
     print(f"Speed: {args.speed}ms/step")
     if args.steps:
         print(f"Steps: {args.steps}")
-    print(f"Dashboard: http://localhost:{args.port}")
-    print("\nPress Ctrl+C to stop\n")
+    print("\nClose the window or press Ctrl+C to stop\n")
 
     # Run simulation loop
     obs = vec_env.reset()
     step = 0
+    interval_sec = args.speed / 1000.0
 
     try:
         while args.steps is None or step < args.steps:
-            # Get action from model
+            if not view.is_open():
+                print("\nWindow closed")
+                break
+
+            # Single forward pass - BrainVisualizer hooks capture activations
             with torch.no_grad():
                 logits = brain(obs.float())
+                probs = F.softmax(logits, dim=-1).squeeze().cpu().numpy()
                 action = logits.argmax(dim=-1)
 
-            # Update visualization
-            app.update(
+            # Update visualization with current state
+            view.update(
                 grid=vec_env.grids[0],
                 agent_x=vec_env.agent_x[0].item(),
                 agent_y=vec_env.agent_y[0].item(),
                 agent_energy=vec_env.agent_energy[0].item(),
                 obs=obs[0],
+                action_probs=probs,
                 step_count=step,
             )
 
@@ -115,19 +109,14 @@ def main():
             obs, _, _, _ = vec_env.step(action)
             step += 1
 
-            # Control speed
-            time.sleep(args.speed / 1000.0)
-
-            # Check if dashboard closed
-            if not app.is_running():
-                print("\nDashboard closed")
-                break
+            # Control speed and process matplotlib events
+            view.pause(interval_sec)
 
     except KeyboardInterrupt:
         print("\nInterrupted")
     finally:
         print(f"Completed {step} steps")
-        app.stop()
+        view.close()
 
     return 0
 

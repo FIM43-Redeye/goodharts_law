@@ -82,13 +82,19 @@ class StatisticalComparison:
     @property
     def effect_magnitude(self) -> str:
         """
-        Cohen's d interpretation.
+        Cohen's d interpretation with extended scale for extreme effects.
 
-        Following Cohen (1988) conventions:
+        Following Cohen (1988) conventions, extended for simulation contexts
+        where distributions may be nearly non-overlapping:
         - negligible: |d| < 0.2
         - small: 0.2 <= |d| < 0.5
         - medium: 0.5 <= |d| < 0.8
-        - large: |d| >= 0.8
+        - large: 0.8 <= |d| < 2.0
+        - very large: 2.0 <= |d| < 10.0
+        - near-complete separation: |d| >= 10.0
+
+        Note: Effect sizes above ~10 indicate distributions that barely
+        overlap, where Cohen's d becomes less meaningful as a metric.
         """
         d = abs(self.cohens_d)
         if d < 0.2:
@@ -97,7 +103,11 @@ class StatisticalComparison:
             return 'small'
         elif d < 0.8:
             return 'medium'
-        return 'large'
+        elif d < 2.0:
+            return 'large'
+        elif d < 10.0:
+            return 'very large'
+        return 'near-complete separation'
 
     def format_compact(self) -> str:
         """Compact format for plot annotations."""
@@ -305,6 +315,9 @@ def interpret_effect_size(d: float) -> str:
     """
     Interpret Cohen's d effect size with context.
 
+    Extended beyond Cohen's original conventions to handle simulation
+    contexts where distributions may be nearly non-overlapping.
+
     Args:
         d: Cohen's d value
 
@@ -320,10 +333,12 @@ def interpret_effect_size(d: float) -> str:
         return f"Small effect: Group A {direction} (d={d:.2f})"
     elif magnitude < 0.8:
         return f"Medium effect: Group A {direction} (d={d:.2f})"
-    elif magnitude < 1.2:
+    elif magnitude < 2.0:
         return f"Large effect: Group A substantially {direction} (d={d:.2f})"
-    else:
+    elif magnitude < 10.0:
         return f"Very large effect: Group A dramatically {direction} (d={d:.2f})"
+    else:
+        return f"Near-complete separation: distributions barely overlap (d={d:.1f})"
 
 
 def compute_goodhart_failure_index(

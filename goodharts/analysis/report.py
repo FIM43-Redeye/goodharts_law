@@ -99,18 +99,23 @@ class ReportGenerator:
         return self
 
     def _extract_mode_data(self) -> dict[str, list[dict]]:
-        """Extract per-death/episode data for each mode."""
+        """Extract per-death/episode AND survivor data for each mode.
+
+        CRITICAL: Must include survivors for accurate distributions.
+        Without survivors, ground_truth would only show the rare deaths,
+        completely misrepresenting the typical ~100% efficiency behavior.
+        """
         mode_data = {}
 
         results = self.data.get('results', {})
         for mode, result in results.items():
-            deaths = result.get('deaths', [])
             mode_data[mode] = []
-            for d in deaths:
+
+            # Extract deaths
+            for d in result.get('deaths', []):
                 food = d.get('food_eaten', 0)
                 poison = d.get('poison_eaten', 0)
                 total = food + poison
-                # Compute efficiency from food/poison (property not serialized to JSON)
                 efficiency = food / total if total > 0 else 1.0
                 mode_data[mode].append({
                     'efficiency': efficiency,
@@ -118,6 +123,22 @@ class ReportGenerator:
                     'food_eaten': food,
                     'poison_eaten': poison,
                     'total_reward': d.get('total_reward', 0),
+                    'censored': False,
+                })
+
+            # Extract survivors (right-censored data - they lived AT LEAST this long)
+            for s in result.get('survivors', []):
+                food = s.get('food_eaten', 0)
+                poison = s.get('poison_eaten', 0)
+                total = food + poison
+                efficiency = food / total if total > 0 else 1.0
+                mode_data[mode].append({
+                    'efficiency': efficiency,
+                    'survival_steps': s.get('survival_time', 0),
+                    'food_eaten': food,
+                    'poison_eaten': poison,
+                    'total_reward': 0,  # Survivors don't have final reward
+                    'censored': True,
                 })
 
         return mode_data
@@ -187,22 +208,33 @@ class ReportGenerator:
                         'complete failure.')
             lines.append('')
 
-        # Summary table
+        # Summary table - show both aggregate and per-agent efficiency
         lines.append('### Performance Summary')
         lines.append('')
-        lines.append('| Mode | Efficiency | Survival (mean) | Deaths | Deaths/1k steps |')
-        lines.append('|------|------------|-----------------|--------|-----------------|')
+        lines.append('| Mode | Aggregate Eff. | Per-Agent Eff. | Survival | Deaths | Deaths/1k |')
+        lines.append('|------|----------------|----------------|----------|--------|-----------|')
 
         results = self.data.get('results', {})
+        mode_data = self._extract_mode_data()
         for mode in sorted(results.keys()):
             agg = results[mode].get('aggregates', {})
             if agg:
-                eff = agg.get('overall_efficiency', 0)
+                agg_eff = agg.get('overall_efficiency', 0)
                 surv = agg.get('survival_mean', 0)
-                deaths = agg.get('n_deaths', 0)
+                # Multi-run aggregates use 'total_deaths', single-run uses 'n_deaths'
+                deaths = agg.get('total_deaths', agg.get('n_deaths', 0))
                 d1k = agg.get('deaths_per_1k_steps', 0)
-                lines.append(f'| {mode} | {eff:.1%} | {surv:.1f} | {deaths} | {d1k:.2f} |')
+                # Compute per-agent mean efficiency from extracted data
+                if mode in mode_data and mode_data[mode]:
+                    individual_effs = [d['efficiency'] for d in mode_data[mode]]
+                    agent_eff = sum(individual_effs) / len(individual_effs)
+                else:
+                    agent_eff = agg_eff
+                lines.append(f'| {mode} | {agg_eff:.1%} | {agent_eff:.1%} | {surv:.1f} | {deaths:,} | {d1k:.2f} |')
 
+        lines.append('')
+        lines.append('> *Aggregate Eff.*: Total food / total consumed (weights by volume)')
+        lines.append('> *Per-Agent Eff.*: Mean of individual agent efficiencies (weights equally)')
         lines.append('')
         return '\n'.join(lines)
 
@@ -215,6 +247,10 @@ class ReportGenerator:
             return '\n'.join(lines)
 
         lines.append('### Ground Truth vs Proxy Comparison')
+        lines.append('')
+
+        # Note about which metric is used
+        lines.append('> Statistical tests use per-agent means (see "Per-Agent Eff." in summary table).')
         lines.append('')
 
         for metric, comp in self.comparisons.items():
@@ -358,9 +394,19 @@ class ReportGenerator:
         lines.append('### Statistical Methods')
         lines.append('')
         lines.append("- **Welch's t-test**: Used for comparing means between groups (robust "
-                    "to unequal variances)")
+                    "to unequal variances and unequal sample sizes)")
         lines.append("- **Cohen's d**: Standardized effect size measure")
         lines.append("- **95% Confidence Intervals**: Computed using t-distribution")
+        lines.append('')
+
+        lines.append('### Sample Size Asymmetry')
+        lines.append('')
+        lines.append("Sample sizes differ between modes because each sample represents one agent's "
+                    "lifetime (death or survival to evaluation end). Ground truth agents rarely die, "
+                    "so most samples are survivors who lived the full evaluation period. Proxy agents "
+                    "die frequently, generating many more death events. This asymmetry is expected "
+                    "and reflects the core Goodhart effect. Welch's t-test handles unequal sample "
+                    "sizes appropriately.")
         lines.append('')
 
         return '\n'.join(lines)

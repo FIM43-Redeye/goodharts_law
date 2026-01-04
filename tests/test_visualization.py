@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from goodharts.analysis.visualize import (
-    plot_reward_comparison,
+    plot_survival_comparison,
     plot_consumption_comparison,
     plot_efficiency_comparison,
     plot_goodhart_summary,
@@ -154,13 +154,13 @@ class TestBasicPlots:
     These tests mock write_image to avoid kaleido dependency.
     """
 
-    def test_reward_comparison_creates_file(self, sample_data, output_dir):
-        """plot_reward_comparison should create output file."""
+    def test_survival_comparison_creates_file(self, sample_data, output_dir):
+        """plot_survival_comparison should create output file."""
         with patch('plotly.graph_objects.Figure.write_image') as mock_write:
-            plot_reward_comparison(sample_data, output_dir)
+            plot_survival_comparison(sample_data, output_dir)
             mock_write.assert_called_once()
             call_path = mock_write.call_args[0][0]
-            assert 'reward_comparison.png' in call_path
+            assert 'survival_comparison.png' in call_path
 
     def test_consumption_comparison_creates_file(self, sample_data, output_dir):
         """plot_consumption_comparison should create output file."""
@@ -253,7 +253,7 @@ class TestGenerateAllFigures:
 
         # Check expected filenames in returned paths
         path_names = [p.name for p in paths]
-        assert 'reward_comparison.png' in path_names
+        assert 'survival_comparison.png' in path_names
         assert 'consumption_comparison.png' in path_names
         assert 'efficiency_comparison.png' in path_names
 

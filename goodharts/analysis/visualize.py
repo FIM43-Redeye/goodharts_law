@@ -16,6 +16,7 @@ Usage:
 import argparse
 import csv
 import json
+import signal
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
@@ -23,6 +24,87 @@ from typing import Optional
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+
+# Default timeout for figure rendering (seconds)
+FIGURE_TIMEOUT = 300  # 5 minutes should be plenty even for large datasets
+
+# Maximum points to render in distribution plots (violin/box)
+# Beyond this, we downsample to preserve distribution shape without killing kaleido
+MAX_DISTRIBUTION_POINTS = 10000
+
+
+def _downsample_for_distribution(values: list, max_points: int = MAX_DISTRIBUTION_POINTS) -> list:
+    """
+    Downsample large datasets for distribution plots.
+
+    Violin and box plots don't benefit from millions of points - the visual
+    distribution is essentially identical with 10k points. This prevents
+    kaleido from hanging on large datasets.
+
+    Uses random sampling which preserves distribution shape for large n.
+
+    Args:
+        values: List of numeric values
+        max_points: Maximum points to keep (default: 10000)
+
+    Returns:
+        Original list if small enough, otherwise random sample
+    """
+    if len(values) <= max_points:
+        return values
+
+    # Use numpy for efficient random sampling
+    indices = np.random.choice(len(values), size=max_points, replace=False)
+    return [values[i] for i in indices]
+
+
+class FigureTimeoutError(Exception):
+    """Raised when figure rendering exceeds timeout."""
+    pass
+
+
+def _timeout_handler(signum, frame):
+    """Signal handler for figure timeout."""
+    raise FigureTimeoutError("Figure rendering timed out")
+
+
+def save_figure(fig: go.Figure, output_path: Path, timeout: int = FIGURE_TIMEOUT) -> bool:
+    """
+    Save figure with timeout protection.
+
+    Uses SIGALRM on Unix to prevent kaleido hangs from blocking indefinitely.
+    Falls back to direct write_image on Windows or if signal fails.
+
+    Args:
+        fig: Plotly figure to save
+        output_path: Path for output PNG
+        timeout: Maximum seconds to wait (default: 300)
+
+    Returns:
+        True if saved successfully, False if timed out or failed
+    """
+    try:
+        # Set up timeout (Unix only)
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(timeout)
+
+        try:
+            fig.write_image(str(output_path), scale=2)
+            signal.alarm(0)  # Cancel the alarm
+            print(f"Saved: {output_path}")
+            return True
+        except FigureTimeoutError:
+            print(f"TIMEOUT: {output_path} (exceeded {timeout}s, skipping)")
+            return False
+        finally:
+            signal.signal(signal.SIGALRM, old_handler)
+            signal.alarm(0)
+    except (AttributeError, ValueError):
+        # Windows or signal not available - fall back to direct call
+        fig.write_image(str(output_path), scale=2)
+        print(f"Saved: {output_path}")
+        return True
 
 
 # Color scheme for modes
@@ -81,75 +163,110 @@ def _apply_theme(fig: go.Figure) -> go.Figure:
     return fig
 
 
-def plot_reward_comparison(data: dict[str, list[dict]], output_dir: Path):
-    """Bar chart comparing average rewards across modes."""
+def plot_survival_comparison(
+    data: dict[str, list[dict]],
+    output_dir: Path,
+    aggregates: dict[str, dict] = None,
+):
+    """Bar chart comparing mean survival time across modes."""
     modes = list(data.keys())
-    means = [np.mean([e['total_reward'] for e in data[m]]) for m in modes]
-    stds = [np.std([e['total_reward'] for e in data[m]]) for m in modes]
     colors = [MODE_COLORS.get(m, '#888888') for m in modes]
     labels = [MODE_NAMES.get(m, m) for m in modes]
+
+    # Use aggregate survival_mean if available (more accurate)
+    if aggregates:
+        means = [aggregates.get(m, {}).get('survival_mean', 0) for m in modes]
+        # Use CI from aggregates if available
+        errors = []
+        for m in modes:
+            ci = aggregates.get(m, {}).get('survival_ci')
+            if ci and len(ci) == 2:
+                mean_val = aggregates.get(m, {}).get('survival_mean', 0)
+                errors.append(mean_val - ci[0])
+            else:
+                errors.append(0)
+    else:
+        # Fallback to per-death mean
+        means = [np.mean([e.get('survival_steps', e.get('survival_time', 0)) for e in data[m]]) for m in modes]
+        stds = [np.std([e.get('survival_steps', e.get('survival_time', 0)) for e in data[m]]) for m in modes]
+        errors = stds
 
     fig = go.Figure()
 
     fig.add_trace(go.Bar(
         x=labels,
         y=means,
-        error_y=dict(type='data', array=stds, visible=True),
+        error_y=dict(type='data', array=errors, visible=True) if any(e > 0 for e in errors) else None,
         marker_color=colors,
         text=[f'{m:.0f}' for m in means],
         textposition='outside',
     ))
 
     fig.update_layout(
-        title=dict(text='Agent Performance by Training Mode', x=0.5,
+        title=dict(text='Mean Survival Time by Mode', x=0.5,
                   font=dict(size=16)),
-        yaxis_title='Average Episode Reward',
+        yaxis_title='Steps Until Death',
         showlegend=False,
         height=500,
         width=800,
     )
 
-    # Reference line at y=0
-    fig.add_hline(y=0, line_dash='dash', line_color='gray', opacity=0.3)
-
     _apply_theme(fig)
 
-    output_path = output_dir / 'reward_comparison.png'
-    fig.write_image(str(output_path), scale=2)
-    print(f"Saved: {output_path}")
+    output_path = output_dir / 'survival_comparison.png'
+    save_figure(fig, output_path)
 
 
-def plot_consumption_comparison(data: dict[str, list[dict]], output_dir: Path):
-    """Grouped bar chart comparing food vs poison consumption."""
+def plot_consumption_comparison(
+    data: dict[str, list[dict]],
+    output_dir: Path,
+    aggregates: dict[str, dict] = None,
+):
+    """Grouped bar chart comparing food vs poison consumption rates.
+
+    Uses per-1000-steps rates from aggregates when available, which properly
+    accounts for different death rates across modes. Per-death averages are
+    misleading because ground_truth agents live ~4000 steps per death while
+    proxy agents live ~25 steps per death.
+    """
     modes = list(data.keys())
-    food_means = [np.mean([e['food_eaten'] for e in data[m]]) for m in modes]
-    poison_means = [np.mean([e['poison_eaten'] for e in data[m]]) for m in modes]
     labels = [MODE_NAMES.get(m, m) for m in modes]
+
+    # Use aggregate rates if available (much more accurate)
+    if aggregates:
+        food_rates = [aggregates.get(m, {}).get('food_per_1k_steps', 0) for m in modes]
+        poison_rates = [aggregates.get(m, {}).get('poison_per_1k_steps', 0) for m in modes]
+        y_label = 'Items Consumed per 1000 Steps'
+    else:
+        # Fallback to per-death averages (less accurate but better than nothing)
+        food_rates = [np.mean([e['food_eaten'] for e in data[m]]) for m in modes]
+        poison_rates = [np.mean([e['poison_eaten'] for e in data[m]]) for m in modes]
+        y_label = 'Items Consumed per Episode (biased - see aggregates)'
 
     fig = go.Figure()
 
     fig.add_trace(go.Bar(
         name='Food',
         x=labels,
-        y=food_means,
+        y=food_rates,
         marker_color='#22c79a',
-        text=[f'{m:.1f}' for m in food_means],
+        text=[f'{m:.1f}' for m in food_rates],
         textposition='outside',
     ))
 
     fig.add_trace(go.Bar(
         name='Poison',
         x=labels,
-        y=poison_means,
+        y=poison_rates,
         marker_color='#ff6b6b',
-        text=[f'{m:.1f}' for m in poison_means],
+        text=[f'{m:.1f}' for m in poison_rates],
         textposition='outside',
     ))
 
     fig.update_layout(
-        title=dict(text='Food vs Poison Consumption by Mode', x=0.5,
+        title=dict(text='Food vs Poison Consumption Rates by Mode', x=0.5,
                   font=dict(size=16)),
-        yaxis_title='Items Consumed per Episode',
+        yaxis_title=y_label,
         barmode='group',
         legend=dict(x=0.85, y=0.95),
         height=500,
@@ -159,8 +276,7 @@ def plot_consumption_comparison(data: dict[str, list[dict]], output_dir: Path):
     _apply_theme(fig)
 
     output_path = output_dir / 'consumption_comparison.png'
-    fig.write_image(str(output_path), scale=2)
-    print(f"Saved: {output_path}")
+    save_figure(fig, output_path)
 
 
 def plot_efficiency_comparison(
@@ -212,8 +328,7 @@ def plot_efficiency_comparison(
     _apply_theme(fig)
 
     output_path = output_dir / 'efficiency_comparison.png'
-    fig.write_image(str(output_path), scale=2)
-    print(f"Saved: {output_path}")
+    save_figure(fig, output_path)
 
 
 def plot_goodhart_summary(data: dict[str, list[dict]], output_dir: Path, aggregates: dict[str, dict] = None):
@@ -221,57 +336,74 @@ def plot_goodhart_summary(data: dict[str, list[dict]], output_dir: Path, aggrega
     Summary figure showing Goodhart's Law effect.
 
     Side-by-side comparison of ground_truth vs proxy on key metrics.
+    Uses aggregate statistics (not per-death averages) for accurate comparison.
     """
     if 'ground_truth' not in data or 'proxy' not in data:
         print("Skipping Goodhart summary: need both ground_truth and proxy modes")
         return
 
-    gt_data = data['ground_truth']
-    proxy_data = data['proxy']
-
-    # Use aggregate efficiency if available
-    if aggregates:
-        gt_agg_eff = aggregates.get('ground_truth', {}).get('overall_efficiency')
-        proxy_agg_eff = aggregates.get('proxy', {}).get('overall_efficiency')
-    else:
-        gt_agg_eff = None
-        proxy_agg_eff = None
-
+    # Define metrics to show - all use aggregates for accuracy
+    # (per-death averages are misleading due to different death rates)
     metrics = [
-        ('total_reward', 'Reward', 'Average Episode Reward'),
-        ('efficiency', 'Efficiency', 'Consumption Efficiency'),
-        ('poison_eaten', 'Poison', 'Poison Consumed'),
+        ('efficiency', 'Efficiency (%)', True),      # Key Goodhart metric
+        ('survival', 'Survival (steps)', False),     # How long agents live
+        ('poison_rate', 'Poison per 1k Steps', False),  # Poison consumption rate
     ]
 
     fig = make_subplots(
         rows=1, cols=3,
-        subplot_titles=[m[2] for m in metrics],
+        subplot_titles=[m[1] for m in metrics],
         horizontal_spacing=0.1,
     )
 
-    for i, (key, short_name, title) in enumerate(metrics, 1):
-        # Use aggregate efficiency if available (more accurate)
-        if key == 'efficiency' and gt_agg_eff is not None and proxy_agg_eff is not None:
-            gt_mean = gt_agg_eff * 100
-            proxy_mean = proxy_agg_eff * 100
-            gt_std, proxy_std = 0, 0  # No std for aggregate ratio
-        else:
-            gt_vals = [e[key] for e in gt_data]
-            proxy_vals = [e[key] for e in proxy_data]
-            if key == 'efficiency':
-                gt_vals = [v * 100 for v in gt_vals]
-                proxy_vals = [v * 100 for v in proxy_vals]
-            gt_mean, gt_std = np.mean(gt_vals), np.std(gt_vals)
-            proxy_mean, proxy_std = np.mean(proxy_vals), np.std(proxy_vals)
+    for i, (key, title, is_percent) in enumerate(metrics, 1):
+        if aggregates:
+            gt_agg = aggregates.get('ground_truth', {})
+            proxy_agg = aggregates.get('proxy', {})
 
-        suffix = '%' if key == 'efficiency' else ''
+            if key == 'efficiency':
+                gt_mean = gt_agg.get('overall_efficiency', 0) * 100
+                proxy_mean = proxy_agg.get('overall_efficiency', 0) * 100
+            elif key == 'survival':
+                gt_mean = gt_agg.get('survival_mean', 0)
+                proxy_mean = proxy_agg.get('survival_mean', 0)
+            elif key == 'poison_rate':
+                gt_mean = gt_agg.get('poison_per_1k_steps', 0)
+                proxy_mean = proxy_agg.get('poison_per_1k_steps', 0)
+            else:
+                gt_mean, proxy_mean = 0, 0
+        else:
+            # Fallback to per-death (less accurate)
+            gt_data_list = data['ground_truth']
+            proxy_data_list = data['proxy']
+
+            if key == 'efficiency':
+                gt_mean = np.mean([e['efficiency'] for e in gt_data_list]) * 100
+                proxy_mean = np.mean([e['efficiency'] for e in proxy_data_list]) * 100
+            elif key == 'survival':
+                gt_mean = np.mean([e.get('survival_steps', e.get('survival_time', 0)) for e in gt_data_list])
+                proxy_mean = np.mean([e.get('survival_steps', e.get('survival_time', 0)) for e in proxy_data_list])
+            elif key == 'poison_rate':
+                gt_mean = np.mean([e['poison_eaten'] for e in gt_data_list])
+                proxy_mean = np.mean([e['poison_eaten'] for e in proxy_data_list])
+            else:
+                gt_mean, proxy_mean = 0, 0
+
+        suffix = '%' if is_percent else ''
+
+        # Format numbers appropriately
+        if gt_mean >= 100 or proxy_mean >= 100:
+            text_fmt = [f'{gt_mean:.0f}{suffix}', f'{proxy_mean:.0f}{suffix}']
+        elif key == 'poison_rate':
+            text_fmt = [f'{gt_mean:.2f}', f'{proxy_mean:.1f}']
+        else:
+            text_fmt = [f'{gt_mean:.1f}{suffix}', f'{proxy_mean:.1f}{suffix}']
 
         fig.add_trace(go.Bar(
             x=['Ground Truth', 'Proxy'],
             y=[gt_mean, proxy_mean],
-            error_y=dict(type='data', array=[gt_std, proxy_std], visible=True) if gt_std > 0 else None,
             marker_color=['#22c79a', '#ff6b6b'],
-            text=[f'{gt_mean:.1f}{suffix}', f'{proxy_mean:.1f}{suffix}'],
+            text=text_fmt,
             textposition='outside',
             showlegend=False,
         ), row=1, col=i)
@@ -286,8 +418,7 @@ def plot_goodhart_summary(data: dict[str, list[dict]], output_dir: Path, aggrega
     _apply_theme(fig)
 
     output_path = output_dir / 'goodhart_summary.png'
-    fig.write_image(str(output_path), scale=2)
-    print(f"Saved: {output_path}")
+    save_figure(fig, output_path)
 
 
 # -----------------------------------------------------------------------------
@@ -298,17 +429,19 @@ def plot_efficiency_distribution(
     data: dict[str, list[dict]],
     output_dir: Path,
     plot_type: str = 'violin',
+    survivors: dict[str, list[dict]] = None,
 ) -> Path:
     """
     Distribution visualization for efficiency across modes.
 
     Shows the full distribution of efficiency values, not just mean/std.
-    This reveals important information about the spread and shape of outcomes.
+    Includes both deaths AND survivors for a complete picture.
 
     Args:
         data: Mode -> list of episode dicts with 'efficiency' key
         output_dir: Directory for output file
         plot_type: 'violin' (default), 'box', or 'histogram'
+        survivors: Optional survivor snapshots (right-censored data)
 
     Returns:
         Path to saved figure
@@ -320,7 +453,14 @@ def plot_efficiency_distribution(
     fig = go.Figure()
 
     for mode, label, color in zip(modes, labels, colors):
+        # Combine deaths and survivors for complete distribution
         efficiencies = [e['efficiency'] * 100 for e in data[mode]]
+        if survivors and mode in survivors:
+            survivor_effs = [s['efficiency'] * 100 for s in survivors[mode]]
+            efficiencies.extend(survivor_effs)
+
+        # Downsample for rendering performance (distribution shape preserved)
+        efficiencies = _downsample_for_distribution(efficiencies)
 
         if plot_type == 'violin':
             fig.add_trace(go.Violin(
@@ -356,9 +496,11 @@ def plot_efficiency_distribution(
         yaxis_title = 'Efficiency (%)'
         fig.update_layout(yaxis_range=[0, 105])
 
+    # Note if survivors included
+    title_suffix = ' (incl. survivors)' if survivors else ''
     fig.update_layout(
         title=dict(
-            text=f'Efficiency Distribution by Mode ({plot_type.title()} Plot)',
+            text=f'Efficiency Distribution by Mode ({plot_type.title()} Plot){title_suffix}',
             x=0.5,
             font=dict(size=16)
         ),
@@ -377,8 +519,7 @@ def plot_efficiency_distribution(
     _apply_theme(fig)
 
     output_path = output_dir / f'efficiency_distribution_{plot_type}.png'
-    fig.write_image(str(output_path), scale=2)
-    print(f"Saved: {output_path}")
+    save_figure(fig, output_path)
     return output_path
 
 
@@ -386,14 +527,20 @@ def plot_survival_distribution(
     data: dict[str, list[dict]],
     output_dir: Path,
     plot_type: str = 'violin',
+    survivors: dict[str, list[dict]] = None,
 ) -> Path:
     """
     Distribution visualization for survival steps across modes.
+
+    CRITICAL: Includes survivors (agents still alive at evaluation end).
+    Without survivors, ground_truth would show only the rare deaths,
+    completely missing the typical ~4000 step lifespans.
 
     Args:
         data: Mode -> list of episode dicts with 'survival_steps' key
         output_dir: Directory for output file
         plot_type: 'violin' (default), 'box', or 'histogram'
+        survivors: Optional survivor snapshots (right-censored data)
 
     Returns:
         Path to saved figure
@@ -413,8 +560,19 @@ def plot_survival_distribution(
             elif 'survival_time' in e:
                 survivals.append(e['survival_time'])
 
+        # Add survivors (they lived AT LEAST this long - right-censored)
+        if survivors and mode in survivors:
+            for s in survivors[mode]:
+                if 'survival_steps' in s:
+                    survivals.append(s['survival_steps'])
+                elif 'survival_time' in s:
+                    survivals.append(s['survival_time'])
+
         if not survivals:
             continue
+
+        # Downsample for rendering performance (distribution shape preserved)
+        survivals = _downsample_for_distribution(survivals)
 
         if plot_type == 'violin':
             fig.add_trace(go.Violin(
@@ -449,9 +607,11 @@ def plot_survival_distribution(
         xaxis_title = None
         yaxis_title = 'Survival (steps)'
 
+    # Note if survivors included
+    title_suffix = ' (incl. survivors)' if survivors else ''
     fig.update_layout(
         title=dict(
-            text=f'Survival Distribution by Mode ({plot_type.title()} Plot)',
+            text=f'Survival Distribution by Mode ({plot_type.title()} Plot){title_suffix}',
             x=0.5,
             font=dict(size=16)
         ),
@@ -465,8 +625,7 @@ def plot_survival_distribution(
     _apply_theme(fig)
 
     output_path = output_dir / f'survival_distribution_{plot_type}.png'
-    fig.write_image(str(output_path), scale=2)
-    print(f"Saved: {output_path}")
+    save_figure(fig, output_path)
     return output_path
 
 
@@ -475,30 +634,33 @@ def plot_multi_distribution(
     output_dir: Path,
     metrics: list[str] = None,
     plot_type: str = 'violin',
+    survivors: dict[str, list[dict]] = None,
 ) -> Path:
     """
     Multi-panel distribution plot for several metrics.
 
     Creates a subplot grid with one distribution per metric, allowing
-    side-by-side comparison of all key metrics at once.
+    side-by-side comparison of all key metrics at once. Includes survivors
+    for efficiency and survival metrics.
 
     Args:
         data: Mode -> list of episode dicts
         output_dir: Directory for output file
-        metrics: List of metric keys (default: ['efficiency', 'survival_steps', 'total_reward'])
+        metrics: List of metric keys (default: ['efficiency', 'survival_steps'])
         plot_type: 'violin' (default) or 'box'
+        survivors: Optional survivor snapshots (right-censored data)
 
     Returns:
         Path to saved figure
     """
+    # Don't include total_reward in multi-distribution - it's mode-specific
     if metrics is None:
-        metrics = ['efficiency', 'survival_steps', 'total_reward']
+        metrics = ['efficiency', 'survival_steps']
 
     metric_titles = {
         'efficiency': 'Efficiency',
         'survival_steps': 'Survival (steps)',
         'survival_time': 'Survival (steps)',
-        'total_reward': 'Reward',
         'food_eaten': 'Food Eaten',
         'poison_eaten': 'Poison Eaten',
     }
@@ -518,14 +680,25 @@ def plot_multi_distribution(
         for mode, label, color in zip(modes, labels, colors):
             # Handle metric aliases
             key = metric
-            if key not in data[mode][0] and key == 'survival_steps':
+            if data[mode] and key not in data[mode][0] and key == 'survival_steps':
                 key = 'survival_time'
 
             values = [e.get(key, 0) for e in data[mode]]
 
+            # Add survivors for efficiency and survival metrics
+            if survivors and mode in survivors and metric in ('efficiency', 'survival_steps', 'survival_time'):
+                surv_key = key
+                if survivors[mode] and surv_key not in survivors[mode][0] and surv_key == 'survival_steps':
+                    surv_key = 'survival_time'
+                survivor_vals = [s.get(surv_key, 0) for s in survivors[mode]]
+                values.extend(survivor_vals)
+
             # Scale efficiency to percentage
             if metric == 'efficiency':
                 values = [v * 100 for v in values]
+
+            # Downsample for rendering performance (distribution shape preserved)
+            values = _downsample_for_distribution(values)
 
             if plot_type == 'violin':
                 fig.add_trace(go.Violin(
@@ -563,8 +736,7 @@ def plot_multi_distribution(
     _apply_theme(fig)
 
     output_path = output_dir / f'multi_distribution_{plot_type}.png'
-    fig.write_image(str(output_path), scale=2)
-    print(f"Saved: {output_path}")
+    save_figure(fig, output_path)
     return output_path
 
 
@@ -723,51 +895,53 @@ def plot_efficiency_comparison_annotated(
     _apply_theme(fig)
 
     output_path = output_dir / 'efficiency_comparison_annotated.png'
-    fig.write_image(str(output_path), scale=2)
-    print(f"Saved: {output_path}")
+    save_figure(fig, output_path)
     return output_path
 
 
 def plot_goodhart_summary_annotated(
     data: dict[str, list[dict]],
     output_dir: Path,
+    aggregates: dict[str, dict] = None,
 ) -> Path:
     """
     Enhanced Goodhart summary with full statistical context.
 
     Shows side-by-side GT vs Proxy with:
-    - CI error bars
-    - P-value brackets
-    - Effect size labels
+    - Aggregate statistics (not per-death averages)
+    - CI error bars where available
     - Goodhart Failure Index prominently displayed
 
     Args:
         data: Mode -> list of episode dicts
         output_dir: Directory for output file
+        aggregates: Optional aggregate stats per mode
 
     Returns:
         Path to saved figure
     """
-    from goodharts.analysis.stats_helpers import (
-        compute_comparison, format_p_value, compute_goodhart_failure_index
-    )
+    from goodharts.analysis.stats_helpers import compute_goodhart_failure_index
 
     if 'ground_truth' not in data or 'proxy' not in data:
         print("Skipping annotated Goodhart summary: need both ground_truth and proxy modes")
         return None
 
-    gt_data = data['ground_truth']
-    proxy_data = data['proxy']
-
-    # Compute GFI
-    gt_eff = np.mean([e['efficiency'] for e in gt_data])
-    proxy_eff = np.mean([e['efficiency'] for e in proxy_data])
+    # Compute GFI from aggregates (more accurate) or fallback to per-death
+    if aggregates:
+        gt_agg = aggregates.get('ground_truth', {})
+        px_agg = aggregates.get('proxy', {})
+        gt_eff = gt_agg.get('overall_efficiency', 0)
+        proxy_eff = px_agg.get('overall_efficiency', 0)
+    else:
+        gt_eff = np.mean([e['efficiency'] for e in data['ground_truth']])
+        proxy_eff = np.mean([e['efficiency'] for e in data['proxy']])
     gfi = compute_goodhart_failure_index(gt_eff, proxy_eff)
 
+    # Metrics to display - all use aggregates for accuracy
     metrics = [
-        ('efficiency', 'Efficiency (%)', True),  # (key, title, scale_to_percent)
-        ('poison_eaten', 'Poison Consumed', False),
-        ('total_reward', 'Reward', False),
+        ('efficiency', 'Efficiency (%)', True),
+        ('survival', 'Survival (steps)', False),
+        ('poison_rate', 'Poison per 1k Steps', False),
     ]
 
     fig = make_subplots(
@@ -776,48 +950,76 @@ def plot_goodhart_summary_annotated(
         horizontal_spacing=0.12,
     )
 
-    for col, (key, title, scale) in enumerate(metrics, 1):
-        gt_vals = [e[key] for e in gt_data]
-        proxy_vals = [e[key] for e in proxy_data]
+    for col, (key, title, is_percent) in enumerate(metrics, 1):
+        # Get values and CIs from aggregates if available
+        if aggregates:
+            gt_agg = aggregates.get('ground_truth', {})
+            px_agg = aggregates.get('proxy', {})
 
-        if scale:
-            gt_vals = [v * 100 for v in gt_vals]
-            proxy_vals = [v * 100 for v in proxy_vals]
+            if key == 'efficiency':
+                gt_mean = gt_agg.get('overall_efficiency', 0) * 100
+                proxy_mean = px_agg.get('overall_efficiency', 0) * 100
+                gt_ci = gt_agg.get('efficiency_ci')
+                px_ci = px_agg.get('efficiency_ci')
+                if gt_ci:
+                    gt_err = gt_mean - gt_ci[0] * 100
+                    px_err = proxy_mean - px_ci[0] * 100
+                else:
+                    gt_err, px_err = 0, 0
+            elif key == 'survival':
+                gt_mean = gt_agg.get('survival_mean', 0)
+                proxy_mean = px_agg.get('survival_mean', 0)
+                gt_ci = gt_agg.get('survival_ci')
+                px_ci = px_agg.get('survival_ci')
+                if gt_ci:
+                    gt_err = gt_mean - gt_ci[0]
+                    px_err = proxy_mean - px_ci[0]
+                else:
+                    gt_err, px_err = 0, 0
+            elif key == 'poison_rate':
+                gt_mean = gt_agg.get('poison_per_1k_steps', 0)
+                proxy_mean = px_agg.get('poison_per_1k_steps', 0)
+                gt_err, px_err = 0, 0  # No CI for rates yet
+            else:
+                gt_mean, proxy_mean = 0, 0
+                gt_err, px_err = 0, 0
+        else:
+            # Fallback to per-death averages (less accurate)
+            gt_data_list = data['ground_truth']
+            px_data_list = data['proxy']
 
-        # Compute comparison
-        comparison = compute_comparison(gt_vals, proxy_vals, metric=key)
+            if key == 'efficiency':
+                gt_mean = np.mean([e['efficiency'] for e in gt_data_list]) * 100
+                proxy_mean = np.mean([e['efficiency'] for e in px_data_list]) * 100
+            elif key == 'survival':
+                gt_mean = np.mean([e.get('survival_steps', e.get('survival_time', 0)) for e in gt_data_list])
+                proxy_mean = np.mean([e.get('survival_steps', e.get('survival_time', 0)) for e in px_data_list])
+            elif key == 'poison_rate':
+                gt_mean = np.mean([e['poison_eaten'] for e in gt_data_list])
+                proxy_mean = np.mean([e['poison_eaten'] for e in px_data_list])
+            else:
+                gt_mean, proxy_mean = 0, 0
+            gt_err, px_err = 0, 0
 
-        gt_mean = np.mean(gt_vals)
-        proxy_mean = np.mean(proxy_vals)
+        suffix = '%' if is_percent else ''
 
-        # Use CI half-width for error bars
-        gt_ci = comparison.ci_a
-        proxy_ci = comparison.ci_b
-        gt_err = gt_mean - gt_ci[0]
-        proxy_err = proxy_mean - proxy_ci[0]
-
-        suffix = '%' if scale else ''
+        # Format numbers appropriately
+        if gt_mean >= 100 or proxy_mean >= 100:
+            text_fmt = [f'{gt_mean:.0f}{suffix}', f'{proxy_mean:.0f}{suffix}']
+        elif key == 'poison_rate':
+            text_fmt = [f'{gt_mean:.2f}', f'{proxy_mean:.1f}']
+        else:
+            text_fmt = [f'{gt_mean:.1f}{suffix}', f'{proxy_mean:.1f}{suffix}']
 
         fig.add_trace(go.Bar(
             x=['Ground Truth', 'Proxy'],
             y=[gt_mean, proxy_mean],
-            error_y=dict(type='data', array=[gt_err, proxy_err], visible=True),
+            error_y=dict(type='data', array=[gt_err, px_err], visible=True) if gt_err > 0 else None,
             marker_color=['#22c79a', '#ff6b6b'],
-            text=[f'{gt_mean:.1f}{suffix}', f'{proxy_mean:.1f}{suffix}'],
+            text=text_fmt,
             textposition='outside',
             showlegend=False,
         ), row=1, col=col)
-
-        # Add p-value annotation above the bars
-        y_max = max(gt_mean + gt_err, proxy_mean + proxy_err)
-        p_str = format_p_value(comparison.p_value)
-        fig.add_annotation(
-            x=0.5, y=y_max * 1.15,
-            text=f"p={p_str} {comparison.significance_stars}<br>d={comparison.cohens_d:.2f}",
-            showarrow=False,
-            font=dict(size=10, color=THEME['text']),
-            row=1, col=col,
-        )
 
     # Add GFI as a prominent title annotation
     fig.update_layout(
@@ -834,8 +1036,7 @@ def plot_goodhart_summary_annotated(
     _apply_theme(fig)
 
     output_path = output_dir / 'goodhart_summary_annotated.png'
-    fig.write_image(str(output_path), scale=2)
-    print(f"Saved: {output_path}")
+    save_figure(fig, output_path)
     return output_path
 
 
@@ -843,59 +1044,72 @@ def plot_goodhart_summary_annotated(
 # JSON data loading (for multi-run results)
 # -----------------------------------------------------------------------------
 
-def load_json_results(path: str) -> tuple[dict[str, list[dict]], dict[str, dict]]:
+def load_json_results(path: str) -> tuple[dict[str, list[dict]], dict[str, dict], dict[str, list[dict]]]:
     """
     Load evaluation results from JSON format.
 
     Handles both single-run and multi-run JSON structures.
-    Converts death events to the same format as CSV results.
+    Converts death events and survivors to the same format as CSV results.
 
     Args:
         path: Path to JSON file
 
     Returns:
-        Tuple of (deaths_by_mode, aggregates_by_mode)
+        Tuple of (deaths_by_mode, aggregates_by_mode, survivors_by_mode)
         - deaths_by_mode: Mode -> list of per-death dicts
         - aggregates_by_mode: Mode -> aggregate stats dict
+        - survivors_by_mode: Mode -> list of survivor snapshot dicts (censored data)
     """
     with open(path, 'r') as f:
         data = json.load(f)
 
     results = defaultdict(list)
     aggregates = {}
+    survivors = defaultdict(list)
 
-    def extract_death(death: dict) -> dict:
-        """Extract death data, computing efficiency from food/poison."""
-        food = death.get('food_eaten', 0)
-        poison = death.get('poison_eaten', 0)
+    def extract_event(event: dict, is_survivor: bool = False) -> dict:
+        """Extract death/survivor data, computing efficiency from food/poison."""
+        food = event.get('food_eaten', 0)
+        poison = event.get('poison_eaten', 0)
         total = food + poison
         # Compute efficiency (property not serialized to JSON)
         efficiency = food / total if total > 0 else 1.0
         return {
-            'total_reward': death.get('total_reward', 0),
+            'total_reward': event.get('total_reward', 0),
             'food_eaten': food,
             'poison_eaten': poison,
-            'survival_steps': death.get('survival_time', 0),
+            'survival_steps': event.get('survival_time', 0),
             'efficiency': efficiency,
+            'censored': is_survivor,  # True if still alive (lower bound data)
         }
 
     # Handle multi-mode structure (from scripts/evaluate.py)
     if 'results' in data:
         for mode, mode_data in data['results'].items():
+            # Always create a results entry for the mode (even if 0 deaths)
+            # This ensures modes with only survivors still appear
+            if mode not in results:
+                results[mode] = []
             if 'deaths' in mode_data:
                 for death in mode_data['deaths']:
-                    results[mode].append(extract_death(death))
+                    results[mode].append(extract_event(death, is_survivor=False))
+            if 'survivors' in mode_data:
+                for survivor in mode_data['survivors']:
+                    survivors[mode].append(extract_event(survivor, is_survivor=True))
             if 'aggregates' in mode_data:
                 aggregates[mode] = mode_data['aggregates']
     # Handle single-mode structure
     elif 'deaths' in data:
         mode = data.get('mode', 'unknown')
         for death in data['deaths']:
-            results[mode].append(extract_death(death))
+            results[mode].append(extract_event(death, is_survivor=False))
+        if 'survivors' in data:
+            for survivor in data['survivors']:
+                survivors[mode].append(extract_event(survivor, is_survivor=True))
         if 'aggregates' in data:
             aggregates[mode] = data['aggregates']
 
-    return dict(results), aggregates
+    return dict(results), aggregates, dict(survivors)
 
 
 def generate_all_figures(
@@ -904,15 +1118,18 @@ def generate_all_figures(
     annotated: bool = True,
     distributions: bool = True,
     aggregates: dict[str, dict] = None,
+    survivors: dict[str, list[dict]] = None,
 ) -> list[Path]:
     """
     Generate all standard figures for a Goodhart experiment.
 
     Args:
-        data: Mode -> list of episode dicts
+        data: Mode -> list of episode/death dicts
         output_dir: Directory for figures
         annotated: Include annotated plots with statistics
         distributions: Include distribution plots
+        aggregates: Optional aggregate stats per mode
+        survivors: Optional survivor snapshot dicts per mode (for distributions)
 
     Returns:
         List of paths to generated figures
@@ -921,10 +1138,10 @@ def generate_all_figures(
     paths = []
 
     # Basic plots
-    plot_reward_comparison(data, output_dir)
-    paths.append(output_dir / 'reward_comparison.png')
+    plot_survival_comparison(data, output_dir, aggregates=aggregates)
+    paths.append(output_dir / 'survival_comparison.png')
 
-    plot_consumption_comparison(data, output_dir)
+    plot_consumption_comparison(data, output_dir, aggregates=aggregates)
     paths.append(output_dir / 'consumption_comparison.png')
 
     plot_efficiency_comparison(data, output_dir, aggregates=aggregates)
@@ -939,20 +1156,20 @@ def generate_all_figures(
         if path:
             paths.append(path)
 
-        path = plot_goodhart_summary_annotated(data, output_dir)
+        path = plot_goodhart_summary_annotated(data, output_dir, aggregates=aggregates)
         if path:
             paths.append(path)
 
-    # Distribution plots
+    # Distribution plots (include survivors for complete picture)
     if distributions:
         for plot_type in ['violin', 'box']:
-            path = plot_efficiency_distribution(data, output_dir, plot_type)
+            path = plot_efficiency_distribution(data, output_dir, plot_type, survivors=survivors)
             paths.append(path)
 
-            path = plot_survival_distribution(data, output_dir, plot_type)
+            path = plot_survival_distribution(data, output_dir, plot_type, survivors=survivors)
             paths.append(path)
 
-        path = plot_multi_distribution(data, output_dir)
+        path = plot_multi_distribution(data, output_dir, survivors=survivors)
         paths.append(path)
 
     return paths
@@ -984,14 +1201,16 @@ def main():
 
     # Detect file format
     aggregates = None
+    survivors = None
     if args.input.endswith('.json'):
-        data, aggregates = load_json_results(args.input)
+        data, aggregates, survivors = load_json_results(args.input)
     else:
         data = load_results(args.input)
 
     print(f"Found {len(data)} modes: {list(data.keys())}")
     for mode, episodes in data.items():
-        print(f"  {mode}: {len(episodes)} episodes/deaths")
+        n_survivors = len(survivors.get(mode, [])) if survivors else 0
+        print(f"  {mode}: {len(episodes)} deaths, {n_survivors} survivors")
     print()
 
     # Determine what to generate
@@ -999,7 +1218,10 @@ def main():
     distributions = args.distributions or args.all
 
     # Generate figures
-    paths = generate_all_figures(data, output_dir, annotated, distributions, aggregates=aggregates)
+    paths = generate_all_figures(
+        data, output_dir, annotated, distributions,
+        aggregates=aggregates, survivors=survivors
+    )
 
     print(f"\nGenerated {len(paths)} figures in {output_dir}/")
 

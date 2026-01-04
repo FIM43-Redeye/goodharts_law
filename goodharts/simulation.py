@@ -15,6 +15,7 @@ from goodharts.behaviors.utils import get_behavior_name
 from goodharts.utils.logging_config import get_logger
 from goodharts.utils.device import get_device
 from goodharts.modes import ObservationSpec, get_mode_for_requirement
+from goodharts.behaviors.action_space import action_to_index
 
 
 logger = get_logger("simulation")
@@ -33,7 +34,6 @@ class AgentWrapper:
         self.id = id(self)
         self.sight_radius = vec_env.view_radius
         self.death_reason = None
-        self.suspicion_score = 0
         self.steps_alive = 0
         
         # Backward compatibility
@@ -175,7 +175,6 @@ class Simulation:
                 dx, dy = agent.behavior.decide_action(agent, obs_batch[i])
                 
                 # Convert (dx, dy) to action index for VecEnv
-                from goodharts.behaviors.action_space import action_to_index
                 action_idx = action_to_index(dx, dy)
                 actions.append(action_idx)
             except Exception as e:

@@ -1,8 +1,8 @@
 """
-Shared Plotly/Dash components for visualization.
+Shared visualization components.
 
-Provides consistent theming, colors, and helper functions
-across brain view and parallel stats dashboards.
+Provides consistent theming and colors across visualizations.
+Plotly/Dash-specific functions are used by parallel_stats dashboard.
 """
 import plotly.graph_objects as go
 
@@ -87,39 +87,3 @@ def apply_dark_theme(fig: go.Figure) -> go.Figure:
     return fig
 
 
-def create_action_bar_figure(
-    probs: list[float],
-    labels: list[str],
-    chosen_idx: int | None = None,
-) -> go.Figure:
-    """
-    Create horizontal bar chart for action probabilities.
-
-    Args:
-        probs: Probability for each action
-        labels: Label for each action
-        chosen_idx: Index of chosen action (highlighted in red)
-
-    Returns:
-        Styled Plotly figure
-    """
-    if chosen_idx is None:
-        chosen_idx = max(range(len(probs)), key=lambda i: probs[i])
-
-    colors = ['#ff6b6b' if i == chosen_idx else '#00d9ff' for i in range(len(probs))]
-
-    fig = go.Figure(data=go.Bar(
-        y=labels,
-        x=probs,
-        orientation='h',
-        marker_color=colors,
-    ))
-
-    fig.update_layout(
-        title='Action Probabilities',
-        xaxis_title='Probability',
-        xaxis=dict(range=[0, 1]),
-        height=300,
-    )
-
-    return apply_dark_theme(fig)

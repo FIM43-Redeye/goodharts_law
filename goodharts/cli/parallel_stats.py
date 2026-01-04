@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Parallel Stats: Multi-environment statistics dashboard.
 
@@ -6,17 +5,13 @@ Runs many environments in parallel to compare training modes side-by-side.
 Demonstrates Goodhart's Law through statistical divergence.
 
 Usage:
-    python scripts/parallel_stats.py                    # All modes, default envs
-    python scripts/parallel_stats.py --modes ground_truth,proxy --envs 256
-    python scripts/parallel_stats.py --timesteps 50000 --checkpoint-interval 100
+    python main.py parallel-stats                    # All modes, default envs
+    python main.py parallel-stats --modes ground_truth,proxy --envs 256
+    python main.py parallel-stats --timesteps 50000 --checkpoint-interval 100
 """
 import argparse
-import sys
 import threading
 from pathlib import Path
-
-# Ensure project root is in path
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 

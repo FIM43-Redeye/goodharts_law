@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Comprehensive testing for trained Goodhart agents.
 
@@ -16,16 +15,15 @@ and unified report generation.
 
 Usage:
     # Single evaluation
-    python scripts/evaluate.py --mode ground_truth --timesteps 100000
-    python scripts/evaluate.py --mode all --dashboard
+    python main.py evaluate --mode ground_truth --timesteps 100000
+    python main.py evaluate --mode all --dashboard
 
     # Multi-run with statistical aggregation
-    python scripts/evaluate.py --mode all --runs 5 --base-seed 42
+    python main.py evaluate --mode all --runs 5 --base-seed 42
 
     # Full report with figures and markdown
-    python scripts/evaluate.py --full-report --runs 5 --timesteps 50000
+    python main.py evaluate --full-report --runs 5 --timesteps 50000
 """
-
 import argparse
 import json
 import os
@@ -35,9 +33,6 @@ import queue
 import time
 from datetime import datetime
 from pathlib import Path
-
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 
@@ -360,6 +355,12 @@ def aggregate_multi_run_results(
                     death
                     for result in runs
                     for death in result.get('deaths', [])
+                ],
+                # Flatten all survivors from all runs (critical for ground_truth)
+                'survivors': [
+                    survivor
+                    for result in runs
+                    for survivor in result.get('survivors', [])
                 ],
             }
 

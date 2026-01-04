@@ -1,117 +1,126 @@
 #!/usr/bin/env python3
 """
-Goodhart's Law Simulation - Entry Point
+Goodhart's Law Simulation - Unified CLI
 
-Dispatcher to visualization dashboards.
+Entry point for all simulation tools: training, evaluation, visualization, and reporting.
 
 Usage:
-    python main.py --brain-view -m ground_truth    # Neural network visualization
-    python main.py --parallel-stats                 # Multi-mode comparison
-    python main.py --help                           # Show all options
+    python main.py train --mode ground_truth --updates 128
+    python main.py evaluate --mode all --runs 5
+    python main.py brain-view -m ground_truth
+    python main.py parallel-stats
+    python main.py report
+    python main.py --help
 """
-import argparse
-import subprocess
 import sys
-from pathlib import Path
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Goodhart's Law Simulation",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-Visualization Modes:
-  --brain-view        Single-agent neural network visualization
-                      Shows: full grid, agent view, layer activations, actions
+    # Handle no arguments
+    if len(sys.argv) < 2:
+        _print_banner()
+        return 0
 
-  --parallel-stats    Multi-environment statistics dashboard
-                      Shows: survival curves, food ratio, deaths per mode
+    # Extract command (first positional arg)
+    command = sys.argv[1]
 
-Examples:
-  %(prog)s --brain-view -m ground_truth
-  %(prog)s --brain-view -m proxy --speed 100
-  %(prog)s --parallel-stats --modes ground_truth,proxy --envs 256
-  %(prog)s --parallel-stats --timesteps 50000
-        ''',
-    )
+    # Handle global --help
+    if command in ('-h', '--help'):
+        _print_help()
+        return 0
 
-    # Mode selection
-    mode_group = parser.add_argument_group('Visualization Mode')
-    mode_group.add_argument('--brain-view', action='store_true',
-                            help='Launch brain view dashboard')
-    mode_group.add_argument('--parallel-stats', action='store_true',
-                            help='Launch parallel stats dashboard')
+    # Pass remaining args (including --help) to subcommand
+    remaining = sys.argv[2:]
 
-    # Brain view options
-    bv_group = parser.add_argument_group('Brain View Options')
-    bv_group.add_argument('-m', '--mode', type=str, default='ground_truth',
-                          help='Training mode (default: ground_truth)')
-    bv_group.add_argument('--model', type=str, default=None,
-                          help='Custom model path')
-    bv_group.add_argument('--speed', type=int, default=50,
-                          help='Step interval in ms (default: 50)')
-    bv_group.add_argument('--steps', type=int, default=None,
-                          help='Run for N steps then exit')
+    # Dispatch to appropriate module
+    if command == 'train':
+        sys.argv = ['train_ppo'] + remaining
+        from goodharts.training.train_ppo import main as train_main
+        return train_main()
 
-    # Parallel stats options
-    ps_group = parser.add_argument_group('Parallel Stats Options')
-    ps_group.add_argument('--modes', type=str, default='all',
-                          help='Comma-separated modes or "all"')
-    ps_group.add_argument('--envs', type=int, default=192,
-                          help='Environments per mode (default: 192)')
-    ps_group.add_argument('--timesteps', type=int, default=10000,
-                          help='Steps per environment (default: 10000)')
+    elif command == 'evaluate':
+        sys.argv = ['evaluate'] + remaining
+        from goodharts.cli.evaluate import main as evaluate_main
+        return evaluate_main()
 
-    args = parser.parse_args()
+    elif command == 'brain-view':
+        sys.argv = ['brain-view'] + remaining
+        from goodharts.cli.brain_view import main as brain_view_main
+        return brain_view_main()
 
-    scripts_dir = Path(__file__).parent / 'scripts'
+    elif command == 'parallel-stats':
+        sys.argv = ['parallel-stats'] + remaining
+        from goodharts.cli.parallel_stats import main as parallel_stats_main
+        return parallel_stats_main()
 
-    if args.brain_view:
-        # Launch brain view
-        cmd = [sys.executable, str(scripts_dir / 'brain_view.py'),
-               '-m', args.mode,
-               '--speed', str(args.speed)]
-        if args.model:
-            cmd.extend(['--model', args.model])
-        if args.steps:
-            cmd.extend(['--steps', str(args.steps)])
-
-        print(f"Launching brain view: {args.mode}")
-        return subprocess.call(cmd)
-
-    elif args.parallel_stats:
-        # Launch parallel stats
-        cmd = [sys.executable, str(scripts_dir / 'parallel_stats.py'),
-               '--modes', args.modes,
-               '--envs', str(args.envs),
-               '--timesteps', str(args.timesteps)]
-
-        print(f"Launching parallel stats")
-        return subprocess.call(cmd)
+    elif command == 'report':
+        sys.argv = ['report'] + remaining
+        from goodharts.cli.report import main as report_main
+        return report_main()
 
     else:
-        # No mode selected - show help
-        print()
-        print("=" * 60)
-        print("  GOODHART'S LAW SIMULATION")
-        print("  'When a measure becomes a target,")
-        print("   it ceases to be a good measure.'")
-        print("=" * 60)
-        print()
-        print("Choose a visualization mode:")
-        print()
-        print("  --brain-view        Single-agent neural network viz")
-        print("  --parallel-stats    Multi-mode statistics comparison")
-        print()
-        print("Examples:")
-        print("  python main.py --brain-view -m ground_truth")
-        print("  python main.py --brain-view -m proxy")
-        print("  python main.py --parallel-stats")
-        print("  python main.py --parallel-stats --modes ground_truth,proxy")
-        print()
-        print("Use --help for all options.")
-        print()
-        return 0
+        print(f"Unknown command: {command}")
+        print("Use 'python main.py --help' for available commands.")
+        return 1
+
+
+def _print_banner():
+    """Print welcome banner with quick-start guide."""
+    print()
+    print("=" * 64)
+    print("  GOODHART'S LAW SIMULATION")
+    print("  'When a measure becomes a target,")
+    print("   it ceases to be a good measure.'")
+    print("=" * 64)
+    print()
+    print("Quick Start:")
+    print()
+    print("  1. Train agents on different modes:")
+    print("     python main.py train --mode ground_truth --updates 128")
+    print("     python main.py train --mode proxy --updates 128")
+    print()
+    print("  2. Evaluate and compare:")
+    print("     python main.py evaluate --mode all --runs 5 --full-report")
+    print()
+    print("  3. Visualize (requires trained models):")
+    print("     python main.py brain-view -m ground_truth")
+    print("     python main.py parallel-stats")
+    print()
+    print("Commands:")
+    print("  train           Train PPO agents")
+    print("  evaluate        Evaluate with statistics")
+    print("  brain-view      Neural network visualization")
+    print("  parallel-stats  Multi-mode statistics")
+    print("  report          Regenerate reports")
+    print()
+    print("Use 'python main.py <command> --help' for command options.")
+    print()
+
+
+def _print_help():
+    """Print detailed help message."""
+    print("usage: python main.py <command> [options]")
+    print()
+    print("Goodhart's Law Simulation - AI Safety Demonstration")
+    print()
+    print("Commands:")
+    print("  train           Train PPO agents on different observation modes")
+    print("  evaluate        Evaluate trained models with statistical analysis")
+    print("  brain-view      Single-agent neural network visualization")
+    print("  parallel-stats  Multi-environment statistics dashboard")
+    print("  report          Regenerate report from saved evaluation results")
+    print()
+    print("Examples:")
+    print("  python main.py train --mode ground_truth --updates 128")
+    print("  python main.py train --mode all --dashboard")
+    print("  python main.py evaluate --mode all --runs 5 --full-report")
+    print("  python main.py brain-view -m proxy --speed 100")
+    print("  python main.py parallel-stats --modes ground_truth,proxy --envs 256")
+    print("  python main.py report --input generated/reports/latest/results.json")
+    print()
+    print("For command-specific help:")
+    print("  python main.py <command> --help")
+    print()
 
 
 if __name__ == '__main__':

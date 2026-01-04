@@ -216,7 +216,7 @@ Complete reproduction from scratch:
 
 ```bash
 # 1. Train models for all modes (takes ~30 minutes with GPU)
-python -m goodharts.training.train_ppo --mode all --timesteps 500000
+python -m goodharts.training.train_ppo --mode all --updates 1024
 
 # 2. Run comprehensive evaluation with multiple seeds
 python scripts/evaluate.py --mode all --runs 3 --base-seed 42 --timesteps 50000

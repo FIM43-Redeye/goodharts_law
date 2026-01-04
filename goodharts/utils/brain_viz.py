@@ -157,26 +157,58 @@ class BrainVisualizer:
     
     def _linear_to_display(self, act: torch.Tensor) -> np.ndarray:
         """
-        Convert linear activation to 2D square-ish tile.
-        
-        Previous 1xN strip was too hard to read.
-        Now reshapes to (S, S) with padding.
+        Convert linear activation to 2D display.
+
+        Special cases:
+        - 8 elements: Compass layout for 8-directional actions
+        - Other: Square-ish tile with padding
         """
         flat = act.view(-1).numpy()
         n = len(flat)
-        
-        # Try to find semi-matching factors for cleaner rectangle?
-        # For now, generic square is robust.
+
+        # Special case: 8-directional action space as compass
+        if n == 8:
+            return self._action_to_compass(flat)
+
+        # Generic square layout
         side = int(np.ceil(np.sqrt(n)))
-        
-        # If perfect square, just reshape
+
         if side * side == n:
             return flat.reshape(side, side)
-            
-        # Else pad
+
         padded = np.zeros(side * side)
         padded[:n] = flat
         return padded.reshape(side, side)
+
+    def _action_to_compass(self, values: np.ndarray) -> np.ndarray:
+        """
+        Arrange 8-directional action values as a compass rose.
+
+        Input indices: [N, NE, E, SE, S, SW, W, NW] (standard 8-action space)
+
+        Output 3x3 masked array:
+            NW  N  NE
+            W   X  E
+            SW  S  SE
+
+        Center cell is masked (not rendered at all).
+        """
+        # Map from action index to (row, col) in 3x3 grid
+        # Actions: 0=N, 1=NE, 2=E, 3=SE, 4=S, 5=SW, 6=W, 7=NW
+        compass = np.zeros((3, 3))
+        compass[0, 1] = values[0]  # N
+        compass[0, 2] = values[1]  # NE
+        compass[1, 2] = values[2]  # E
+        compass[2, 2] = values[3]  # SE
+        compass[2, 1] = values[4]  # S
+        compass[2, 0] = values[5]  # SW
+        compass[1, 0] = values[6]  # W
+        compass[0, 0] = values[7]  # NW
+
+        # Mask the center cell so it's not rendered
+        mask = np.zeros((3, 3), dtype=bool)
+        mask[1, 1] = True
+        return np.ma.array(compass, mask=mask)
     
     def _generic_to_display(self, act: torch.Tensor) -> np.ndarray:
         """Fallback for unknown layer types."""
