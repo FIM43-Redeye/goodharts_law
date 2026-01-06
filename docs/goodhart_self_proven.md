@@ -1,23 +1,12 @@
-# The Day We Proved Goodhart's Law (On Ourselves)
+# The Day We Proved Goodhart's Law On Ourselves
 
-> "When a measure becomes a target, it ceases to be a good measure." — Goodhart (again)
-
-**Date:** 2025-12-12
+On December 12th, 2025, with the help of Google's experimental Antigravity IDE, I conclusively demonstrated that I am also not immune to Goodhart's Law, and by extension demonstrated that computers and AI systems are *exceptionally* not-immune to Goodhart's Law.
 
 ## What Happened
 
-We set out to build a project demonstrating Goodhart's Law through agent simulations.
-We accidentally demonstrated it through our own development process.
+While designing the agent's *core* reward function, we initially tried to use behavior cloning as a starting point - copy the expert, and for the proxy function, copy the proxy expert. In hindsight, this was a flawed choice from the beginning, but pursuing it to functionality still demonstrates a point.
 
-## The Irony
-
-| What We Did | The Goodhart Trap |
-|-------------|-------------------|
-| Used **behavior cloning** (copy the expert) | "Expert mimicry" became our proxy for "good agent" |
-| OmniscientSeeker avoids poison perfectly | Training data had **zero poison examples** |
-| CNN learned to go toward food | CNN had **no idea** what to do with poison |
-| Added synthetic poison samples as a patch | Band-aid on a fundamentally misaligned objective |
-| Still got worse survival than hardcoded | **Proxy optimization failed to generalize** |
+The irony is palpable. Copying the expert led to the expert becoming the reward signal, the training data had no examples of poison, and the CNN wasn't actually learning how to properly go towards food in the first place. It was only learning to replicate the expert's exact motions, which is a much harder optimization problem than consuming food and rejecting poison. Synthetic poison samples failed to patch the issue, and survival rates remained extremely low. Adding patches to a fundamentally unfit objective were never going to solve the core problem. *Optimizing to copy something never generalizes.*
 
 ## The Numbers
 
@@ -27,39 +16,22 @@ HARDCODED EXPERTS:
   ProxySeeker:      43% survival, 3.7 poison deaths
 
 BEHAVIOR-CLONED CNNs:
-  Learned GT CNN:   23% survival, 1.7 poison deaths  ← WORSE than hardcoded!
+  Learned GT CNN:   23% survival, 1.7 poison deaths
   Learned Proxy:    20% survival, 1.7 poison deaths
 
-The student (CNN) failed to surpass the teacher (heuristic)
-because we optimized for COPYING, not for SURVIVING.
+Optimizing for COPYING rather than SURVIVING completely precluded any true learning whatsoever. The model could not grow. With no meaningful reward signal in response to its actions, the model learned nothing at all.
 ```
-
-## The Lesson
-
-**Behavior cloning optimizes for "do what the expert did"**
-...which is a PROXY for "be good at the task."
-
-When we discovered gaps (poison avoidance), we patched them with synthetic data.
-But the fundamental misalignment remained: we were teaching imitation, not survival.
 
 ## The Pivot
 
-The solution was **true reinforcement learning.**
+The solution, obvious as it is in hindsight, was shifting to proper RL. No expert means no expert biases, reward is linked to actual survival outcomes, agents discover strategies through trial and error, and optimization pressure bears down on the core problem instead of an inscrutable and invisible guide. The better the RL system became, the better the models became at their jobs.
 
-- No expert to copy → no expert biases to inherit
-- Reward = actual survival outcomes (energy delta)
-- Agents discover strategies through trial and error
-- Emergence, not prescription
+## Why This Matters
 
-## Meta-Commentary
+This is frankly the best demonstration of Goodhart's Law I could ask for.
 
-This experience demonstrates Goodhart's Law in practice.
-
-Real-world demonstrations of phenomena like Goodhart's Law are often either intentional or so trivial as to be undetectable. The fact that we actually *fell into the same trap while developing actual code* is the best demonstration I can think of for the importance of this work.
-
-That recognition — "wait, we're doing the thing we're studying" — is exactly the kind of insight that AI safety work aims to surface.
+Real-world demonstrations of phenomena like Goodhart's Law are often either trivial, obvious, or entirely intentional. Actually *falling into the same trap in actual development* is everything one could want. The ability to recognize a failure mode under study *in oneself* is one of the best tools out there for AI safety work.
 
 ---
 
-*Preserved as `behavior_cloning_checkpoint` for posterity.*
-*All code as of this commit demonstrates the failure mode.*
+We preserved the faulty code in the `behavior_cloning_checkpoint` checkpoint. This code is extremely messy and implements a far smaller CNN than the current one, so this failure mode in behavior cloning is not validated with the BaseCNN.

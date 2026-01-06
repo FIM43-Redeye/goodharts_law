@@ -23,7 +23,6 @@ import numpy as np
 from goodharts.analysis.stats_helpers import (
     StatisticalComparison,
     compute_comparison,
-    compute_goodhart_failure_index,
     format_p_value,
 )
 from goodharts.analysis.power import power_analysis, achieved_power
@@ -190,22 +189,25 @@ class ReportGenerator:
         """Generate executive summary section."""
         lines = ['## Executive Summary', '']
 
-        # Goodhart Failure Index - use aggregate efficiency from results (not per-death mean)
+        # Survival Collapse Ratio - the real measure of catastrophic failure
         results = self.data.get('results', {})
         gt_agg = results.get('ground_truth', {}).get('aggregates', {})
         px_agg = results.get('proxy', {}).get('aggregates', {})
 
         if gt_agg and px_agg:
-            gt_eff = gt_agg.get('overall_efficiency', 0)
-            px_eff = px_agg.get('overall_efficiency', 0)
-            gfi = compute_goodhart_failure_index(gt_eff, px_eff)
+            gt_surv = gt_agg.get('survival_mean', 1)
+            px_surv = px_agg.get('survival_mean', 1)
+            scr = gt_surv / px_surv if px_surv > 0 else float('inf')
 
-            lines.append(f'**Goodhart Failure Index: {gfi:.1%}**')
+            px_eff = px_agg.get('overall_efficiency', 0)
+            worse_than_random = px_eff < 0.5
+
+            lines.append(f'**Survival Collapse Ratio: {scr:.0f}x**')
             lines.append('')
-            lines.append('> The Goodhart Failure Index measures how much performance '
-                        'degrades when optimizing for a proxy metric instead of the '
-                        'true objective. A GFI of 0% indicates no failure; 100% indicates '
-                        'complete failure.')
+            lines.append(f'> Ground truth agents survive {scr:.0f}x longer than proxy agents. '
+                        f'Proxy efficiency ({px_eff:.1%}) is {"below" if worse_than_random else "above"} '
+                        f'random chance (50%), meaning proxy optimization {"anti-correlates" if worse_than_random else "weakly correlates"} '
+                        f'with the true objective.')
             lines.append('')
 
         # Summary table - show both aggregate and per-agent efficiency
@@ -385,10 +387,11 @@ class ReportGenerator:
         lines.append('### Key Metrics')
         lines.append('')
         lines.append('- **Efficiency**: Food consumed / Total consumed. Measures how well '
-                    'agents distinguish food from poison.')
+                    'agents distinguish food from poison. Below 50% means worse than random.')
         lines.append('- **Survival Time**: Steps lived before each death. Higher is better.')
         lines.append('- **Deaths per 1000 Steps**: Population death rate. Lower is better.')
-        lines.append('- **Goodhart Failure Index (GFI)**: (GT_efficiency - Proxy_efficiency) / GT_efficiency')
+        lines.append('- **Survival Collapse Ratio (SCR)**: GT_survival / Proxy_survival. '
+                    'Captures the magnitude of catastrophic failure better than efficiency gaps.')
         lines.append('')
 
         lines.append('### Statistical Methods')
@@ -481,17 +484,17 @@ class ReportGenerator:
         lines = []
         results = self.data.get('results', {})
 
-        # Goodhart Failure Index header - use aggregate efficiency
+        # Survival Collapse Ratio header
         gt_agg = results.get('ground_truth', {}).get('aggregates', {})
         px_agg = results.get('proxy', {}).get('aggregates', {})
 
         if gt_agg and px_agg:
-            gt_eff = gt_agg.get('overall_efficiency', 0)
-            px_eff = px_agg.get('overall_efficiency', 0)
-            gfi = compute_goodhart_failure_index(gt_eff, px_eff)
+            gt_surv = gt_agg.get('survival_mean', 1)
+            px_surv = px_agg.get('survival_mean', 1)
+            scr = gt_surv / px_surv if px_surv > 0 else float('inf')
 
             lines.append('=' * 80)
-            lines.append(f"{'GOODHART FAILURE INDEX: ' + f'{gfi:.1%}':^80}")
+            lines.append(f"{'SURVIVAL COLLAPSE RATIO: ' + f'{scr:.0f}x':^80}")
             lines.append('=' * 80)
         else:
             lines.append('=' * 80)

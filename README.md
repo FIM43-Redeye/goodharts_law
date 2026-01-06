@@ -2,7 +2,7 @@
 
 > "When a measure becomes a target, it ceases to be a good measure." - Charles Goodhart, paraphrased
 
-This project is an empirical demonstration of Goodhart's law in reinforcement learning. Agents navigate a 2D grid world with the goal of increasing their energy. **Ground truth** agents see real cell types and thrive. **Blinded** agents see only interestingness and fail to thrive. **Proxy** agents rewarded on interestingness rather than energy rapidly self-destruct.
+This project is an empirical demonstration of Goodhart's Law in reinforcement learning. Agents navigate a 2D grid world with the goal of increasing their energy. **Ground truth** agents see real cell types and thrive. **Blinded** agents see only interestingness and fail to thrive. **Proxy** agents rewarded on interestingness rather than energy rapidly self-destruct.
 
 Optimizing for proxy metrics nearly always leads to alignment failures. Whether the proxy is reasonable or unreasonable, alignment still fails.
 
@@ -56,7 +56,7 @@ The efficiency gap of 54.7% appears to be moderate, but the death count speaks f
 - [Evaluation](#evaluation)
 - [Architecture Deep Dive](#architecture-deep-dive)
 - [AI Safety Connection](#ai-safety-connection)
-- [Roadmap](#roadmap)
+- [Future Directions](#future-directions)
 - [Disclosure](#disclosure)
 
 ---
@@ -237,12 +237,9 @@ python -m goodharts.training.train_ppo --n-envs 128 --updates 128
 
 ### Training Performance
 
-With the GPU-native vectorized environment and optimized PPO:
-- GPU training is 10-30x faster than CPU
-- Exact throughput varies by configuration (n_envs, compile settings) and hardware
-- Use `--benchmark` flag to measure throughput on your system
+The training pipeline evolved from ~50 steps/second (naive Python) to ~25,000 steps/second through GPU-native environment design, async logging, and torch.compile optimization. Key insight: the environment itself must live on GPU, not just the model.
 
-Note: Throughput depends heavily on hardware and settings. On an AMD Radeon RX 7700S with ROCm 7.10, typical throughput is 15-25k steps/second with torch.compile enabled.
+Use `--benchmark` to measure throughput on your system. Results vary by hardware and settings.
 
 ### Training Output
 
@@ -418,13 +415,13 @@ During development, we initially used behavior cloning, training CNNs to mimic e
 - The CNN had zero training examples of what to do about poison
 - We were optimizing for **imitation**, not **survival**
 
-This accidental demonstration of Goodhart's law is documented in `docs/goodhart_self_proven.md`.
+This accidental demonstration of Goodhart's Law is documented in `docs/goodhart_self_proven.md`.
 
 ---
 
 ## Limitations
 
-This project demonstrates Goodhart's law in a simplified and heavily controlled setting. We acknowledge the following limitations.
+This project demonstrates Goodhart's Law in a simplified and heavily controlled setting. We acknowledge the following limitations.
 
 ### Intentional Simplifications
 
@@ -444,7 +441,7 @@ This project demonstrates Goodhart's law in a simplified and heavily controlled 
 
 ### What This Does Demonstrate
 
-Even with limitations, this project empirically validates the core mechanism of Goodhart's law.
+Even with limitations, this project empirically validates the core mechanism of Goodhart's Law.
 - Optimizing a measurable proxy (interestingness) produces behavior that anti-correlates with the true objective (survival) unless the proxy is extremely strongly correlated to the true objective
 - The failure is quantifiable to an absurd degree: Worse-than-random proxy efficiency, 6-order-of-magnitude death rate increase
 - Control conditions (ground_truth_blinded) isolate the effect of information vs reward - a model with bad information but good rewards will either learn to perform or fail gracefully
@@ -454,33 +451,9 @@ The claim is narrowed by these limitations, but the core thesis is not. **Optimi
 
 ---
 
-## Roadmap
+## Future Directions
 
-### Phase 1: Measurement & Visualization
-- [x] Death cause tracking (starvation vs poison)
-- [x] Per-behavior energy charts
-- [x] Activity heatmaps with type filtering
-- [x] Behavior color system
-
-### Phase 2: Learned Behaviors
-- [x] BaseCNN architecture with dynamic channels
-- [x] PPO training with GAE and curriculum
-- [x] GPU-native vectorized training
-- [x] Multi-mode dashboard
-- [x] Structured logging (CSV/JSON)
-- [x] Model verification suite
-
-### Phase 2.5: Code Quality
-- [x] TOML configuration system
-- [x] Auto-discovery behavior registry
-- [x] Centralized device selection
-- [x] Comprehensive test suite
-
-### Phase 3: Emergent Deception
-- [ ] Multi-agent signaling dynamics
-- [ ] Resource competition under scarcity
-- [ ] Agents that "game" the proxy metric
-- [ ] Adversarial inspector/gamer co-evolution
+The demonstration is complete as a single-agent Goodhart failure mode. Multi-agent dynamics (signaling, competition, adversarial co-evolution) would extend this to emergent deception, but require architectural changes to TorchVecEnv.
 
 ---
 
