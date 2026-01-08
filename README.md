@@ -4,7 +4,7 @@
 
 This project is an empirical demonstration of Goodhart's Law in reinforcement learning. Agents navigate a 2D grid world with the goal of increasing their energy. **Ground truth** agents see real cell types and thrive. **Blinded** agents see only interestingness and fail to thrive. **Proxy** agents rewarded on interestingness rather than energy rapidly self-destruct.
 
-Optimizing for proxy metrics nearly always leads to alignment failures. Whether the proxy is reasonable or unreasonable, alignment still fails.
+Optimizing for proxy metrics can lead to alignment failures even when the proxy seems reasonable. The failure mode is robust across experimental conditions.
 
 ---
 
@@ -411,15 +411,15 @@ This simulation is a **toy model** for understanding real AI alignment failures,
 ### 1. Precision in Specification
 The proxy agent optimizes for exactly what it is rewarded on - consume as much interestingness as possible. Training freezes energy to prevent the agent from learning poison is dangerous, which only *works* because there's a backup reward signal. When that penalty is removed and the agent optimizes purely for the proxy metric, it fails completely. This mirrors the real world; so long as an AI agent is given a sufficiently robust objective, it will accomplish the goal, but the robustness of that objective is vital.
 
-**Real-world parallel:** The different algorithms on TikTok and its internal Chinese variant, Douyin, are an excellent example. Douyin emphasizes positive and educational content, while TikTok optimizes solely for profit. This proxy metric demands only that as many ads be served as possible, and the best way to do that is to make people angry, or scared, or anything else that keeps them engaged. Douyin's algorithm benefits the Chinese people, while TikTok's drives global tension up. Same company, same technology, different objectives, different outcomes.
+**Real-world parallel:** The different algorithms on TikTok and its Chinese variant Douyin illustrate this well. Chinese law requires Douyin to emphasize educational and positive content for minors, while TikTok optimizes purely for engagement and profit - as any company would absent such constraints. Same technology, different regulatory objectives, different outcomes. The algorithm does exactly what it's optimized for.
 
 ### 2. Information Asymmetry
 Describing an objective to an agent in exact terms is already nearly impossible; giving the agent *perfect information* is *genuinely* impossible.
 
-**Real-world parallel:** Educational systems, both human and AI-operated, optimize for test scores rather than genuine understanding. Teaching to the test is a plague throughout the United States, not least because those test scores are used as judges of capability by *other* systems as well. Humans do not have the necessary energy to decode true objective information. AI agents do not have any *reason* to seek out a deeper 'true' objective. They only optimize for what they are rewarded on.
+**Real-world parallel:** Educational systems, both human and AI-operated, optimize for test scores rather than genuine understanding. Test scores become targets, then cease to measure what they were designed to measure. Humans do not have the necessary energy to decode true objective information. AI agents do not have any *reason* to seek out a deeper 'true' objective. They only optimize for what they are rewarded on.
 
 ### 3. Distributional Shift
-The proxy mode demonstrates what happens when the reward system itself is misaligned. The agent learns only to seek interesting things. Because the agent cannot experience death in the training loop, it never learns anything about its true goals.
+The proxy mode demonstrates what happens when the reward system itself is misaligned. The agent learns only to seek interesting things. Critically, proxy agents are *immortal during training* - they cannot experience the consequences of their choices. This is deliberate: real-world AI systems rarely have clean "death penalties" that provide corrective feedback. The `proxy_mortal` mode tests what happens when consequences ARE available, and still shows significant failure (56.6% efficiency vs 100%).
 
 **Real-world parallel:** Click-through rate optimization across the entire internet. Charitably, CTR can be said to proxy whether the user finds a link valuable. Less charitably, it proxies likely engagement with advertisements and other material. When only positive content of varying quality is available, CTR selects for the best of it, enlightening and entertaining the audience. In our modern world, laden with misinformation and propaganda, CTR selects blindly for engagement and warps our societies in the process. The proxy selects for what is worst for the public.
 
@@ -455,7 +455,7 @@ This project demonstrates Goodhart's Law in a simplified and heavily controlled 
 
 ### What This Does Demonstrate
 
-Even with limitations, this project empirically validates the core mechanism of Goodhart's Law.
+Even with limitations, this project demonstrates the core mechanism of Goodhart's Law.
 - Optimizing a measurable proxy (interestingness) produces catastrophic outcomes even when the proxy isn't adversarial - the metric simply fails to encode harm
 - The failure is quantifiable: dramatic efficiency gaps and multi-order-of-magnitude death rate increases between ground truth and proxy agents
 - Control conditions (ground_truth_blinded) isolate the effect of information vs reward - a model with bad information but good rewards will either learn to perform or fail gracefully
@@ -488,6 +488,10 @@ This project uses type hints throughout. Key conventions:
 
 ## Disclosure
 
-This project was developed initially using Google's experimental Antigravity agentic IDE, with the gracious assistance of Claude 4.5 Opus and Gemini 3 Pro. Due to emergent lag in Antigravity, I later switched to Claude Code, primarily with 4.5 Opus. I acted as architect and systems lead, manually writing some code where relevant, but I credit Opus for the vast majority of the implementation and documentation along with serving as a valuable advisor. This project would not have been possible without Google's free Gemini Pro subscription for students, the high usage limits in Antigravity, and the extreme efficiency and potential of Claude Code.
+This project was developed with AI assistance, initially using Google's Antigravity IDE (Gemini 3 Pro), then Claude Code (Claude 4.5 Opus).
+
+**My contributions:** All architectural decisions were mine - the GPU-native vectorization strategy, eliminating CPU-GPU sync points, CUDA graph integration, and condensing the rollout loop into a single compiled graph. The experimental design (ground truth vs proxy dichotomy, the blinded control condition, immortality-during-training as a deliberate confound) was mine. For debugging, Claude would assess symptoms while I identified root causes - pair programming where I provided the "why" and Claude provided the "how."
+
+**Claude's contributions:** The vast majority of implementation code and documentation. Claude transformed my architectural sketches into working systems and served as an invaluable advisor throughout.
 
 I am grateful to Google and Anthropic for making this project possible.

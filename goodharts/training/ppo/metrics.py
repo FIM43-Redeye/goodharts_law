@@ -60,7 +60,7 @@ class PendingMetrics:
     By the time we need it (next update end), transfer finished long ago.
 
     Episode data (n_episodes, reward_sum, etc.) is in the transferred tensor,
-    extracted in _process_pending_metrics after transfer completes.
+    extracted by BackgroundBookkeeper after transfer completes.
     """
     n_metrics: int  # Length of metrics in pinned buffer
     update_count: int

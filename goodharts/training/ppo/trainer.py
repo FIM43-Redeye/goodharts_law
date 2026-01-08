@@ -36,7 +36,7 @@ from .async_logger import AsyncLogger, LogPayload
 from .monitoring import GPUMonitor
 from .ppo_config import PPOConfig
 from .metrics import (
-    METRICS_SCHEMA, N_SCALAR_METRICS, unpack_metrics,
+    METRICS_SCHEMA, N_SCALAR_METRICS,
     PendingMetrics, BookkeepingWork, BackgroundBookkeeper
 )
 from .globals import (
@@ -1004,70 +1004,6 @@ class PPOTrainer:
                         action_space_config=self.action_space.get_config(),
                         seed=self.seed,
                     )
-
-    def _process_pending_metrics(self):
-        """
-        Process metrics from PREVIOUS update (if any).
-
-        Called at the start of each update cycle. By now, the async transfer
-        that started at the end of the previous update has long since completed
-        (transfer takes ~8ms, update takes ~800ms).
-        """
-        if self._metrics_event is None:
-            return  # No pending metrics (first update)
-
-        # Sync transfer (should be instant - finished 800ms ago)
-        self._metrics_event.synchronize()
-
-        # Unpack using schema (single source of truth)
-        pending = self._pending_log_data
-        cpu_array = self._metrics_pinned[:pending.n_metrics].numpy()
-        m = unpack_metrics(cpu_array)
-
-        # Update running totals (one update behind, nobody notices)
-        if m['n_episodes'] > 0:
-            if m['reward_max'] > self.best_reward:
-                self.best_reward = m['reward_max']
-            self.episode_count += m['n_episodes']
-
-        # Prepare episode stats
-        ep_stats = None
-        if m['n_episodes'] > 0:
-            ep_stats = {
-                'reward': m['reward_sum'] / m['n_episodes'],
-                'food': m['food_sum'] / m['n_episodes'],
-                'poison': m['poison_sum'] / m['n_episodes'],
-            }
-
-        # Queue to async logger
-        log_payload = LogPayload(
-            policy_loss=m['policy_loss'],
-            value_loss=m['value_loss'],
-            entropy=m['entropy'],
-            explained_var=m['explained_var'],
-            action_probs=m['action_probs'],
-            update_count=pending.update_count,
-            total_steps=pending.total_steps,
-            best_reward=self.best_reward,
-            mode=self.config.mode,
-            episode_stats=ep_stats,
-            profiler_summary=pending.profiler_summary,
-            sps_instant=pending.sps_instant,
-            sps_rolling=pending.sps_rolling,
-            sps_global=pending.sps_global,
-            validation_metrics=pending.validation_metrics,
-            episodes_count=m['n_episodes'],
-            reward_sum=m['reward_sum'],
-            reward_min=m['reward_min'] if m['n_episodes'] > 0 else 0.0,
-            reward_max=m['reward_max'] if m['n_episodes'] > 0 else 0.0,
-            food_sum=m['food_sum'],
-            poison_sum=m['poison_sum'],
-        )
-        self.async_logger.log_update(log_payload)
-
-        # Clear pending state
-        self._metrics_event = None
-        self._pending_log_data = None
 
     def _start_metrics_transfer(
         self,
