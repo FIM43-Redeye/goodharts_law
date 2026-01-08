@@ -107,28 +107,16 @@ def save_figure(fig: go.Figure, output_path: Path, timeout: int = FIGURE_TIMEOUT
         return True
 
 
-# Color scheme for modes
-MODE_COLORS = {
-    'ground_truth': '#22c79a',       # Green - correct behavior
-    'ground_truth_handhold': '#4ecdc4',  # Teal - guided learning
-    'ground_truth_blinded': '#ffc107',   # Yellow/amber - blinded control
-    'proxy': '#ff6b6b',              # Red - Goodhart failure
-}
+# Import canonical colors and theme from single source of truth
+from goodharts.visualization.components import MODE_COLORS, THEME
 
-# Friendly display names
+# Friendly display names for report output
 MODE_NAMES = {
     'ground_truth': 'Ground Truth',
     'ground_truth_handhold': 'Ground Truth (Guided)',
     'ground_truth_blinded': 'Ground Truth (Blinded)',
-    'proxy': 'Proxy (Goodhart)',
-}
-
-# Dark theme colors
-THEME = {
-    'background': '#1a1a2e',
-    'paper': '#16213e',
-    'text': '#e0e0e0',
-    'grid': 'rgba(128, 128, 128, 0.15)',
+    'proxy_mortal': 'Proxy (Mortal)',
+    'proxy': 'Proxy (Immortal)',
 }
 
 

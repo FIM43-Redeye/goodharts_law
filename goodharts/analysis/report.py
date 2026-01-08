@@ -142,48 +142,100 @@ class ReportGenerator:
 
         return mode_data
 
-    def _compute_comparisons(self, mode_data: dict) -> dict[str, StatisticalComparison]:
-        """Compute statistical comparisons for ground_truth vs proxy."""
+    def _compute_pairwise_comparison(
+        self,
+        mode_data: dict,
+        mode_a: str,
+        mode_b: str
+    ) -> dict[str, StatisticalComparison]:
+        """Compute efficiency, survival, and poison comparisons for a mode pair."""
+        if mode_a not in mode_data or mode_b not in mode_data:
+            return {}
+
+        data_a = mode_data[mode_a]
+        data_b = mode_data[mode_b]
+
+        if not data_a or not data_b:
+            return {}
+
         comparisons = {}
 
-        if 'ground_truth' not in mode_data or 'proxy' not in mode_data:
-            return comparisons
-
-        gt = mode_data['ground_truth']
-        px = mode_data['proxy']
-
-        # Efficiency comparison (the key Goodhart metric)
-        gt_eff = [d['efficiency'] * 100 for d in gt]
-        px_eff = [d['efficiency'] * 100 for d in px]
+        # Efficiency comparison
+        eff_a = [d['efficiency'] * 100 for d in data_a]
+        eff_b = [d['efficiency'] * 100 for d in data_b]
         comparisons['efficiency'] = compute_comparison(
-            gt_eff, px_eff,
+            eff_a, eff_b,
             metric='efficiency',
-            group_a='ground_truth',
-            group_b='proxy'
+            group_a=mode_a,
+            group_b=mode_b
         )
 
         # Survival comparison
-        gt_surv = [d['survival_steps'] for d in gt]
-        px_surv = [d['survival_steps'] for d in px]
+        surv_a = [d['survival_steps'] for d in data_a]
+        surv_b = [d['survival_steps'] for d in data_b]
         comparisons['survival'] = compute_comparison(
-            gt_surv, px_surv,
+            surv_a, surv_b,
             metric='survival',
-            group_a='ground_truth',
-            group_b='proxy'
+            group_a=mode_a,
+            group_b=mode_b
         )
 
-        # Poison consumption
-        gt_poison = [d['poison_eaten'] for d in gt]
-        px_poison = [d['poison_eaten'] for d in px]
+        # Poison comparison
+        poison_a = [d['poison_eaten'] for d in data_a]
+        poison_b = [d['poison_eaten'] for d in data_b]
         comparisons['poison'] = compute_comparison(
-            gt_poison, px_poison,
+            poison_a, poison_b,
             metric='poison_eaten',
-            group_a='ground_truth',
-            group_b='proxy'
+            group_a=mode_a,
+            group_b=mode_b
         )
 
-        self.comparisons = comparisons
         return comparisons
+
+    def _compute_comparisons(self, mode_data: dict) -> dict[str, dict[str, StatisticalComparison]]:
+        """
+        Compute statistical comparisons for all meaningful mode pairs.
+
+        Returns a nested dict: {pair_name: {metric: StatisticalComparison}}
+
+        Comparison pairs and what they test:
+        - gt_vs_proxy: Primary Goodhart effect (full alignment gap)
+        - gt_vs_blinded: Impact of observation quality (can't see reality)
+        - mortal_vs_proxy: Impact of training mortality (reality check)
+        - blinded_vs_mortal: Reward quality vs mortality (which matters more)
+        """
+        all_comparisons = {}
+
+        # Primary comparison: The Goodhart effect
+        gt_vs_proxy = self._compute_pairwise_comparison(
+            mode_data, 'ground_truth', 'proxy'
+        )
+        if gt_vs_proxy:
+            all_comparisons['gt_vs_proxy'] = gt_vs_proxy
+
+        # Control 1: Impact of observation quality
+        gt_vs_blinded = self._compute_pairwise_comparison(
+            mode_data, 'ground_truth', 'ground_truth_blinded'
+        )
+        if gt_vs_blinded:
+            all_comparisons['gt_vs_blinded'] = gt_vs_blinded
+
+        # Control 2: Does mortality ground proxy agents?
+        mortal_vs_proxy = self._compute_pairwise_comparison(
+            mode_data, 'proxy_mortal', 'proxy'
+        )
+        if mortal_vs_proxy:
+            all_comparisons['mortal_vs_proxy'] = mortal_vs_proxy
+
+        # Control 3: Right reward vs mortality - which matters more?
+        blinded_vs_mortal = self._compute_pairwise_comparison(
+            mode_data, 'ground_truth_blinded', 'proxy_mortal'
+        )
+        if blinded_vs_mortal:
+            all_comparisons['blinded_vs_mortal'] = blinded_vs_mortal
+
+        self.comparisons = all_comparisons
+        return all_comparisons
 
     def _generate_executive_summary(self, mode_data: dict) -> str:
         """Generate executive summary section."""
@@ -199,106 +251,213 @@ class ReportGenerator:
             px_surv = px_agg.get('survival_mean', 1)
             scr = gt_surv / px_surv if px_surv > 0 else float('inf')
 
-            px_eff = px_agg.get('overall_efficiency', 0)
-            worse_than_random = px_eff < 0.5
+            gt_energy = gt_agg.get('energy_per_1k_steps', 0)
+            px_energy = px_agg.get('energy_per_1k_steps', 0)
 
             lines.append(f'**Survival Collapse Ratio: {scr:.0f}x**')
             lines.append('')
-            lines.append(f'> Ground truth agents survive {scr:.0f}x longer than proxy agents. '
-                        f'Proxy efficiency ({px_eff:.1%}) is {"below" if worse_than_random else "above"} '
-                        f'random chance (50%), meaning proxy optimization {"anti-correlates" if worse_than_random else "weakly correlates"} '
-                        f'with the true objective.')
+            if gt_energy > 0 and px_energy < 0:
+                lines.append(f'> Ground truth agents gain energy (+{gt_energy:.1f}/1k steps) and thrive. '
+                            f'Proxy agents hemorrhage energy ({px_energy:.1f}/1k steps) and die. '
+                            f'This is Goodhart\'s Law: optimizing the proxy metric leads to catastrophic failure.')
+            else:
+                lines.append(f'> Ground truth agents survive {scr:.0f}x longer than proxy agents. '
+                            f'Ground truth energy: {gt_energy:+.1f}/1k, Proxy energy: {px_energy:+.1f}/1k.')
             lines.append('')
 
-        # Summary table - show both aggregate and per-agent efficiency
+        # Summary table - energy per 1k steps is THE key metric
         lines.append('### Performance Summary')
         lines.append('')
-        lines.append('| Mode | Aggregate Eff. | Per-Agent Eff. | Survival | Deaths | Deaths/1k |')
-        lines.append('|------|----------------|----------------|----------|--------|-----------|')
+        lines.append('| Mode | Energy/1k | Efficiency | Survival | Deaths | Deaths/1k |')
+        lines.append('|------|-----------|------------|----------|--------|-----------|')
 
         results = self.data.get('results', {})
-        mode_data = self._extract_mode_data()
         for mode in sorted(results.keys()):
             agg = results[mode].get('aggregates', {})
             if agg:
-                agg_eff = agg.get('overall_efficiency', 0)
+                energy = agg.get('energy_per_1k_steps', 0)
+                energy_str = f"{'+' if energy >= 0 else ''}{energy:.1f}"
+                eff = agg.get('overall_efficiency', 0)
                 surv = agg.get('survival_mean', 0)
                 # Multi-run aggregates use 'total_deaths', single-run uses 'n_deaths'
                 deaths = agg.get('total_deaths', agg.get('n_deaths', 0))
                 d1k = agg.get('deaths_per_1k_steps', 0)
-                # Compute per-agent mean efficiency from extracted data
-                if mode in mode_data and mode_data[mode]:
-                    individual_effs = [d['efficiency'] for d in mode_data[mode]]
-                    agent_eff = sum(individual_effs) / len(individual_effs)
-                else:
-                    agent_eff = agg_eff
-                lines.append(f'| {mode} | {agg_eff:.1%} | {agent_eff:.1%} | {surv:.1f} | {deaths:,} | {d1k:.2f} |')
+                lines.append(f'| {mode} | {energy_str} | {eff:.1%} | {surv:.1f} | {deaths:,} | {d1k:.2f} |')
 
         lines.append('')
-        lines.append('> *Aggregate Eff.*: Total food / total consumed (weights by volume)')
-        lines.append('> *Per-Agent Eff.*: Mean of individual agent efficiencies (weights equally)')
+        lines.append('> *Energy/1k*: Net energy change per 1000 steps (positive = thriving, negative = dying)')
+        lines.append('> *Efficiency*: Food eaten / total consumed (above 50% = better than random)')
         lines.append('')
         return '\n'.join(lines)
 
+    def _format_comparison_block(
+        self,
+        comp: StatisticalComparison,
+        label_a: str,
+        label_b: str
+    ) -> list[str]:
+        """Format a single metric comparison as markdown lines."""
+        lines = []
+        lines.append(f'- **{label_a}**: {comp.mean_a:.2f} (95% CI: [{comp.ci_a[0]:.2f}, {comp.ci_a[1]:.2f}])')
+        lines.append(f'- **{label_b}**: {comp.mean_b:.2f} (95% CI: [{comp.ci_b[0]:.2f}, {comp.ci_b[1]:.2f}])')
+        lines.append(f'- **Difference**: {comp.mean_diff:+.2f} (95% CI: [{comp.ci_diff[0]:.2f}, {comp.ci_diff[1]:.2f}])')
+        lines.append(f'- t({comp.df:.1f}) = {comp.t_statistic:.2f}, '
+                    f'p = {format_p_value(comp.p_value)} {comp.significance_stars}, '
+                    f"Cohen's d = {comp.cohens_d:.2f} ({comp.effect_magnitude})")
+        return lines
+
     def _generate_statistical_analysis(self) -> str:
-        """Generate statistical analysis section."""
+        """Generate statistical analysis section with all comparison pairs."""
         lines = ['## Statistical Analysis', '']
 
         if not self.comparisons:
-            lines.append('*No comparison data available (requires both ground_truth and proxy modes)*')
+            lines.append('*No comparison data available (requires multiple modes)*')
             return '\n'.join(lines)
 
-        lines.append('### Ground Truth vs Proxy Comparison')
-        lines.append('')
+        # Comparison metadata: pair_key -> (title, description, label_a, label_b)
+        comparison_info = {
+            'gt_vs_proxy': (
+                'Primary: Ground Truth vs Proxy (The Goodhart Effect)',
+                'The core demonstration: agents optimizing for a proxy metric versus '
+                'agents with access to ground truth. This measures the full alignment gap.',
+                'Ground Truth', 'Proxy'
+            ),
+            'gt_vs_blinded': (
+                'Control 1: Ground Truth vs Blinded (Observation Quality)',
+                'Both modes receive energy-based rewards and can die, but blinded agents '
+                'cannot distinguish food from poison visually. Tests whether observation '
+                'quality alone impacts survival.',
+                'Ground Truth', 'Blinded'
+            ),
+            'mortal_vs_proxy': (
+                'Control 2: Proxy Mortal vs Proxy (Mortality as Grounding)',
+                'Both modes see proxy observations and receive proxy rewards, but proxy_mortal '
+                'agents can die during training. Tests whether mortality provides a "reality check" '
+                'that helps ground agents despite misaligned reward signals.',
+                'Proxy Mortal', 'Proxy'
+            ),
+            'blinded_vs_mortal': (
+                'Control 3: Blinded vs Proxy Mortal (Reward vs Mortality)',
+                'Both modes can die and see proxy observations. Blinded has correct reward signals; '
+                'proxy_mortal has incorrect rewards but experienced mortality during training. '
+                'Tests which factor matters more for survival.',
+                'Blinded', 'Proxy Mortal'
+            ),
+        }
 
-        # Note about which metric is used
-        lines.append('> Statistical tests use per-agent means (see "Per-Agent Eff." in summary table).')
-        lines.append('')
+        for pair_key, pair_comparisons in self.comparisons.items():
+            if pair_key not in comparison_info:
+                continue
 
-        for metric, comp in self.comparisons.items():
-            lines.append(f'#### {metric.replace("_", " ").title()}')
+            title, description, label_a, label_b = comparison_info[pair_key]
+
+            lines.append(f'### {title}')
             lines.append('')
-            lines.append(f'- **Ground Truth**: {comp.mean_a:.2f} (95% CI: [{comp.ci_a[0]:.2f}, {comp.ci_a[1]:.2f}])')
-            lines.append(f'- **Proxy**: {comp.mean_b:.2f} (95% CI: [{comp.ci_b[0]:.2f}, {comp.ci_b[1]:.2f}])')
-            lines.append(f'- **Difference**: {comp.mean_diff:+.2f} (95% CI: [{comp.ci_diff[0]:.2f}, {comp.ci_diff[1]:.2f}])')
+            lines.append(f'> {description}')
             lines.append('')
-            lines.append(f'Statistical test (Welch\'s t-test):')
-            lines.append(f'- t({comp.df:.1f}) = {comp.t_statistic:.2f}')
-            lines.append(f'- p = {format_p_value(comp.p_value)} {comp.significance_stars}')
-            lines.append(f'- Cohen\'s d = {comp.cohens_d:.2f} ({comp.effect_magnitude} effect)')
-            lines.append('')
+
+            # Show efficiency as the key metric with full detail
+            if 'efficiency' in pair_comparisons:
+                comp = pair_comparisons['efficiency']
+                lines.append('**Efficiency** (% food of total consumed):')
+                lines.append('')
+                lines.extend(self._format_comparison_block(comp, label_a, label_b))
+                lines.append('')
+
+            # Show survival and poison as secondary metrics in compact form
+            secondary = []
+            if 'survival' in pair_comparisons:
+                comp = pair_comparisons['survival']
+                secondary.append(f'**Survival**: {label_a} {comp.mean_a:.1f} vs {label_b} {comp.mean_b:.1f} steps '
+                               f'(d={comp.cohens_d:.2f}, p={format_p_value(comp.p_value)})')
+            if 'poison' in pair_comparisons:
+                comp = pair_comparisons['poison']
+                secondary.append(f'**Poison**: {label_a} {comp.mean_a:.1f} vs {label_b} {comp.mean_b:.1f} eaten '
+                               f'(d={comp.cohens_d:.2f}, p={format_p_value(comp.p_value)})')
+
+            if secondary:
+                lines.append('Secondary metrics:')
+                for s in secondary:
+                    lines.append(f'- {s}')
+                lines.append('')
 
         return '\n'.join(lines)
 
     def _generate_power_analysis(self, mode_data: dict) -> str:
-        """Generate power analysis section."""
+        """Generate power analysis section for all comparison pairs."""
         lines = ['## Power Analysis', '']
 
-        if 'efficiency' not in self.comparisons:
+        # Check if we have the primary comparison
+        gt_vs_proxy = self.comparisons.get('gt_vs_proxy', {})
+        if 'efficiency' not in gt_vs_proxy:
             lines.append('*Power analysis requires efficiency comparison data*')
             return '\n'.join(lines)
 
-        comp = self.comparisons['efficiency']
+        # Primary comparison power analysis
+        comp = gt_vs_proxy['efficiency']
         n_gt = len(mode_data.get('ground_truth', []))
         n_px = len(mode_data.get('proxy', []))
         effect_size = abs(comp.cohens_d)
 
-        # Achieved power
-        pwr = achieved_power(n_gt, n_px, effect_size)
-        lines.append(f'### Achieved Power')
+        lines.append('### Achieved Power (Primary Comparison)')
         lines.append('')
-        lines.append(f'With the observed effect size (d = {effect_size:.2f}) and sample sizes '
-                    f'(n_gt = {n_gt}, n_proxy = {n_px}):')
+        pwr = achieved_power(n_gt, n_px, effect_size)
+        lines.append(f'For the ground_truth vs proxy comparison with effect size d = {effect_size:.2f} '
+                    f'and sample sizes (n_gt = {n_gt}, n_proxy = {n_px}):')
         lines.append('')
         lines.append(f'- **Achieved power: {pwr:.1%}**')
         lines.append('')
 
         if pwr >= 0.80:
-            lines.append('> The study has adequate power (>= 80%) to detect the observed effect.')
+            lines.append('> The primary comparison has adequate power (>= 80%).')
         else:
-            lines.append(f'> The study is underpowered. For 80% power with this effect size, '
-                        f'approximately {power_analysis(effect_size).n_per_group} deaths per mode '
-                        f'would be needed.')
+            lines.append(f'> The primary comparison is underpowered. For 80% power, '
+                        f'approximately {power_analysis(effect_size).n_per_group} samples per mode needed.')
+        lines.append('')
+
+        # Power summary for all comparisons
+        lines.append('### Power Summary (All Comparisons)')
+        lines.append('')
+        lines.append('| Comparison | Effect Size (d) | Power | Adequate? |')
+        lines.append('|------------|-----------------|-------|-----------|')
+
+        comparison_labels = {
+            'gt_vs_proxy': 'GT vs Proxy',
+            'gt_vs_blinded': 'GT vs Blinded',
+            'mortal_vs_proxy': 'Mortal vs Proxy',
+            'blinded_vs_mortal': 'Blinded vs Mortal',
+        }
+
+        sample_sizes = {
+            'ground_truth': len(mode_data.get('ground_truth', [])),
+            'proxy': len(mode_data.get('proxy', [])),
+            'ground_truth_blinded': len(mode_data.get('ground_truth_blinded', [])),
+            'proxy_mortal': len(mode_data.get('proxy_mortal', [])),
+        }
+
+        pair_modes = {
+            'gt_vs_proxy': ('ground_truth', 'proxy'),
+            'gt_vs_blinded': ('ground_truth', 'ground_truth_blinded'),
+            'mortal_vs_proxy': ('proxy_mortal', 'proxy'),
+            'blinded_vs_mortal': ('ground_truth_blinded', 'proxy_mortal'),
+        }
+
+        for pair_key, label in comparison_labels.items():
+            if pair_key not in self.comparisons:
+                continue
+            pair_comps = self.comparisons[pair_key]
+            if 'efficiency' not in pair_comps:
+                continue
+
+            eff_comp = pair_comps['efficiency']
+            d = abs(eff_comp.cohens_d)
+            mode_a, mode_b = pair_modes[pair_key]
+            n_a, n_b = sample_sizes.get(mode_a, 0), sample_sizes.get(mode_b, 0)
+
+            if n_a > 0 and n_b > 0:
+                pwr = achieved_power(n_a, n_b, d)
+                adequate = 'Yes' if pwr >= 0.80 else 'No'
+                lines.append(f'| {label} | {d:.2f} | {pwr:.1%} | {adequate} |')
 
         lines.append('')
 
@@ -375,23 +534,49 @@ class ReportGenerator:
                     'then auto-respawn, allowing natural measurement of survival behavior.')
         lines.append('')
 
-        lines.append('### Training Modes')
+        lines.append('### Training Modes (Factorial Design)')
         lines.append('')
-        lines.append('- **Ground Truth**: Agents receive one-hot encoded cell type observations '
-                    '(can see if cells are food, poison, or empty) and energy-based rewards.')
-        lines.append('- **Proxy**: Agents receive only "interestingness" values (a scalar proxy '
-                    'for cell type) and interestingness-based rewards. This simulates optimizing '
-                    'for a measurable but imperfect proxy metric.')
+        lines.append('The experiment uses four training modes that vary along three dimensions: '
+                    'observation quality, reward alignment, and training mortality.')
+        lines.append('')
+        lines.append('| Mode | Observations | Reward | Can Die (Train) |')
+        lines.append('|------|--------------|--------|-----------------|')
+        lines.append('| ground_truth | One-hot cell types | Energy-based | Yes |')
+        lines.append('| ground_truth_blinded | Proxy (interestingness) | Energy-based | Yes |')
+        lines.append('| proxy_mortal | Proxy (interestingness) | Interestingness | Yes |')
+        lines.append('| proxy | Proxy (interestingness) | Interestingness | No (immortal) |')
+        lines.append('')
+        lines.append('**Mode descriptions:**')
+        lines.append('')
+        lines.append('- **Ground Truth (Baseline)**: Agents see reality (one-hot cell types) and '
+                    'receive energy-based rewards. Fully aligned - can distinguish food from poison.')
+        lines.append('- **Ground Truth Blinded**: Agents cannot see cell types (only interestingness values) '
+                    'but receive correct energy-based rewards. Tests whether observation quality matters.')
+        lines.append('- **Proxy Mortal**: Agents see proxy observations and receive interestingness-based rewards, '
+                    'but can die during training. Tests whether mortality provides grounding despite wrong rewards.')
+        lines.append('- **Proxy (Goodhart Case)**: Agents see proxy observations, receive interestingness rewards, '
+                    'and are immortal during training. Full misalignment - optimizes proxy with no reality check.')
+        lines.append('')
+        lines.append('**Control comparisons:**')
+        lines.append('')
+        lines.append('- GT vs Proxy: Primary effect (full alignment gap)')
+        lines.append('- GT vs Blinded: Impact of observation quality')
+        lines.append('- Mortal vs Proxy: Impact of training mortality')
+        lines.append('- Blinded vs Mortal: Reward alignment vs mortality (which helps more?)')
         lines.append('')
 
         lines.append('### Key Metrics')
         lines.append('')
-        lines.append('- **Efficiency**: Food consumed / Total consumed. Measures how well '
-                    'agents distinguish food from poison. Below 50% means worse than random.')
+        lines.append('- **Energy per 1k Steps**: Net energy change per 1000 steps. THE key metric. '
+                    'Positive values mean agents are thriving (gaining energy faster than losing). '
+                    'Negative values mean agents are dying (hemorrhaging energy). '
+                    'Formula: (food_reward * food - poison_penalty * poison - move_cost * steps) / steps * 1000')
+        lines.append('- **Efficiency**: Food consumed / Total consumed. Secondary metric. '
+                    'Below 50% means worse than random chance.')
         lines.append('- **Survival Time**: Steps lived before each death. Higher is better.')
         lines.append('- **Deaths per 1000 Steps**: Population death rate. Lower is better.')
         lines.append('- **Survival Collapse Ratio (SCR)**: GT_survival / Proxy_survival. '
-                    'Captures the magnitude of catastrophic failure better than efficiency gaps.')
+                    'Captures the magnitude of catastrophic failure.')
         lines.append('')
 
         lines.append('### Statistical Methods')
@@ -503,7 +688,7 @@ class ReportGenerator:
 
         # Results table - use aggregate stats (not per-death which gives different values)
         lines.append('')
-        lines.append(f"{'Mode':<25} {'Efficiency':>12} {'Survival':>12} {'Deaths':>12} {'Deaths/1k':>12}")
+        lines.append(f"{'Mode':<22} {'Energy/1k':>12} {'Efficiency':>12} {'Survival':>12} {'Deaths/1k':>12}")
         lines.append('-' * 80)
 
         for mode in sorted(results.keys()):
@@ -511,12 +696,13 @@ class ReportGenerator:
             if not agg:
                 continue
 
+            energy = agg.get('energy_per_1k_steps', 0)
+            energy_str = f"{'+' if energy >= 0 else ''}{energy:.1f}"
             eff = agg.get('overall_efficiency', 0)
             surv = agg.get('survival_mean', 0)
-            deaths = agg.get('total_deaths', agg.get('n_deaths', 0))
             d1k = agg.get('deaths_per_1k_steps', 0)
 
-            lines.append(f'{mode:<25} {eff:>11.1%} {surv:>12.1f} {deaths:>12,} {d1k:>12.2f}')
+            lines.append(f'{mode:<22} {energy_str:>12} {eff:>11.1%} {surv:>12.1f} {d1k:>12.2f}')
 
         lines.append('=' * 80)
 
