@@ -26,9 +26,10 @@ python main.py brain-view --mode ground_truth
 | Mode | Observation | Reward | Use Case |
 |------|-------------|--------|----------|
 | `ground_truth` | One-hot cell types | Energy delta | Baseline: full information |
-| `ground_truth_handhold` | One-hot cell types | Shaped rewards | Easier learning curve |
-| `proxy` | Interestingness | Interestingness | **Main Goodhart failure mode** |
-| `ground_truth_blinded` | Interestingness | Energy delta | Control: blinded but true rewards |
+| `ground_truth_blinded` | Interestingness | Energy delta | Control: correct rewards, blinded observation |
+| `proxy_mortal` | Interestingness | Interestingness | Partial grounding: proxy reward but can die |
+| `proxy` | Interestingness | Interestingness | **Main Goodhart failure mode** (immortal during training) |
+| `ground_truth_handhold` | One-hot cell types | Shaped rewards | Experimental (not in default batch) |
 
 ---
 
