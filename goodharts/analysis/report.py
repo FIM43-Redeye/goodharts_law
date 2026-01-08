@@ -664,11 +664,15 @@ class ReportGenerator:
         # Generate figures if requested
         if self.config.include_figures and mode_data:
             from goodharts.analysis.visualize import generate_all_figures
+            # Extract aggregates for rate-based figures (consumption per 1k steps, etc.)
+            results = self.data.get('results', {})
+            aggregates = {mode: results[mode].get('aggregates', {}) for mode in results}
             self.figure_paths = generate_all_figures(
                 mode_data,
                 self.config.figures_dir,
                 annotated=True,
                 distributions=True,
+                aggregates=aggregates,
             )
 
         # Build report sections
