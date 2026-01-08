@@ -125,10 +125,14 @@ class TestModeColors:
     """Tests for mode color configuration."""
 
     def test_all_modes_have_colors(self):
-        """All expected modes should have assigned colors."""
-        expected_modes = ['ground_truth', 'ground_truth_handhold',
-                          'ground_truth_blinded', 'proxy']
-        for mode in expected_modes:
+        """All registered modes should have assigned colors."""
+        from goodharts.modes import get_all_mode_names
+        from goodharts.configs.default_config import get_simulation_config
+
+        config = get_simulation_config()
+        all_modes = get_all_mode_names(config, include_manual=True)
+
+        for mode in all_modes:
             assert mode in MODE_COLORS, f"Missing color for {mode}"
 
     def test_colors_are_valid_hex(self):

@@ -168,14 +168,9 @@ class MatplotlibBrainView:
             transform=ax.transAxes
         )
 
-        # Mode indicator as suptitle
-        mode_colors = {
-            'ground_truth': '#4CAF50',
-            'proxy': '#FF5722',
-            'ground_truth_blinded': '#2196F3',
-            'ground_truth_handhold': '#9C27B0',
-        }
-        mode_color = mode_colors.get(self.mode, '#ffffff')
+        # Mode indicator as suptitle - use canonical colors
+        from goodharts.visualization.components import MODE_COLORS
+        mode_color = MODE_COLORS.get(self.mode, '#ffffff')
         self.fig.suptitle(
             f'{self.mode}',
             fontsize=14,

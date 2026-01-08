@@ -32,27 +32,10 @@ QUEUE_MAX_SIZE = 2000             # Max queue size
 ROLLING_WINDOW = 20               # Window for rolling average survival
 
 
-# Color scheme for modes (consistent across plots and stats)
-MODE_COLORS = {
-    'ground_truth': '#00ff88',      # Bright green
-    'ground_truth_handhold': '#88ff00',  # Lime
-    'proxy': '#ff4444',             # Red
-    'ground_truth_blinded': '#ffaa00',   # Orange
-}
-DEFAULT_COLOR = '#00aaff'           # Cyan fallback
-
-# Dark theme
-THEME = {
-    'background': '#1a1a2e',
-    'paper': '#16213e',
-    'text': '#e0e0e0',
-    'grid': 'rgba(128, 128, 128, 0.15)',
-}
-
-
-def get_mode_color(mode: str) -> str:
-    """Get consistent color for a mode."""
-    return MODE_COLORS.get(mode, DEFAULT_COLOR)
+# Import canonical colors and theme from single source of truth
+from goodharts.visualization.components import (
+    MODE_COLORS, THEME, DEFAULT_COLOR, get_mode_color
+)
 
 
 @dataclass

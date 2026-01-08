@@ -117,14 +117,17 @@ def run_mode(
 
 def main():
     config = get_simulation_config()
-    all_modes = get_all_mode_names(config)
+    # Batch modes: used for --modes all (excludes experimental modes)
+    batch_modes = get_all_mode_names(config, include_manual=False)
+    # All modes: used for validation
+    all_modes = get_all_mode_names(config, include_manual=True)
 
     parser = argparse.ArgumentParser(
         description='Parallel environment statistics dashboard',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('-m', '--modes', type=str, default='all',
-                        help='Comma-separated modes or "all" (default: all)')
+                        help=f'Comma-separated modes or "all" (default: all). Available: {", ".join(all_modes)}')
     parser.add_argument('-e', '--envs', type=int, default=192,
                         help='Environments per mode (default: 192)')
     parser.add_argument('-t', '--timesteps', type=int, default=10000,
@@ -137,10 +140,14 @@ def main():
 
     # Parse modes
     if args.modes == 'all':
-        # Only use modes that have trained models
-        modes = [m for m in all_modes if Path(f'models/ppo_{m}.pth').exists()]
+        # Only use batch_modes that have trained models (excludes manual_only)
+        modes = [m for m in batch_modes if Path(f'models/ppo_{m}.pth').exists()]
     else:
         modes = [m.strip() for m in args.modes.split(',')]
+        invalid = [m for m in modes if m not in all_modes]
+        if invalid:
+            print(f"Invalid mode(s): {', '.join(invalid)}. Valid: {', '.join(all_modes)}")
+            return 1
 
     if not modes:
         print("No trained models found. Train first with:")
