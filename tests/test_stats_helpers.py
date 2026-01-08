@@ -166,12 +166,13 @@ class TestComputeComparison:
 
     def test_mean_difference_computed_correctly(self):
         """Mean difference property should be mean_a - mean_b."""
-        a = [10.0, 10.0, 10.0]
-        b = [5.0, 5.0, 5.0]
+        # Use small variance to avoid scipy warnings about identical data
+        a = [9.9, 10.0, 10.1]
+        b = [4.9, 5.0, 5.1]
 
         result = compute_comparison(a, b)
 
-        assert result.mean_diff == 5.0
+        assert abs(result.mean_diff - 5.0) < 0.01
 
     def test_significant_difference_detected(self):
         """Clearly different groups should give significant p-value."""

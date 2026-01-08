@@ -260,10 +260,10 @@ class TestLearnedBehaviorLoading:
 
     def test_learned_behavior_loads_preset(self, config):
         """LearnedBehavior should load preset models without error."""
-        from goodharts.behaviors.learned import create_learned_behavior
+        from goodharts.behaviors.learned import create_learned_behavior, LEARNED_PRESETS
 
-        # These should not raise errors
-        for preset in ['ground_truth', 'proxy', 'ground_truth_blinded']:
+        # These should not raise errors for all registered presets
+        for preset in LEARNED_PRESETS.keys():
             try:
                 behavior = create_learned_behavior(preset)
                 assert behavior is not None

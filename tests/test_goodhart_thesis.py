@@ -74,13 +74,13 @@ class TestGoodhartThesis:
 
         # No explicit close needed - TorchVecEnv is a GPU buffer, cleaned up by GC
 
-    def test_poison_is_more_interesting_than_food(self, evaluation_config):
+    def test_proxy_metric_is_incomplete_not_adversarial(self, evaluation_config):
         """
-        Verify the Goodhart trap: poison has higher interestingness than food.
+        Verify the Goodhart trap: proxy metric doesn't encode harm.
 
-        This is the mechanism that makes proxy optimization fail:
-        the better the agent optimizes for interestingness, the more
-        poison it consumes.
+        The key insight: the proxy metric is INCOMPLETE, not adversarial.
+        Food is actually MORE interesting than poison, yet agents still
+        consume poison because interestingness doesn't encode harm.
         """
         config = evaluation_config
 
@@ -88,12 +88,17 @@ class TestGoodhartThesis:
         food_interestingness = CellType.FOOD.interestingness
         poison_interestingness = CellType.POISON.interestingness
 
-        # Poison should be MORE interesting than food
-        # This creates the anti-correlation that demonstrates Goodhart's Law
-        assert poison_interestingness > food_interestingness, (
-            f"Poison interestingness ({poison_interestingness}) should be "
-            f"greater than food interestingness ({food_interestingness}). "
-            f"This is the core of the Goodhart trap."
+        # Both food and poison should have positive interestingness
+        # This means the proxy rewards consuming BOTH, even though one is deadly
+        assert food_interestingness > 0, "Food should have positive interestingness"
+        assert poison_interestingness > 0, "Poison should have positive interestingness"
+
+        # Food is MORE interesting, yet proxy agents still die because
+        # the metric doesn't encode harm - poison is "interesting enough" to eat
+        assert food_interestingness > poison_interestingness, (
+            f"Food interestingness ({food_interestingness}) should be greater "
+            f"than poison ({poison_interestingness}). This is the honest Goodhart "
+            f"setup: the proxy isn't adversarial, it's just incomplete."
         )
 
     def test_proxy_observations_hide_cell_identity(self, evaluation_config, device):

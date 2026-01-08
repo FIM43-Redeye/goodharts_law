@@ -211,32 +211,33 @@ class TestProxyEncoding:
         assert abs(poison_interestingness - CellType.POISON.interestingness) < 0.001, \
             f"Poison interestingness wrong: {poison_interestingness} != {CellType.POISON.interestingness}"
 
-    def test_proxy_poison_more_interesting_than_food(self, config, device):
+    def test_proxy_metric_incomplete_not_adversarial(self, config, device):
         """
-        In proxy mode, poison should be MORE interesting than food.
+        The proxy metric is INCOMPLETE, not adversarial.
 
-        This is the sharpened Goodhart trap: agents optimizing for interestingness
-        will actively PREFER poison over food, making the failure mode more dramatic.
-        The proxy metric (interestingness) is actively anti-correlated with true value.
+        Food is MORE interesting than poison - the metric isn't designed to cause
+        harm. But poison still has positive interestingness, so agents consume it.
 
-        Why this makes the demonstration stronger:
-        - With equal interestingness, proxy agents would randomly eat food/poison (~50% efficiency)
-        - With poison MORE interesting, proxy agents ACTIVELY SEEK the harmful option
-        - This shows Goodhart's Law at its worst: the proxy doesn't just fail, it backfires
-        - The result is worse-than-random performance, a dramatic failure mode
+        Why this is a more honest Goodhart demonstration:
+        - Food is MORE interesting than poison - the metric isn't designed to harm
+        - But poison still has positive interestingness (0.5 > 0)
+        - Agents are rewarded for consuming interesting things
+        - The metric doesn't encode harm, so agents eat poison anyway
+        - Result: correct optimization, catastrophic outcomes
         """
         food_i = CellType.FOOD.interestingness
         poison_i = CellType.POISON.interestingness
 
-        # Poison should be more interesting than food (the trap)
-        assert poison_i > food_i, (
-            f"Poison should be MORE interesting than food for sharp Goodhart trap. "
+        # Food should be more interesting than poison (the honest setup)
+        assert food_i > poison_i, (
+            f"Food should be MORE interesting than poison for honest Goodhart demo. "
             f"Got food={food_i}, poison={poison_i}"
         )
 
-        # Both should be non-zero (so agents seek them)
-        assert food_i > 0, f"Food should have some interestingness: {food_i}"
-        assert poison_i > 0, f"Poison should have interestingness: {poison_i}"
+        # BOTH should be non-zero - this is the key!
+        # Poison is "interesting enough" to consume, even if food is more interesting
+        assert food_i > 0, f"Food should have positive interestingness: {food_i}"
+        assert poison_i > 0, f"Poison should have positive interestingness: {poison_i}"
 
         # Empty cells should be boring (so agents move toward items)
         empty_i = CellType.EMPTY.interestingness

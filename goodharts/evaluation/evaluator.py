@@ -138,12 +138,16 @@ class EvaluationConfig:
         Returns:
             EvaluationConfig instance
         """
+        from goodharts.config import get_evaluation_config
+        eval_cfg = get_evaluation_config()
         train_cfg = get_training_config()
 
         config_values = {
             'mode': mode,
-            'n_envs': train_cfg.get('n_envs', 64),
-            # Load training distribution ranges
+            # Load from [evaluation] section (not [training])
+            'n_envs': eval_cfg.get('n_envs', 8192),
+            'total_timesteps': eval_cfg.get('steps_per_env', 4096),
+            # Load training distribution ranges from [training] for environment setup
             'food_min': train_cfg.get('min_food', 50),
             'food_max': train_cfg.get('max_food', 200),
             'poison_min': train_cfg.get('min_poison', 20),
@@ -255,11 +259,16 @@ class ModeAggregates:
     food_per_1k_steps: float
     poison_per_1k_steps: float
 
+    # Energy dynamics (THE key metric for survival)
+    # energy_per_1k = (food_reward * food - poison_penalty * poison - move_cost * steps) / steps * 1000
+    # Positive = thriving, Negative = dying, Zero = equilibrium
+    energy_per_1k_steps: float
+
     # Rewards per death
     reward_mean: float
     reward_std: float
 
-    # Efficiency (food / total consumed) - the key Goodhart metric
+    # Efficiency (food / total consumed) - a secondary metric
     # overall_efficiency uses total consumption across all steps (the TRUE metric)
     # efficiency_mean/std are per-death averages (can be misleading with few deaths)
     overall_efficiency: float
@@ -415,6 +424,11 @@ class ModelTester:
             self._move_cost_desc = f"{cfg.move_cost}"
         else:
             self._move_cost_desc = f"{self.vec_env.energy_move_cost} (default)"
+
+        # Store energy config for computing energy_per_1k_steps
+        self._food_reward = self.vec_env.food_reward
+        self._poison_penalty = self.vec_env.poison_penalty
+        self._move_cost = self.vec_env.energy_move_cost
 
         # Determine model path
         model_path = cfg.model_path or f'models/ppo_{cfg.mode}.pth'
@@ -658,6 +672,13 @@ class ModelTester:
         # Compute rates per 1000 steps
         steps_k = self.total_steps / 1000.0 if self.total_steps > 0 else 1.0
 
+        # Compute net energy per 1k steps (THE key metric)
+        # Positive = thriving (gaining energy), Negative = dying (hemorrhaging energy)
+        total_energy_gained = self.total_food * self._food_reward
+        total_energy_lost = self.total_poison * self._poison_penalty + self.total_steps * self._move_cost
+        net_energy = total_energy_gained - total_energy_lost
+        energy_per_1k = (net_energy / self.total_steps * 1000.0) if self.total_steps > 0 else 0.0
+
         self.aggregates = ModeAggregates(
             mode=self.config.mode,
             n_deaths=len(self.deaths),
@@ -677,11 +698,13 @@ class ModelTester:
             # Consumption rates (per 1000 steps)
             food_per_1k_steps=self.total_food / steps_k,
             poison_per_1k_steps=self.total_poison / steps_k,
+            # Energy dynamics (THE key survival metric)
+            energy_per_1k_steps=energy_per_1k,
             # Rewards
             reward_mean=float(np.mean(rewards)),
             reward_std=float(np.std(rewards)),
-            # Efficiency (the key Goodhart metric)
-            # Overall efficiency from total consumption (the TRUE metric)
+            # Efficiency (secondary metric)
+            # Overall efficiency from total consumption
             overall_efficiency=self.total_food / (self.total_food + self.total_poison)
                 if (self.total_food + self.total_poison) > 0 else 1.0,
             # Per-death efficiency stats (can be misleading with few deaths)
@@ -737,6 +760,10 @@ class ModelTester:
         print(f"{'Food per 1k Steps':<25} {agg.food_per_1k_steps:>12.1f}")
         print(f"{'Poison per 1k Steps':<25} {agg.poison_per_1k_steps:>12.1f}")
         print(f"-"*65)
+        # Energy per 1k steps: THE key survival metric
+        # Positive = thriving, Negative = dying
+        energy_sign = '+' if agg.energy_per_1k_steps >= 0 else ''
+        print(f"{'Energy per 1k Steps':<25} {energy_sign}{agg.energy_per_1k_steps:>11.1f}")
         print(f"{'Overall Efficiency':<25} {agg.overall_efficiency:>12.1%}")
         print(f"{'='*65}")
 

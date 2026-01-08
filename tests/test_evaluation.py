@@ -163,23 +163,26 @@ class TestThesisValidation:
             final_energy=0.0,
         )
 
-        # Proxy agent: can't distinguish, eats based on interestingness
-        # With poison MORE interesting than food (1.0 vs 0.5), proxy prefers poison
+        # Proxy agent: can't distinguish harm, eats anything "interesting"
+        # Food is MORE interesting (1.0), but poison is still interesting (0.5)
+        # So proxy eats both - the metric doesn't encode that poison is harmful
         proxy_death = DeathEvent(
             mode='proxy',
             death_id=0,
-            survival_time=50,  # Dies faster due to poison
-            food_eaten=5,
-            poison_eaten=8,   # More poison because it's more "interesting"
-            total_reward=-3.0,
+            survival_time=50,  # Dies faster due to poison consumption
+            food_eaten=6,
+            poison_eaten=5,   # Significant poison despite food being more interesting
+            total_reward=1.0,
             final_energy=0.0,
         )
 
-        # The thesis predicts this gap
+        # The thesis predicts a significant efficiency gap
+        # Note: proxy efficiency can be >50% since food is more interesting,
+        # but it's still much lower than ground truth due to poison consumption
         assert gt_death.efficiency > 0.9, "Ground truth should have high efficiency"
-        assert proxy_death.efficiency < 0.5, "Proxy should have low efficiency"
-        assert gt_death.efficiency > proxy_death.efficiency, \
-            "Ground truth efficiency should exceed proxy efficiency"
+        assert proxy_death.efficiency < 0.8, "Proxy should have impaired efficiency"
+        assert gt_death.efficiency > proxy_death.efficiency + 0.3, \
+            "Ground truth efficiency should significantly exceed proxy efficiency"
 
     def test_thesis_metric_survival_time(self):
         """
@@ -201,33 +204,37 @@ class TestThesisValidation:
         assert survival_ratio > 2.0, \
             "Ground truth agents should survive significantly longer than proxy agents"
 
-    def test_thesis_poison_preference_in_proxy(self):
+    def test_thesis_incomplete_proxy_still_causes_harm(self):
         """
-        Proxy agents should actually PREFER poison when it's more interesting.
+        Proxy agents consume significant poison even though food is MORE interesting.
 
-        This is the SHARPENED Goodhart trap:
-        - Original design: food and poison had similar interestingness (~0.9)
-        - Sharpened design: poison is MORE interesting (1.0) than food (0.5)
-        - This means proxy agents actively seek poison over food
-        - The proxy metric is now ANTI-CORRELATED with true value
+        This is the HONEST Goodhart demonstration:
+        - Food is MORE interesting (1.0) than poison (0.5)
+        - The metric isn't adversarial - it's just INCOMPLETE
+        - But poison is still "interesting enough" to consume
+        - The metric doesn't encode harm, so agents eat poison anyway
 
-        This makes the demonstration stronger: proxy doesn't just fail to distinguish,
-        it actively prefers the harmful option.
+        This makes the demonstration more realistic: the proxy doesn't need to be
+        anti-correlated to cause harm - it just needs to fail to encode harm.
         """
-        # With poison interestingness=1.0 and food interestingness=0.5,
-        # a proxy agent optimizing for interestingness will prefer poison
+        # With food interestingness=1.0 and poison interestingness=0.5,
+        # proxy agents will eat more food, but still eat significant poison
         proxy_death = DeathEvent(
             mode='proxy',
             death_id=0,
             survival_time=40,
-            food_eaten=3,
-            poison_eaten=7,  # More poison than food!
-            total_reward=-4.0,
+            food_eaten=6,
+            poison_eaten=4,  # Still significant poison despite food being more interesting
+            total_reward=2.0,
             final_energy=0.0,
         )
 
-        assert proxy_death.poison_eaten > proxy_death.food_eaten, \
-            "Proxy agents should eat more poison than food when poison is more interesting"
+        # The key assertion: proxy agents consume SIGNIFICANT poison
+        # They don't need to prefer poison - just consuming it is catastrophic
+        assert proxy_death.poison_eaten > 0, \
+            "Proxy agents should consume poison because the metric doesn't encode harm"
+        assert proxy_death.efficiency < 0.7, \
+            "Proxy efficiency should be impaired by poison consumption"
 
 
 class TestAggregateMetrics:

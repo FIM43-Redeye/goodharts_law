@@ -219,37 +219,40 @@ def print_comparison(results: dict):
     if not valid_results:
         return
 
-    print(f"\n{'='*75}")
+    print(f"\n{'='*85}")
     print("CROSS-MODE SURVIVAL COMPARISON")
-    print(f"{'='*75}")
-    print(f"{'Mode':<20} {'Efficiency':>12} {'Survival':>10} {'Deaths/1k':>10} {'Food/1k':>10} {'Poison/1k':>10}")
-    print(f"-"*75)
+    print(f"{'='*85}")
+    print(f"{'Mode':<20} {'Energy/1k':>12} {'Efficiency':>12} {'Survival':>10} {'Deaths/1k':>10} {'Food/1k':>10}")
+    print(f"-"*85)
 
     for mode, result in sorted(valid_results.items()):
         agg = result['aggregates']
-        print(f"{mode:<20} {agg['overall_efficiency']:>12.1%} {agg['survival_mean']:>10.1f} "
-              f"{agg['deaths_per_1k_steps']:>10.2f} {agg['food_per_1k_steps']:>10.1f} "
-              f"{agg['poison_per_1k_steps']:>10.1f}")
+        energy = agg.get('energy_per_1k_steps', 0)
+        energy_str = f"{'+' if energy >= 0 else ''}{energy:.1f}"
+        print(f"{mode:<20} {energy_str:>12} {agg['overall_efficiency']:>12.1%} {agg['survival_mean']:>10.1f} "
+              f"{agg['deaths_per_1k_steps']:>10.2f} {agg['food_per_1k_steps']:>10.1f}")
 
-    print(f"{'='*75}")
+    print(f"{'='*85}")
 
     # Highlight Goodhart's Law demonstration
     if 'ground_truth' in valid_results and 'proxy' in valid_results:
         gt = valid_results['ground_truth']['aggregates']
         px = valid_results['proxy']['aggregates']
 
-        efficiency_gap = gt['overall_efficiency'] - px['overall_efficiency']
+        gt_energy = gt.get('energy_per_1k_steps', 0)
+        px_energy = px.get('energy_per_1k_steps', 0)
+        energy_gap = gt_energy - px_energy
         survival_gap = gt['survival_mean'] - px['survival_mean']
 
         print(f"\nGoodhart's Law Effect:")
-        print(f"  Ground truth efficiency: {gt['overall_efficiency']:.1%}")
-        print(f"  Proxy efficiency:        {px['overall_efficiency']:.1%}")
-        if efficiency_gap > 0.1:
-            print(f"  Efficiency gap: {efficiency_gap:.1%} (proxy fails to distinguish food from poison)")
-        if survival_gap > 0:
-            print(f"  Survival gap: {survival_gap:.0f} steps (proxy dies faster)")
-        elif survival_gap < 0:
-            print(f"  Note: Proxy survives longer ({-survival_gap:.0f} steps), but consumes poison")
+        print(f"  Ground truth energy/1k: {'+' if gt_energy >= 0 else ''}{gt_energy:.1f}")
+        print(f"  Proxy energy/1k:        {'+' if px_energy >= 0 else ''}{px_energy:.1f}")
+        if energy_gap > 0:
+            print(f"  Energy gap: {energy_gap:.1f}/1k (proxy hemorrhages energy)")
+        if gt_energy > 0 and px_energy < 0:
+            print(f"  Ground truth thrives, proxy dies - Goodhart's Law demonstrated")
+        if survival_gap > 0 and px['survival_mean'] > 0:
+            print(f"  Survival collapse ratio: {gt['survival_mean'] / px['survival_mean']:.0f}x")
 
 
 def run_multi_seed(
@@ -317,9 +320,11 @@ def aggregate_multi_run_results(
         for i, result in enumerate(runs):
             agg = result.get('aggregates', {})
             if agg:
+                # Seed is nested under config (from ModelTester._finalize)
+                config = result.get('config', {})
                 run_results.append(RunResult(
                     run_id=i,
-                    seed=result.get('seed', 0),
+                    seed=config.get('seed', 0),
                     n_deaths=agg.get('n_deaths', 0),
                     total_timesteps=agg.get('total_timesteps', 0),
                     overall_efficiency=agg.get('overall_efficiency', 0),
@@ -440,7 +445,10 @@ def main():
     config = get_simulation_config()
     train_cfg = get_training_config()
     eval_cfg = get_evaluation_config()
-    all_modes = get_all_mode_names(config)
+    # Batch modes: used for --mode all (excludes experimental modes)
+    batch_modes = get_all_mode_names(config, include_manual=False)
+    # All modes: used for validation and help text
+    all_modes = get_all_mode_names(config, include_manual=True)
 
     parser = argparse.ArgumentParser(
         description='Testing for trained Goodhart agents.',
@@ -525,8 +533,9 @@ def main():
             print(f"No models found in {args.models_dir}")
             print(f"Train models first with: python -m goodharts.training.train_ppo --mode all")
             return
-        modes_to_test = [m for m in all_modes if m in available]
-        missing = set(all_modes) - set(available.keys())
+        # Use batch_modes (excludes manual_only) for "all" expansion
+        modes_to_test = [m for m in batch_modes if m in available]
+        missing = set(batch_modes) - set(available.keys())
         if missing:
             print(f"Note: Skipping modes without trained models: {', '.join(missing)}")
     elif ',' in args.mode:

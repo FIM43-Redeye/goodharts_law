@@ -299,10 +299,10 @@ class TestLearnedBehavior:
 
     def test_learned_behavior_presets_exist(self):
         """Learned behavior presets should be registered."""
-        from goodharts.behaviors.learned import create_learned_behavior
+        from goodharts.behaviors.learned import create_learned_behavior, LEARNED_PRESETS
 
-        # Should be able to create these without errors
-        for preset in ['ground_truth', 'proxy', 'ground_truth_blinded']:
+        # Should be able to create all registered presets without errors
+        for preset in LEARNED_PRESETS.keys():
             behavior = create_learned_behavior(preset)
             assert behavior is not None
             assert isinstance(behavior, BehaviorStrategy)

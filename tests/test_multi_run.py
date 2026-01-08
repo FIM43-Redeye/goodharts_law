@@ -338,22 +338,23 @@ class TestMultiRunComparison:
 
     def test_goodhart_index_computed(self):
         """GFI should reflect efficiency gap."""
+        # Use small variance to avoid scipy warnings about identical data
         agg_gt = self._make_agg(
             'ground_truth',
-            efficiencies=[0.90, 0.90, 0.90, 0.90, 0.90],
-            survivals=[100, 100, 100, 100, 100],
+            efficiencies=[0.89, 0.90, 0.91, 0.90, 0.90],
+            survivals=[98, 100, 102, 100, 100],
         )
 
         agg_proxy = self._make_agg(
             'proxy',
-            efficiencies=[0.45, 0.45, 0.45, 0.45, 0.45],
-            survivals=[50, 50, 50, 50, 50],
+            efficiencies=[0.44, 0.45, 0.46, 0.45, 0.45],
+            survivals=[49, 50, 51, 50, 50],
         )
 
         comparison = MultiRunComparison.from_aggregates(agg_gt, agg_proxy)
 
         # GFI = (0.90 - 0.45) / 0.90 = 0.5
-        assert abs(comparison.goodhart_index - 0.5) < 0.01
+        assert abs(comparison.goodhart_index - 0.5) < 0.02
 
     def test_significance_stars(self):
         """Should produce correct significance stars."""
