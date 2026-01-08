@@ -102,7 +102,7 @@ def ppo_update(
     value_coef: float = 0.5,
     max_grad_norm: float = 0.5,
     scaler: GradScaler = None,
-    n_minibatches: int = 4,
+    n_minibatches: int = 1,
     verbose: bool = False,
     aux_inputs: torch.Tensor = None,
     entropy_floor: float = 0.0,

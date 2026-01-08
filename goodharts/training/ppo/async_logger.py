@@ -145,6 +145,10 @@ class AsyncLogger:
         
         # Dashboard update
         if self.dashboard:
+            # Use new aggregate fields (food_sum, poison_sum, reward_sum)
+            # These are populated by BackgroundBookkeeper; episode_stats is legacy
+            n = p.episodes_count if p.episodes_count > 0 else 1
+
             # Flat dictionary format expected by dashboard._process_updates()
             payload = {
                 'policy_loss': p.policy_loss,
@@ -153,9 +157,9 @@ class AsyncLogger:
                 'explained_var': p.explained_var,
                 'action_probs': p.action_probs,
                 'total_steps': p.total_steps,
-                # Episode stats (if available)
-                'reward': p.episode_stats.get('reward', 0) if p.episode_stats else 0,
-                'food': p.episode_stats.get('food', 0) if p.episode_stats else 0,
-                'poison': p.episode_stats.get('poison', 0) if p.episode_stats else 0,
+                # Episode stats from aggregates (new format)
+                'reward': p.reward_sum / n,
+                'food': p.food_sum / n,
+                'poison': p.poison_sum / n,
             }
             self.dashboard.update(p.mode, 'update', payload)

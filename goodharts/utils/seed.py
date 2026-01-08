@@ -14,12 +14,22 @@ Usage:
     seed = set_seed(None)  # Returns the seed that was used
     print(f"Using seed: {seed}")
 
-    # Full determinism (slower, for debugging)
+    # Full determinism (slower, for debugging/evaluation)
     seed = set_seed(42, deterministic=True)
+
+    # Training mode: set seeds but allow non-deterministic ops like multinomial
+    seed = set_seed(42, deterministic=True, warn_only=True)
+
+Determinism Notes:
+    For CUDA: Requires CUBLAS_WORKSPACE_CONFIG=:4096:8 (set automatically).
+    For ROCm: HIP respects use_deterministic_algorithms without special env vars.
+    Operations like torch.multinomial have no deterministic CUDA implementation;
+    use warn_only=True for training, or use argmax for deterministic evaluation.
 """
 import os
 import random
 import time
+import warnings
 from typing import Optional
 
 import numpy as np
@@ -47,6 +57,7 @@ def get_random_seed() -> int:
 def set_seed(
     seed: Optional[int] = None,
     deterministic: bool = False,
+    warn_only: bool = False,
     verbose: bool = False,
 ) -> int:
     """
@@ -56,13 +67,17 @@ def set_seed(
     - Python's random module
     - NumPy's random
     - PyTorch CPU
-    - PyTorch CUDA (if available)
+    - PyTorch CUDA/ROCm (if available)
 
     Args:
         seed: Seed value. If None, generates a random seed.
         deterministic: If True, enables PyTorch deterministic mode.
                       This may significantly impact performance but
                       guarantees reproducibility across runs.
+        warn_only: If True with deterministic=True, warn instead of error
+                   when non-deterministic ops are encountered. Use this for
+                   training (which needs multinomial sampling) while still
+                   setting all other determinism flags.
         verbose: If True, print the seed being used.
 
     Returns:
@@ -94,22 +109,42 @@ def set_seed(
     # PyTorch CPU
     torch.manual_seed(seed)
 
-    # PyTorch CUDA (all devices)
+    # PyTorch CUDA/ROCm (all devices)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)  # For multi-GPU
 
     # Deterministic mode (optional, impacts performance)
     if deterministic:
+        # cuBLAS workspace config required for some deterministic ops on CUDA
+        # ROCm/HIP doesn't need this but it's harmless to set
+        if 'CUBLAS_WORKSPACE_CONFIG' not in os.environ:
+            os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
         # PyTorch 1.8+ deterministic algorithms
         if hasattr(torch, 'use_deterministic_algorithms'):
-            try:
-                torch.use_deterministic_algorithms(True)
-            except RuntimeError:
-                # Some operations don't have deterministic implementations
-                pass
+            if warn_only:
+                # Training mode: warn about non-deterministic ops but don't fail
+                # This allows multinomial sampling while keeping other ops deterministic
+                torch.use_deterministic_algorithms(True, warn_only=True)
+                if verbose:
+                    print("[Seed] Deterministic mode (warn_only): will warn on non-deterministic ops")
+            else:
+                # Strict mode: fail on non-deterministic ops
+                # Use this for evaluation with argmax (no multinomial needed)
+                try:
+                    torch.use_deterministic_algorithms(True)
+                except RuntimeError as e:
+                    # This shouldn't happen at seed time, but could happen later
+                    # if the function is called after non-deterministic ops are queued
+                    warnings.warn(
+                        f"Could not enable full determinism: {e}. "
+                        "Use warn_only=True for training, or ensure no non-deterministic "
+                        "ops are pending."
+                    )
         if verbose:
             print("[Seed] Deterministic mode enabled (may impact performance)")
 

@@ -63,7 +63,6 @@ class PPOConfig:
 
     # Reproducibility
     seed: Optional[int] = 42  # Default 42 for reproducibility; None = random
-    deterministic: bool = False  # Full determinism (slower)
 
     # Validation episodes (periodic eval without exploration)
     validation_interval: int = 0     # Every N updates (0 = disabled)

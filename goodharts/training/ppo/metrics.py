@@ -263,19 +263,26 @@ class BackgroundBookkeeper:
         sps_global = work.total_steps / max(elapsed, 1e-6)
 
         # Generate profiler summary (from pre-captured CUDA events)
+        # Aggregate by name since we have 128 Inference ticks per update
         profiler_summary = ""
         if work.profiler_enabled and work.profiler_events:
             try:
-                summaries = []
+                # Wait for the last event to complete before querying times
+                # This only syncs up to the last recorded event, not all GPU work
+                last_event = work.profiler_events[-1][2]  # end_event of last tuple
+                last_event.synchronize()
+
+                times: dict[str, float] = {}
                 for name, start_event, end_event in work.profiler_events:
-                    # This synchronizes the events (already complete by now)
                     duration_ms = start_event.elapsed_time(end_event)
-                    summaries.append(f"{name}:{duration_ms:.1f}ms")
+                    times[name] = times.get(name, 0.0) + duration_ms
+                # Format: name:total_ms (sorted by insertion order)
+                summaries = [f"{name}:{ms:.1f}ms" for name, ms in times.items()]
                 profiler_summary = " | ".join(summaries)
-            except RuntimeError:
+            except RuntimeError as e:
                 # CUDA event timing can fail if events weren't recorded properly
                 # This is non-critical - just skip profiler summary
-                profiler_summary = "(profiler timing unavailable)"
+                profiler_summary = f"(profiler timing unavailable: {e})"
 
         # Log via AsyncLogger
         log_payload = LogPayload(

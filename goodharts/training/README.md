@@ -71,8 +71,7 @@ max_poison = 100
 | `-t, --timesteps N` | Total environment steps (alternative to updates) |
 | `-e, --n-envs N` | Parallel environments (higher = faster, more VRAM) |
 | `-d, --dashboard` | Live training visualization |
-| `--seed N` | Random seed for reproducibility |
-| `--deterministic` | Full reproducibility (slower) |
+| `--seed N` | Random seed for reproducibility (default: 42) |
 | `-b, --benchmark` | Measure throughput without saving models |
 | `--no-amp` | Disable mixed precision |
 | `--compile-mode` | torch.compile mode: `reduce-overhead`, `max-autotune` |
@@ -125,6 +124,33 @@ device = "cuda"
 ### AMD GPUs (ROCm)
 
 MIOpen (AMD's cuDNN equivalent) doesn't cache algorithm selection across processes, causing slow startup with `cudnn.benchmark=True`. The trainer auto-detects AMD and disables benchmark mode for faster startup with minimal throughput impact.
+
+---
+
+## Reproducibility
+
+Training uses seeded random number generators:
+
+```bash
+python -m goodharts.training.train_ppo --mode ground_truth --seed 42
+```
+
+**Why training is inherently non-deterministic:**
+
+PPO training uses `Categorical.sample()` for action selection, which internally calls `torch.multinomial`. This operation has **no deterministic CUDA implementation** in PyTorch. This is a fundamental GPU limitation, not a bug.
+
+**What the seed provides:**
+- Identical initial weights
+- Identical environment layouts
+- Identical data ordering
+- Very similar (but not bit-identical) training trajectories
+
+**What this means in practice:**
+- Training with the same seed produces *very similar* but not bit-for-bit identical results
+- This is standard in RL research; papers report statistics over multiple seeds
+- Run multiple seeds and report mean/variance for robust results
+
+**Evaluation IS fully deterministic:** When using `--deterministic` during evaluation, actions are selected via `argmax` (no sampling), making results bit-for-bit reproducible. This is where thesis validation occurs.
 
 ---
 

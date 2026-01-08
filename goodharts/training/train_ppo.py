@@ -119,12 +119,15 @@ def main():
     """Main CLI entry point."""
     config = get_simulation_config()
     train_cfg = get_training_config()
-    all_modes = get_all_mode_names(config)
+    # Batch modes: used for --mode all (excludes experimental modes)
+    batch_modes = get_all_mode_names(config, include_manual=False)
+    # All modes: used for validation and help text
+    all_modes = get_all_mode_names(config, include_manual=True)
     brain_names = get_brain_names()
 
     # Get defaults from config for help text
     default_envs = train_cfg.get('n_envs', 64)
-    default_minibatches = train_cfg.get('n_minibatches', 4)
+    default_minibatches = train_cfg.get('n_minibatches', 1)
     default_brain = train_cfg.get('brain_type', 'base_cnn')
 
     parser = argparse.ArgumentParser(
@@ -180,8 +183,6 @@ def main():
                             help='Random seed (default: 42 for reproducibility)')
     experiment.add_argument('--random-seed', action='store_true',
                             help='Use random seed instead of default 42')
-    experiment.add_argument('--deterministic', action='store_true',
-                            help='Full determinism (slower, for debugging)')
     experiment.add_argument('--analyze', action='store_true',
                             help='Run evaluation after training and generate comparison stats')
     experiment.add_argument('--popart-beta-min', type=float, default=None, metavar='BETA',
@@ -264,12 +265,9 @@ def main():
     else:
         overrides['seed'] = args.seed  # Default 42 or user-specified
 
-    if args.deterministic:
-        overrides['deterministic'] = True
-
     # Parse mode(s) - supports "all", single mode, or comma-separated list
     if args.mode == 'all':
-        modes_to_train = all_modes
+        modes_to_train = batch_modes  # Excludes manual_only modes
     elif ',' in args.mode:
         modes_to_train = [m.strip() for m in args.mode.split(',')]
         invalid = [m for m in modes_to_train if m not in all_modes]

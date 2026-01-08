@@ -60,6 +60,42 @@ def _vprint(msg: str, verbose: bool):
         print(f"[VERBOSE] {msg}", flush=True)
 
 
+class MemoryTracker:
+    """Track GPU memory allocations at named checkpoints."""
+
+    def __init__(self, device: torch.device, enabled: bool = True):
+        self.device = device
+        self.enabled = enabled and device.type == 'cuda'
+        self.checkpoints: list[tuple[str, float, float]] = []  # (name, allocated_mb, delta_mb)
+        self._last_allocated = 0.0
+
+    def checkpoint(self, name: str):
+        """Record current memory allocation with delta from last checkpoint."""
+        if not self.enabled:
+            return
+        allocated = torch.cuda.memory_allocated(self.device) / 1024**2
+        delta = allocated - self._last_allocated
+        self.checkpoints.append((name, allocated, delta))
+        self._last_allocated = allocated
+
+    def report(self):
+        """Print memory breakdown report."""
+        if not self.enabled or not self.checkpoints:
+            return
+        print("\n   [Memory Breakdown]")
+        print("   " + "-" * 50)
+        for name, allocated, delta in self.checkpoints:
+            delta_str = f"+{delta:.1f}" if delta >= 0 else f"{delta:.1f}"
+            print(f"   {name:30s} {allocated:8.1f} MB ({delta_str:>8s} MB)")
+        print("   " + "-" * 50)
+        reserved = torch.cuda.memory_reserved(self.device) / 1024**2
+        print(f"   {'Reserved (memory pool)':30s} {reserved:8.1f} MB")
+        # Show largest allocations from memory stats
+        stats = torch.cuda.memory_stats(self.device)
+        peak = stats.get('allocated_bytes.all.peak', 0) / 1024**2
+        print(f"   {'Peak allocated':30s} {peak:8.1f} MB")
+
+
 class PPOTrainer:
     """
     PPO training orchestrator.
@@ -178,14 +214,17 @@ class PPOTrainer:
         cfg = self.config
 
         # Reproducibility: set all random seeds
-        self.seed = set_seed(
-            seed=cfg.seed,
-            deterministic=cfg.deterministic,
-            verbose=False
-        )
+        # Note: Training is inherently non-deterministic due to Categorical.sample()
+        # using multinomial, which has no deterministic CUDA implementation.
+        # Seeds provide run-to-run consistency for initialization and data order.
+        self.seed = set_seed(seed=cfg.seed, verbose=False)
 
         v = cfg.hyper_verbose
         _vprint("_setup() starting", v)
+
+        # Memory tracking (enabled in verbose mode)
+        self._mem_tracker = MemoryTracker(self.device, enabled=v)
+        self._mem_tracker.checkpoint("Initial")
 
         print(f"\n[PPO] Starting training: {cfg.mode}")
         print(f"   Device: {self.device}, Envs: {cfg.n_envs}, Seed: {self.seed}")
@@ -219,6 +258,7 @@ class PPOTrainer:
         print(f"   Env: {env_type}")
         _vprint("Environment created", v)
         print(f"   View: {self.vec_env.view_size}x{self.vec_env.view_size}, Channels: {self.vec_env.n_channels}")
+        self._mem_tracker.checkpoint("Environment (grids + buffers)")
 
         # Compile environment step for better GPU utilization (reduces CPU dispatch overhead)
         if cfg.compile_env:
@@ -252,6 +292,7 @@ class PPOTrainer:
         # Store architecture info before potential torch.compile (for serialization)
         self._policy_arch_info = self.policy.get_architecture_info()
         _vprint("Networks created and moved to device", v)
+        self._mem_tracker.checkpoint("Networks (policy + value head)")
 
         # AMP
         self.device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
@@ -275,6 +316,7 @@ class PPOTrainer:
             lr=cfg.lr,
             fused=use_fused
         )
+        self._mem_tracker.checkpoint("Optimizer (Adam state)")
 
         # Reward computer - unified class handles both numpy and torch
         # Shaping is now handled internally by each RewardComputer subclass
@@ -305,6 +347,7 @@ class PPOTrainer:
         self._aux_buf = self._rollout_buffers.aux
         self._finished_dones_buf = self._rollout_buffers.finished_dones
         self._finished_rewards_buf = self._rollout_buffers.finished_rewards
+        self._mem_tracker.checkpoint("Rollout buffers")
 
         # Note: step_idx tensor removed - buffer writes now use Python int index
         # outside the compiled function to avoid implicit .item() calls
@@ -337,6 +380,7 @@ class PPOTrainer:
                         print(f"   [JIT] Warning: torch.compile failed ({e}). Using eager mode.")
                     else:
                         raise e
+            self._mem_tracker.checkpoint("Compilation (if enabled)")
 
         # TensorBoard logging (always enabled, unified logging target)
         self.tb_writer = None
@@ -400,7 +444,8 @@ class PPOTrainer:
         print(f"   Brain: {cfg.brain_type} (hidden={self.policy.hidden_size})")
         print(f"   Value head: {cfg.value_head_type}")
         print(f"   AMP: {'Enabled' if cfg.use_amp else 'Disabled'}")
-    
+        self._mem_tracker.checkpoint("Setup complete (pre-warmup)")
+
     def _training_loop(self):
         """Main training loop."""
         cfg = self.config
@@ -528,6 +573,16 @@ class PPOTrainer:
             states = self.vec_env.reset()
             self.reward_computer.initialize(states)
             episode_rewards.zero_()
+
+        # Memory profiling after warmup (all lazy init complete)
+        self._mem_tracker.checkpoint("After warmup (peak setup)")
+        if self.device.type == 'cuda':
+            allocated_mb = torch.cuda.memory_allocated(self.device) / 1024**2
+            reserved_mb = torch.cuda.memory_reserved(self.device) / 1024**2
+            print(f"   [Memory] Allocated: {allocated_mb:.1f} MB, Reserved: {reserved_mb:.1f} MB", flush=True)
+            if v:  # hyper_verbose - full memory breakdown
+                self._mem_tracker.report()
+                print(torch.cuda.memory_summary(self.device, abbreviated=True), flush=True)
 
         # Start GPU monitor after warmup (if enabled)
         if cfg.gpu_log_interval_ms > 0:
@@ -1099,6 +1154,12 @@ class PPOTrainer:
         # Shutdown async logger first - flushes all queued logs
         if self.async_logger:
             self.async_logger.shutdown()
+
+        # Peak memory stats
+        if self.device.type == 'cuda':
+            peak_mb = torch.cuda.max_memory_allocated(self.device) / 1024**2
+            reserved_mb = torch.cuda.max_memory_reserved(self.device) / 1024**2
+            print(f"   [Memory] Peak allocated: {peak_mb:.1f} MB, Peak reserved: {reserved_mb:.1f} MB")
 
         if cfg.benchmark_mode:
             # Benchmark mode: just report throughput, don't save
