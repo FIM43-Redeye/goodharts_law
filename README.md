@@ -257,7 +257,13 @@ Training produces:
 
 ### Model Verification
 
-Note: The verification module (`goodharts.training.verification`) currently has an import error and needs repair.
+Verify trained models meet fitness thresholds:
+
+```bash
+python -m goodharts.training.verification --steps 1000 --verbose
+```
+
+This runs directional and survival checks to ensure models learned meaningful behaviors.
 
 ---
 

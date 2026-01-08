@@ -840,9 +840,9 @@ class PPOTrainer:
                     all_advantages = advantages.flatten()
 
                     if v:
-                        _vprint(f"   [DEBUG] Rewards: mean={rewards_buf.mean():.4f}, std={rewards_buf.std():.4f}", v)
-                        _vprint(f"   [DEBUG] Advantages: mean={all_advantages.mean():.4f}, std={all_advantages.std():.4f}", v)
-                        _vprint(f"   [DEBUG] Returns: mean={all_returns.mean():.4f}, std={all_returns.std():.4f}", v)
+                        _vprint(f"   Rewards: mean={rewards_buf.mean():.4f}, std={rewards_buf.std():.4f}", v)
+                        _vprint(f"   Advantages: mean={all_advantages.mean():.4f}, std={all_advantages.std():.4f}", v)
+                        _vprint(f"   Returns: mean={all_returns.mean():.4f}, std={all_returns.std():.4f}", v)
 
                     # Normalize advantages
                     all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)

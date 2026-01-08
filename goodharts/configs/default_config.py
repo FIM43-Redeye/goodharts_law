@@ -263,15 +263,3 @@ def get_simulation_config(config_path: str | None = None):
     config['get_observation_spec'] = lambda mode: ObservationSpec.for_mode(mode, config)
 
     return config
-
-
-# Deprecated alias for backward compatibility
-def get_config(config_path: str | None = None):
-    """DEPRECATED: Use get_simulation_config() instead."""
-    import warnings
-    warnings.warn(
-        "get_config() is deprecated, use get_simulation_config()",
-        DeprecationWarning,
-        stacklevel=2
-    )
-    return get_simulation_config(config_path)
