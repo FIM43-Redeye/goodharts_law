@@ -152,4 +152,4 @@ config.toml
 CLAUDE.local.md
 
 # Root-level artifacts (models should go in models/)
-/*.pth
+/*.pthSUBMISSION_CHECKLIST.md
