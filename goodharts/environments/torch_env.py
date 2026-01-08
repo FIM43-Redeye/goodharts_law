@@ -769,7 +769,8 @@ class TorchVecEnv(nn.Module):
 
         The proxy agent sees the same value in both channels, making
         food and poison indistinguishable - only magnitude matters.
-        Poison has higher interestingness (1.0 > 0.5), creating the Goodhart trap.
+        Food has higher interestingness (1.0 > 0.5), but poison is still
+        "interesting enough" to consume, creating the Goodhart trap.
 
         For proxy modes, also computes ground truth encoding into _privileged_view_buffer
         for the value function (asymmetric actor-critic). This reuses the same

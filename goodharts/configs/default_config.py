@@ -150,7 +150,7 @@ class CellType:
     Usage:
         CellType.FOOD.value          # 1
         CellType.FOOD.energy_delta   # 1.0 (from config)
-        CellType.FOOD.interestingness # 0.5 (from config)
+        CellType.FOOD.interestingness # 1.0 (from config)
         CellType.all_types()         # List of all CellTypeInfo
     """
     # Descriptors for lazy-loading from TOML

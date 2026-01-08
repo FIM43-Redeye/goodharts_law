@@ -33,6 +33,7 @@ def make_run_result(
     survival_std: float = 30.0,
     n_deaths: int = 50,
     total_timesteps: int = 10000,
+    energy_per_1k_steps: float = 45.0,
 ) -> RunResult:
     """Create a mock RunResult for testing."""
     return RunResult(
@@ -48,6 +49,7 @@ def make_run_result(
         poison_per_1k_steps=5.0,
         food_per_death_mean=10.0,
         poison_per_death_mean=1.0,
+        energy_per_1k_steps=energy_per_1k_steps,
         reward_mean=50.0,
     )
 
@@ -70,6 +72,7 @@ class TestRunResult:
             'poison_per_1k_steps': 7.0,
             'food_per_death_mean': 8.0,
             'poison_per_death_mean': 1.5,
+            'energy_per_1k_steps': 33.0,
             'reward_mean': 45.0,
         }
 
@@ -94,6 +97,7 @@ class TestRunResult:
             'poison_per_1k_steps': 5.0,
             'food_per_death_mean': 10.0,
             'poison_per_death_mean': 1.0,
+            'energy_per_1k_steps': 45.0,
             'reward_mean': 50.0,
             'extra_field': 'should_be_ignored',
         }

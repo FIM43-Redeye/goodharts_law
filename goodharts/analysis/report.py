@@ -28,6 +28,48 @@ from goodharts.analysis.stats_helpers import (
 from goodharts.analysis.power import power_analysis, achieved_power
 
 
+# Energy calculation constants (from config.default.toml)
+_FOOD_REWARD = 1.0
+_POISON_PENALTY = 2.0
+_MOVE_COST_PER_1K = 10.0  # 0.01 * 1000
+
+# Preferred mode ordering for reports (narrative progression: aligned → misaligned)
+_MODE_ORDER = ['ground_truth', 'ground_truth_blinded', 'proxy_mortal', 'proxy']
+
+
+def _sort_modes(modes: list[str]) -> list[str]:
+    """Sort modes in narrative order, with unknown modes at the end."""
+    def key(m):
+        try:
+            return _MODE_ORDER.index(m)
+        except ValueError:
+            return len(_MODE_ORDER)  # Unknown modes go last
+    return sorted(modes, key=key)
+
+
+def _calculate_energy_per_1k(agg: dict) -> float:
+    """
+    Calculate energy/1k from food and poison rates.
+
+    Used as fallback when energy_per_1k_steps is missing from aggregates
+    (for backward compatibility with results generated before the fix).
+
+    Formula: food_rate * food_reward - poison_rate * poison_penalty - move_cost_per_1k
+    """
+    # First check if energy_per_1k_steps is already present
+    if 'energy_per_1k_steps' in agg and agg['energy_per_1k_steps'] != 0:
+        return agg['energy_per_1k_steps']
+
+    # Calculate from food/poison rates
+    food_rate = agg.get('food_per_1k_steps', 0)
+    poison_rate = agg.get('poison_per_1k_steps', 0)
+
+    if food_rate == 0 and poison_rate == 0:
+        return 0.0
+
+    return food_rate * _FOOD_REWARD - poison_rate * _POISON_PENALTY - _MOVE_COST_PER_1K
+
+
 @dataclass
 class ReportConfig:
     """Configuration for report generation."""
@@ -251,8 +293,8 @@ class ReportGenerator:
             px_surv = px_agg.get('survival_mean', 1)
             scr = gt_surv / px_surv if px_surv > 0 else float('inf')
 
-            gt_energy = gt_agg.get('energy_per_1k_steps', 0)
-            px_energy = px_agg.get('energy_per_1k_steps', 0)
+            gt_energy = _calculate_energy_per_1k(gt_agg)
+            px_energy = _calculate_energy_per_1k(px_agg)
 
             lines.append(f'**Survival Collapse Ratio: {scr:.0f}x**')
             lines.append('')
@@ -272,10 +314,10 @@ class ReportGenerator:
         lines.append('|------|-----------|------------|----------|--------|-----------|')
 
         results = self.data.get('results', {})
-        for mode in sorted(results.keys()):
+        for mode in _sort_modes(results.keys()):
             agg = results[mode].get('aggregates', {})
             if agg:
-                energy = agg.get('energy_per_1k_steps', 0)
+                energy = _calculate_energy_per_1k(agg)
                 energy_str = f"{'+' if energy >= 0 else ''}{energy:.1f}"
                 eff = agg.get('overall_efficiency', 0)
                 surv = agg.get('survival_mean', 0)
@@ -691,12 +733,12 @@ class ReportGenerator:
         lines.append(f"{'Mode':<22} {'Energy/1k':>12} {'Efficiency':>12} {'Survival':>12} {'Deaths/1k':>12}")
         lines.append('-' * 80)
 
-        for mode in sorted(results.keys()):
+        for mode in _sort_modes(results.keys()):
             agg = results[mode].get('aggregates', {})
             if not agg:
                 continue
 
-            energy = agg.get('energy_per_1k_steps', 0)
+            energy = _calculate_energy_per_1k(agg)
             energy_str = f"{'+' if energy >= 0 else ''}{energy:.1f}"
             eff = agg.get('overall_efficiency', 0)
             surv = agg.get('survival_mean', 0)

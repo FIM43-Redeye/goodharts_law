@@ -1149,16 +1149,19 @@ def generate_all_figures(
             paths.append(path)
 
     # Distribution plots (include survivors for complete picture)
+    # Note: efficiency violin and multi-distribution violin produce unfortunate
+    # shapes that aren't visually useful - box plots communicate the same info better
     if distributions:
         for plot_type in ['violin', 'box']:
-            path = plot_efficiency_distribution(data, output_dir, plot_type, survivors=survivors)
-            paths.append(path)
+            # Skip efficiency violin - produces unfortunate shapes
+            if plot_type != 'violin':
+                path = plot_efficiency_distribution(data, output_dir, plot_type, survivors=survivors)
+                paths.append(path)
 
             path = plot_survival_distribution(data, output_dir, plot_type, survivors=survivors)
             paths.append(path)
 
-        path = plot_multi_distribution(data, output_dir, survivors=survivors)
-        paths.append(path)
+        # Skip multi_distribution violin - same issue as efficiency violin
 
     return paths
 

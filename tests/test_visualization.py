@@ -197,10 +197,10 @@ class TestDistributionPlots:
     def test_efficiency_distribution_creates_file(self, sample_data, output_dir):
         """plot_efficiency_distribution should create output file."""
         with patch('plotly.graph_objects.Figure.write_image') as mock_write:
-            plot_efficiency_distribution(sample_data, output_dir)
+            plot_efficiency_distribution(sample_data, output_dir, plot_type='box')
             mock_write.assert_called_once()
             call_path = mock_write.call_args[0][0]
-            assert 'efficiency_distribution_violin.png' in call_path
+            assert 'efficiency_distribution_box.png' in call_path
 
     def test_survival_distribution_creates_file(self, sample_data, output_dir):
         """plot_survival_distribution should create output file."""
@@ -278,8 +278,9 @@ class TestGenerateAllFigures:
                                         annotated=False, distributions=True)
 
         path_names = [p.name for p in paths]
-        # Generates both violin and box versions
-        assert 'efficiency_distribution_violin.png' in path_names
+        # Generates box for efficiency, violin+box for survival
+        # (efficiency violin produces unfortunate shapes)
+        assert 'efficiency_distribution_box.png' in path_names
         assert 'survival_distribution_violin.png' in path_names
 
 

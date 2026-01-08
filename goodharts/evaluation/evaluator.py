@@ -100,8 +100,15 @@ class EvaluationConfig:
     n_envs: int = 64
 
     # Determinism
-    deterministic: bool = False  # argmax actions when True
-    seed: Optional[int] = None
+    # NOTE: Setting a seed without deterministic=True does NOT guarantee reproducibility.
+    # torch.multinomial (used for action sampling) has no deterministic CUDA implementation.
+    # For statistical evaluation with large sample sizes (8192+ envs, 10k+ steps), this
+    # variance is negligible - the effect sizes dwarf sampling noise. Only use
+    # deterministic=True for debugging or exact reproduction, as argmax can degrade
+    # policy performance (agents trained with stochastic sampling may behave worse
+    # when forced into greedy action selection).
+    deterministic: bool = False  # argmax actions when True (may degrade performance)
+    seed: Optional[int] = None   # Seeds RNGs but doesn't guarantee reproducibility
     temperature: float = 1.0  # ignored if deterministic
 
     # Environment settings - use training distribution by default

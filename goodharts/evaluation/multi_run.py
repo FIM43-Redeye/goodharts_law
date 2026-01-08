@@ -48,6 +48,9 @@ class RunResult:
     food_per_death_mean: float
     poison_per_death_mean: float
 
+    # Energy dynamics (THE key survival metric)
+    energy_per_1k_steps: float
+
     # Reward
     reward_mean: float
 
@@ -72,6 +75,7 @@ class RunResult:
             poison_per_1k_steps=agg.poison_per_1k_steps,
             food_per_death_mean=agg.food_per_death_mean,
             poison_per_death_mean=agg.poison_per_death_mean,
+            energy_per_1k_steps=agg.energy_per_1k_steps,
             reward_mean=agg.reward_mean,
         )
 
@@ -124,6 +128,10 @@ class MultiRunAggregates:
     food_rate_std: float
     poison_rate_mean: float
     poison_rate_std: float
+
+    # Energy dynamics (THE key survival metric)
+    energy_per_1k_mean: float
+    energy_per_1k_std: float
 
     # Individual run results for detailed analysis
     runs: list[RunResult] = field(default_factory=list)
@@ -407,6 +415,9 @@ def aggregate_runs(mode: str, runs: list[RunResult]) -> MultiRunAggregates:
     food_rates = [r.food_per_1k_steps for r in runs]
     poison_rates = [r.poison_per_1k_steps for r in runs]
 
+    # Energy dynamics (THE key survival metric)
+    energy_rates = [r.energy_per_1k_steps for r in runs]
+
     return MultiRunAggregates(
         mode=mode,
         n_runs=n_runs,
@@ -431,6 +442,8 @@ def aggregate_runs(mode: str, runs: list[RunResult]) -> MultiRunAggregates:
         food_rate_std=float(np.std(food_rates, ddof=1)) if n_runs > 1 else 0.0,
         poison_rate_mean=float(np.mean(poison_rates)),
         poison_rate_std=float(np.std(poison_rates, ddof=1)) if n_runs > 1 else 0.0,
+        energy_per_1k_mean=float(np.mean(energy_rates)),
+        energy_per_1k_std=float(np.std(energy_rates, ddof=1)) if n_runs > 1 else 0.0,
         runs=runs,
     )
 

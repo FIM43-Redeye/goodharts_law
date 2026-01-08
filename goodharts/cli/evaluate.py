@@ -197,6 +197,7 @@ def merge_results(results: dict, output_path: Path):
                 'deaths_per_1k': agg['deaths_per_1k_steps'],
                 'food_per_1k': agg['food_per_1k_steps'],
                 'poison_per_1k': agg['poison_per_1k_steps'],
+                'energy_per_1k': agg['energy_per_1k_steps'],
             }
 
     if aggregates:
@@ -335,6 +336,7 @@ def aggregate_multi_run_results(
                     poison_per_1k_steps=agg.get('poison_per_1k_steps', 0),
                     food_per_death_mean=agg.get('food_per_death_mean', 0),
                     poison_per_death_mean=agg.get('poison_per_death_mean', 0),
+                    energy_per_1k_steps=agg.get('energy_per_1k_steps', 0),
                     reward_mean=agg.get('reward_mean', 0),
                 ))
 
@@ -352,6 +354,7 @@ def aggregate_multi_run_results(
                     'deaths_per_1k_steps': agg.death_rate_mean,
                     'food_per_1k_steps': agg.food_rate_mean,
                     'poison_per_1k_steps': agg.poison_rate_mean,
+                    'energy_per_1k_steps': agg.energy_per_1k_mean,
                     'total_deaths': agg.total_deaths,
                     'total_timesteps': agg.total_timesteps,
                 },

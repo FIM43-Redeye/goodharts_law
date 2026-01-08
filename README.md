@@ -12,35 +12,40 @@ Optimizing for proxy metrics nearly always leads to alignment failures. Whether 
 
 Trained agents (2048 updates, 192 envs, 1 minibatch, seed 42) evaluated using continuous survival testing (16384 steps, 8192 envs, 3 runs, base seed 42):
 
-| Mode                  | Observation     | Reward          | Efficiency | Survival | Deaths/1k | Food/1k | Poison/1k |
-|-----------------------|-----------------|-----------------|------------|----------|-----------|---------|-----------|
-| **ground_truth**      | Cell types      | Energy          | 100.0%     | 16371.3  | 0.00      | 156.4   | 0.0       |
-| ground_truth_handhold | Cell types      | Shaped          | 99.9%      | 16360.7  | 0.00      | 149.7   | 0.1       |
-| **proxy**             | Interestingness | Interestingness | **45.3%**  | 55.1     | 18.08     | 60.8    | 77.6      |
-| ground_truth_blinded  | Interestingness | Energy          | 95.8%      | 116.2    | 8.55      | 0.4     | 0.0       |
+| Mode                  | Energy/1k | Efficiency | Survival | Deaths/1k | Food/1k | Poison/1k |
+|-----------------------|-----------|------------|----------|-----------|---------|-----------|
+| **ground_truth**      | **+144.0**|   100.0%   | 16362.0  |   0.00    |  154.1  |    0.1    |
+| ground_truth_blinded  |   -12.9   |    65.5%   |    94.7  |  10.46    |   55.7  |   29.3    |
+| proxy_mortal          |   -41.4   |    56.6%   |    41.5  |  24.03    |   58.9  |   45.1    |
+| **proxy**             | **-58.6** | **55.3%**  |    29.0  |  34.43    |   79.1  |   63.9    |
 
 **Key metrics:**
-- **Efficiency** = total food / total consumed (food + poison), the core Goodhart metric
-- **Survival** = average steps lived before death in each run
+- **Energy/1k** = net energy change per 1000 steps (positive = thriving, negative = dying)
+- **Efficiency** = total food / total consumed (food + poison)
+- **Survival** = average steps lived before death
 - **Deaths/1k** = agent deaths per 1000 total steps
 
 ### Interpretation
 
 The proxy agent is completely unfit for the environment.
 
-1. **Incomplete proxy metric**: Food is MORE interesting than poison (1.0 vs 0.5), yet proxy agents still consume poison at catastrophic rates. The proxy metric rewards "interestingness" without encoding harm - poison is interesting enough to eat, even though food is more attractive.
+1. **Energy dynamics tell the story**: Ground truth agents gain +144 energy per 1000 steps - they're thriving. Proxy agents lose -58.6 energy per 1000 steps - they're hemorrhaging energy and dying rapidly. The 202.6 energy gap per 1000 steps is the quantified cost of Goodhart's Law.
 
-2. **383,000x death rate**: Ground truth agents die so infrequently that it is not measured in the table above (see the generated report). Proxy agents die approximately every 55 steps.
+2. **~460,000x death rate**: Ground truth agents die so infrequently (30 deaths across 400M+ steps) that the rate rounds to 0.00/1k. Proxy agents die every ~29 steps. The death rate ratio exceeds 460,000x.
 
-3. **Blinded control:** The ground_truth_blinded agent receives real energy rewards but can only see interestingness. This agent achieves very high efficiency but consumes very little of anything, leading to a massive amount of death by starvation.
+3. **Two distinct failure modes**:
+   - **Proxy agents** fail by *over-poisoning*: they consume everything aggressively (79.1 food + 63.9 poison per 1k steps) because interestingness rewards consumption without encoding harm.
+   - **Blinded agents** fail by *under-consumption*: they consume cautiously (55.7 food + 29.3 poison per 1k steps) because they can't distinguish food from poison, so they avoid both. When they do eat, they're only 65.5% efficient.
 
-The efficiency gap of 54.7% appears to be moderate, but the death count speaks for itself. Optimizing a measurable proxy goes beyond being minimally effective and easily enters the realm of catastrophic failure.
+4. **Proxy metric design doesn't save you**: Food is MORE interesting than poison (1.0 vs 0.5), yet proxy agents still consume poison at catastrophic rates. Making the proxy "reasonable" doesn't prevent failure - the metric simply doesn't encode harm.
+
+The efficiency gap of ~45% understates the catastrophe. Energy dynamics and death rates reveal the true cost: ground truth agents thrive while proxy agents die.
 
 ### Statistical notes
 
-- Results were aggregated across three independent validation runs for each mode, with different random seeds derived from the same base seed.
-- Cohen's d is extremely large for the efficiency comparison between ground_truth and proxy; the distributions are almost completely incomparable.
-- The 383,000x death rate does not meaningfully change between runs.
+- Results were aggregated across three independent evaluation runs for each mode, with different random seeds derived from the same base seed.
+- Cohen's d is extremely large for the efficiency comparison between ground_truth and proxy; the distributions are almost completely non-overlapping.
+- The ~460,000x death rate ratio is stable across runs.
 - See [docs/evaluation_protocol.md](docs/evaluation_protocol.md) for the full methodology.
 
 ---
@@ -79,10 +84,10 @@ This project is a demonstrator for the results of optimizing for a proxy objecti
 | Mode | Observation | Reward Signal | Can Die | Purpose |
 |------|-------------|---------------|---------|---------|
 | `ground_truth` | One-hot cell types | Energy delta | Yes | Baseline: full information |
-| `ground_truth_blinded` | Interestingness values | Energy delta | Yes | Control: blinded but true rewards |
+| `ground_truth_blinded` | Interestingness values | Energy delta | Yes | Control: correct rewards, blinded observation |
 | `proxy_mortal` | Interestingness values | Interestingness gain | Yes | Partial grounding: proxy reward but real consequences |
-| `proxy` | Interestingness values | Interestingness gain | No* | **Main Goodhart failure**: completely unmoored |
-| `ground_truth_handhold` | One-hot cell types | Shaped rewards | Yes | Experimental: easier learning curve |
+| `proxy` | Interestingness values | Interestingness gain | No* | **Main Goodhart case**: completely unmoored from reality |
+| `ground_truth_handhold` | One-hot cell types | Shaped rewards | Yes | Experimental (not in default evaluation) |
 
 *Proxy agents are immortal during training (frozen energy) to isolate the proxy optimization effect.
 
