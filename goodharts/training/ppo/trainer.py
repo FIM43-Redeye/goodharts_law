@@ -746,7 +746,7 @@ class PPOTrainer:
 
             # Store logits for action_probs logging
             last_logits = logits
-            self.profiler.tick("Inference")
+            self.profiler.tick("Rollout")  # Fused: env step + reward shaping + inference + buffer
             self.total_steps += cfg.n_envs
 
             # Carry forward for next iteration
@@ -767,8 +767,6 @@ class PPOTrainer:
 
             # PPO Update (when buffer is full)
             if step_in_buffer >= cfg.steps_per_env:
-                self.profiler.tick("Collection")
-
                 # Get bootstrap value (keep on GPU)
                 with record_function("GAE_COMPUTE"):
                     with torch.no_grad():

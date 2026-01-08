@@ -158,10 +158,8 @@ popart_beta_min = 0.001         # Min EMA decay for PopArt (smaller = slower ada
 popart_rescale_weights = true   # Rescale fc weights when stats change (required for correct values)
 action_space_type = "discrete_grid"
 
-# Environment curriculum
-initial_food = 256
-final_food = 64
-curriculum_fraction = 0.7
+# Environment randomization: each episode samples food/poison counts uniformly
+# This prevents overfitting to specific densities and improves generalization
 min_food = 64
 max_food = 256
 min_poison = 64

@@ -1,13 +1,22 @@
 """
-Model Evaluation for Goodhart's Law Experiments.
+DEPRECATED: Use 'python main.py evaluate' instead.
 
-Run trained models and collect per-episode metrics for analysis.
-Designed to be deterministic (argmax actions) for reproducible results.
+This module is retained for backwards compatibility but is no longer maintained.
+The primary evaluation interface is now:
 
-Usage:
-    python -m goodharts.analysis.evaluate --mode all --episodes 100
-    python -m goodharts.analysis.evaluate --mode ground_truth --episodes 1024 --batch-size 128
+    python main.py evaluate --mode all --full-report
+
+This provides timestep-based evaluation with statistical analysis and report
+generation. See 'python main.py evaluate --help' for options.
 """
+import warnings
+
+warnings.warn(
+    "goodharts.analysis.evaluate is deprecated. Use 'python main.py evaluate' instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
+
 import argparse
 import csv
 from dataclasses import dataclass, asdict

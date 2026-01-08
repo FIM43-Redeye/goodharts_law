@@ -10,7 +10,7 @@ import argparse
 import torch
 
 from .directional import test_directional_accuracy
-from .survival import compare_behaviors
+from .survival import run_comparative_verification
 
 
 def check_gpu():
@@ -53,11 +53,11 @@ def main():
     print("DIRECTIONAL ACCURACY TESTS")
     print("=" * 60)
     
-    gt_acc = test_directional_accuracy('models/ground_truth.pth', 'Ground Truth Model')
-    proxy_acc = test_directional_accuracy('models/proxy_trained.pth', 'Proxy Model')
-    
+    gt_acc = test_directional_accuracy('models/ppo_ground_truth.pth', 'Ground Truth Model')
+    proxy_acc = test_directional_accuracy('models/ppo_proxy.pth', 'Proxy Model')
+
     # Behavior comparison
-    compare_behaviors(steps=args.steps, verbose=args.verbose)
+    run_comparative_verification(steps=args.steps, runs=3)
     
     print("\n" + "=" * 60)
     print("VERIFICATION COMPLETE")
@@ -66,10 +66,10 @@ def main():
     # Final verdict
     if gt_acc >= 0.75:
         print("[OK] Models appear to be trained correctly")
-        print("  Run 'python main.py --learned' for visual demo")
+        print("  Run 'python main.py brain-view -m ground_truth' for visual demo")
     else:
         print("[WARN] Models may need retraining")
-        print("  Run 'python -m goodharts.training.train_ppo --mode both --epochs 100'")
+        print("  Run 'python main.py train --mode all --updates 128'")
 
 if __name__ == "__main__":
     main()

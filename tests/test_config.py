@@ -78,7 +78,7 @@ def test_convenience_accessors():
     assert 'speed' in get_visualization_config()
     assert 'enabled' in get_brain_view_config()
     assert isinstance(get_agents_list(), list)
-    assert 'initial_food' in get_training_config()  # Curriculum value
+    assert 'min_food' in get_training_config()  # Environment randomization
 
 
 def test_default_config_values():

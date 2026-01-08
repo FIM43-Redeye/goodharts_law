@@ -41,23 +41,30 @@ Configured via `config.toml` or `config.default.toml`:
 | `learning_rate` | 0.0003 | Adam optimizer LR |
 | `gamma` | 0.99 | Discount factor |
 | `gae_lambda` | 0.95 | GAE smoothing |
-| `eps_clip` | 0.2 | PPO clipping epsilon |
+| `eps_clip` | 0.2 | PPO clipping epsilon (decays to 0.1) |
 | `k_epochs` | 4 | Updates per batch |
 | `steps_per_env` | 128 | Horizon length |
 | `n_envs` | 192 | Parallel environments |
-| `entropy_coef` | 0.02 | Exploration bonus |
+| `entropy_initial` | 0.1 | Starting entropy coefficient |
+| `entropy_final` | 0.001 | Final entropy coefficient |
 | `value_coef` | 0.5 | Value loss weight |
 
-### Curriculum Learning
+### Entropy Scheduling
 
-Food and poison counts randomize each update to prevent overfitting:
+Entropy coefficient decays from `entropy_initial` to `entropy_final` over training,
+encouraging exploration early and exploitation late. An entropy floor prevents
+premature policy collapse during the learning phase.
+
+### Environment Randomization
+
+Food and poison counts randomize each episode to prevent overfitting:
 
 ```toml
 [training]
-min_food = 50
-max_food = 200
-min_poison = 20
-max_poison = 100
+min_food = 64
+max_food = 256
+min_poison = 64
+max_poison = 256
 ```
 
 ---
