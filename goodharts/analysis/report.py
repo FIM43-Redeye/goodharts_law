@@ -618,8 +618,8 @@ class ReportGenerator:
                     'Positive values mean agents are thriving (gaining energy faster than losing). '
                     'Negative values mean agents are dying (hemorrhaging energy). '
                     'Formula: (food_reward * food - poison_penalty * poison - move_cost * steps) / steps * 1000')
-        lines.append('- **Efficiency**: Food consumed / Total consumed. Secondary metric. '
-                    'Below 50% means worse than random chance.')
+        lines.append('- **Efficiency**: Per-agent mean of (food / total consumed). Secondary metric. '
+                    'Each agent weighted equally regardless of lifespan. Below 50% means worse than random chance.')
         lines.append('- **Survival Time**: Steps lived before each death. Higher is better.')
         lines.append('- **Deaths per 1000 Steps**: Population death rate. Lower is better.')
         lines.append('- **Survival Collapse Ratio (SCR)**: GT_survival / Proxy_survival. '

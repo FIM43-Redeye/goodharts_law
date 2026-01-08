@@ -152,4 +152,6 @@ config.toml
 CLAUDE.local.md
 
 # Root-level artifacts (models should go in models/)
-/*.pthSUBMISSION_CHECKLIST.md
+/*.pth
+SUBMISSION_CHECKLIST.md
+create_submission_zip.sh

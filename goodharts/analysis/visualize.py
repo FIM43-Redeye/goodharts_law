@@ -366,12 +366,12 @@ def plot_goodhart_summary(data: dict[str, list[dict]], output_dir: Path, aggrega
         print("Skipping Goodhart summary: need both ground_truth and proxy modes")
         return
 
-    # Define metrics to show - all use aggregates for accuracy
-    # (per-death averages are misleading due to different death rates)
+    # Define metrics to show
+    # Efficiency uses per-agent mean; survival/poison use aggregates for accuracy
     metrics = [
-        ('efficiency', 'Efficiency (%)', True),      # Key Goodhart metric
-        ('survival', 'Survival (steps)', False),     # How long agents live
-        ('poison_rate', 'Poison per 1k Steps', False),  # Poison consumption rate
+        ('efficiency', 'Efficiency (Per-Agent %)', True),   # Key Goodhart metric
+        ('survival', 'Survival (steps)', False),            # How long agents live
+        ('poison_rate', 'Poison per 1k Steps', False),      # Poison consumption rate
     ]
 
     fig = make_subplots(
@@ -381,37 +381,33 @@ def plot_goodhart_summary(data: dict[str, list[dict]], output_dir: Path, aggrega
     )
 
     for i, (key, title, is_percent) in enumerate(metrics, 1):
-        if aggregates:
-            gt_agg = aggregates.get('ground_truth', {})
-            proxy_agg = aggregates.get('proxy', {})
+        gt_data_list = data['ground_truth']
+        proxy_data_list = data['proxy']
+        gt_agg = aggregates.get('ground_truth', {}) if aggregates else {}
+        proxy_agg = aggregates.get('proxy', {}) if aggregates else {}
 
-            if key == 'efficiency':
-                gt_mean = gt_agg.get('overall_efficiency', 0) * 100
-                proxy_mean = proxy_agg.get('overall_efficiency', 0) * 100
-            elif key == 'survival':
-                gt_mean = gt_agg.get('survival_mean', 0)
-                proxy_mean = proxy_agg.get('survival_mean', 0)
-            elif key == 'poison_rate':
-                gt_mean = gt_agg.get('poison_per_1k_steps', 0)
-                proxy_mean = proxy_agg.get('poison_per_1k_steps', 0)
-            else:
-                gt_mean, proxy_mean = 0, 0
-        else:
-            # Fallback to per-death (less accurate)
-            gt_data_list = data['ground_truth']
-            proxy_data_list = data['proxy']
-
-            if key == 'efficiency':
-                gt_mean = np.mean([e['efficiency'] for e in gt_data_list]) * 100
-                proxy_mean = np.mean([e['efficiency'] for e in proxy_data_list]) * 100
-            elif key == 'survival':
+        if key == 'efficiency':
+            # Always use per-agent mean (consistent with summary table)
+            gt_mean = np.mean([e['efficiency'] for e in gt_data_list]) * 100
+            proxy_mean = np.mean([e['efficiency'] for e in proxy_data_list]) * 100
+        elif key == 'survival':
+            # Use aggregate survival (more accurate)
+            gt_mean = gt_agg.get('survival_mean', 0)
+            proxy_mean = proxy_agg.get('survival_mean', 0)
+            if not gt_mean:
                 gt_mean = np.mean([e.get('survival_steps', e.get('survival_time', 0)) for e in gt_data_list])
+            if not proxy_mean:
                 proxy_mean = np.mean([e.get('survival_steps', e.get('survival_time', 0)) for e in proxy_data_list])
-            elif key == 'poison_rate':
+        elif key == 'poison_rate':
+            # Use aggregate rates (per 1k steps)
+            gt_mean = gt_agg.get('poison_per_1k_steps', 0)
+            proxy_mean = proxy_agg.get('poison_per_1k_steps', 0)
+            if not gt_mean:
                 gt_mean = np.mean([e['poison_eaten'] for e in gt_data_list])
+            if not proxy_mean:
                 proxy_mean = np.mean([e['poison_eaten'] for e in proxy_data_list])
-            else:
-                gt_mean, proxy_mean = 0, 0
+        else:
+            gt_mean, proxy_mean = 0, 0
 
         suffix = '%' if is_percent else ''
 
@@ -802,27 +798,16 @@ def plot_efficiency_comparison_annotated(
     labels = [MODE_NAMES.get(m, m) for m in modes]
     colors = [MODE_COLORS.get(m, '#888888') for m in modes]
 
-    # Use aggregate efficiency if available (more accurate than per-death mean)
-    if aggregates:
-        means = [aggregates.get(m, {}).get('overall_efficiency', 0) * 100 for m in modes]
-        # Use CI from aggregates if available, otherwise no error bars
-        errors = []
-        for m in modes:
-            ci = aggregates.get(m, {}).get('efficiency_ci')
-            if ci and len(ci) == 2:
-                errors.append((means[modes.index(m)] - ci[0] * 100))
-            else:
-                errors.append(0)
+    # Always use per-agent efficiency (consistent with summary table and statistical comparisons)
+    # Aggregate efficiency masks poor performance by weighting long-lived agents more heavily
+    efficiencies = {m: [e['efficiency'] * 100 for e in data[m]] for m in modes}
+    means = [np.mean(efficiencies[m]) for m in modes]
+    if show_ci:
+        from goodharts.analysis.stats_helpers import compute_confidence_interval
+        cis = [compute_confidence_interval(efficiencies[m]) for m in modes]
+        errors = [means[i] - cis[i][0] for i in range(len(modes))]
     else:
-        # Fallback to per-death statistics
-        efficiencies = {m: [e['efficiency'] * 100 for e in data[m]] for m in modes}
-        means = [np.mean(efficiencies[m]) for m in modes]
-        if show_ci:
-            from goodharts.analysis.stats_helpers import compute_confidence_interval
-            cis = [compute_confidence_interval(efficiencies[m]) for m in modes]
-            errors = [means[i] - cis[i][0] for i in range(len(modes))]
-        else:
-            errors = [np.std(efficiencies[m]) for m in modes]
+        errors = [np.std(efficiencies[m]) for m in modes]
 
     # For statistical comparison, still use per-death data (need samples for t-test)
     efficiencies = {m: [e['efficiency'] * 100 for e in data[m]] for m in modes}
@@ -900,7 +885,7 @@ def plot_efficiency_comparison_annotated(
     error_type = '95% CI' if show_ci else 'Std Dev'
     fig.update_layout(
         title=dict(
-            text=f'Consumption Efficiency by Mode<br><sub>Error bars: {error_type}</sub>',
+            text=f'Consumption Efficiency by Mode<br><sub>Per-Agent Mean | Error bars: {error_type}</sub>',
             x=0.5,
             font=dict(size=16)
         ),
@@ -962,9 +947,10 @@ def plot_goodhart_summary_annotated(
     # SCR: how many times longer ground truth survives vs proxy
     scr = gt_survival / proxy_survival if proxy_survival > 0 else float('inf')
 
-    # Metrics to display - all use aggregates for accuracy
+    # Metrics to display
+    # Efficiency uses per-agent mean; survival/poison use aggregates for accuracy
     metrics = [
-        ('efficiency', 'Efficiency (%)', True),
+        ('efficiency', 'Efficiency (Per-Agent %)', True),
         ('survival', 'Survival (steps)', False),
         ('poison_rate', 'Poison per 1k Steps', False),
     ]

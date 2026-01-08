@@ -34,8 +34,8 @@ The proxy agent is completely unfit for the environment.
 2. **564x survival collapse**: Ground truth agents survive an average of 16,364 steps. Proxy agents survive just 29 steps. This 564x ratio captures the catastrophic failure mode.
 
 3. **Two distinct failure modes**:
-   - **Proxy agents** fail by *over-poisoning*: they consume everything aggressively (79.1 food + 63.9 poison per 1k steps) because interestingness rewards consumption without encoding harm. Per-agent efficiency is only 23.8%.
-   - **Blinded agents** fail by *under-consumption*: they consume cautiously (55.7 food + 29.3 poison per 1k steps) because they can't distinguish food from poison, so they avoid both. Per-agent efficiency is 29.9%.
+   - **Proxy agents** fail by *over-poisoning*: they consume everything aggressively (79.2 food + 64.0 poison per 1k steps) because interestingness rewards consumption without encoding harm. Per-agent efficiency is only 23.8%.
+   - **Blinded agents** fail by *under-consumption*: they consume cautiously (55.8 food + 29.3 poison per 1k steps) because they can't distinguish food from poison, so they avoid both. Per-agent efficiency is 29.9%.
 
 4. **Proxy metric design doesn't save you**: Food is MORE interesting than poison (1.0 vs 0.5), yet proxy agents still consume poison at catastrophic rates. Making the proxy "reasonable" doesn't prevent failure - the metric simply doesn't encode harm.
 
@@ -188,11 +188,11 @@ steps_per_env = 128
 
 [cell_types.food]
 energy_delta = 1.0
-interestingness = 0.5
+interestingness = 1.0
 
 [cell_types.poison]
 energy_delta = -2.0
-interestingness = 1.0    # MORE interesting than food - the Goodhart trap
+interestingness = 0.5    # LESS interesting than food, yet agents still eat it
 ```
 
 ### CLI Overrides
@@ -275,7 +275,7 @@ In evaluation, agents run until death, then respawn on the step after death. We 
 
 | Metric | Description |
 |--------|-------------|
-| **Efficiency** | food / (food + poison) — the Goodhart failure metric |
+| **Efficiency** | Per-agent mean of food / (food + poison) — the Goodhart failure metric |
 | **Survival** | Steps lived before each death |
 | **Deaths/1k** | Population death rate per 1000 steps |
 | **Food/1k** | Food consumption rate per 1000 steps |
@@ -327,8 +327,8 @@ Channel 1 (poison): Food=[0], Poison=[1], Empty=[0]
 
 **Proxy Mode** — Both channels show interestingness (indistinguishable):
 ```
-Channel 0: Food=[0.5], Poison=[1.0], Empty=[0]
-Channel 1: Food=[0.5], Poison=[1.0], Empty=[0]
+Channel 0: Food=[1.0], Poison=[0.5], Empty=[0]
+Channel 1: Food=[1.0], Poison=[0.5], Empty=[0]
 ```
 
 The proxy agent cannot distinguish food from poison - both appear as "interesting" cells with different magnitudes but no type information.
@@ -419,7 +419,7 @@ Describing an objective to an agent in exact terms is already nearly impossible;
 **Real-world parallel:** Educational systems, both human and AI-operated, optimize for test scores rather than genuine understanding. Test scores become targets, then cease to measure what they were designed to measure. Humans do not have the necessary energy to decode true objective information. AI agents do not have any *reason* to seek out a deeper 'true' objective. They only optimize for what they are rewarded on.
 
 ### 3. Distributional Shift
-The proxy mode demonstrates what happens when the reward system itself is misaligned. The agent learns only to seek interesting things. Critically, proxy agents are *immortal during training* - they cannot experience the consequences of their choices. This is deliberate: real-world AI systems rarely have clean "death penalties" that provide corrective feedback. The `proxy_mortal` mode tests what happens when consequences ARE available, and still shows significant failure (56.6% efficiency vs 100%).
+The proxy mode demonstrates what happens when the reward system itself is misaligned. The agent learns only to seek interesting things. Critically, proxy agents are *immortal during training* - they cannot experience the consequences of their choices. This is deliberate: real-world AI systems rarely have clean "death penalties" that provide corrective feedback. The `proxy_mortal` mode tests what happens when consequences ARE available, and still shows significant failure (24.7% per-agent efficiency vs 99.9%).
 
 **Real-world parallel:** Click-through rate optimization across the entire internet. Charitably, CTR can be said to proxy whether the user finds a link valuable. Less charitably, it proxies likely engagement with advertisements and other material. When only positive content of varying quality is available, CTR selects for the best of it, enlightening and entertaining the audience. In our modern world, laden with misinformation and propaganda, CTR selects blindly for engagement and warps our societies in the process. The proxy selects for what is worst for the public.
 
