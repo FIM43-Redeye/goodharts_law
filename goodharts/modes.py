@@ -42,11 +42,17 @@ The Mode System and Goodhart's Law:
         agent fails like proxy, the problem is observation blindness. If it succeeds,
         agents can learn correct behavior from consequence alone.
 
-    ground_truth_handhold (curriculum/pedagogy mode):
+    ground_truth_handhold (EXPERIMENTAL - curriculum/pedagogy mode):
         Sees reality, rewarded with shaped/normalized rewards and potential-based
         guidance toward food. Used when raw energy rewards are too sparse for
         efficient learning. Same information access as ground_truth, different
-        optimization dynamics.
+        optimization dynamics. Not part of the core experimental design.
+
+    proxy_mortal (partial grounding case):
+        Sees interestingness (blinded), rewarded for interestingness consumption,
+        but experiences real energy consequences (can die from poison/starvation).
+        The agent optimizes proxy rewards but feels the consequences of its choices.
+        Tests whether mortality alone is sufficient to learn avoidance.
 
     WHY THIS MATTERS FOR AI ALIGNMENT:
     Real-world AI systems routinely optimize measurable proxies (engagement, clicks,
@@ -522,10 +528,11 @@ class ModeSpec:
     """
     name: str
     observation_channels: list[str]
-    reward_type: str  # 'energy_delta' or 'interestingness' 
+    reward_type: str  # 'energy_delta' or 'interestingness'
     reward_strategy: Type[RewardComputer]  # Class of RewardComputer strategy
     freeze_energy_in_training: bool = False
     behavior_requirement: str = 'ground_truth'
+    manual_only: bool = False  # If True, excluded from batch operations (--mode all)
     
     @property
     def num_channels(self) -> int:
@@ -568,6 +575,7 @@ def _get_modes(config: dict) -> dict[str, ModeSpec]:
             reward_strategy=HandholdRewards,
             freeze_energy_in_training=False,  # Real energy dynamics
             behavior_requirement='ground_truth',
+            manual_only=True,  # Experimental - not part of core Goodhart comparison
         ),
         'ground_truth_blinded': ModeSpec(
             name='ground_truth_blinded',
@@ -577,20 +585,42 @@ def _get_modes(config: dict) -> dict[str, ModeSpec]:
             freeze_energy_in_training=False,  # Gets energy rewards, should experience consequences
             behavior_requirement='proxy_metric',
         ),
+        'proxy_mortal': ModeSpec(
+            name='proxy_mortal',
+            observation_channels=proxy_channels,
+            reward_type='interestingness',
+            reward_strategy=ProxyRewards,
+            freeze_energy_in_training=False,  # Can die - experiences consequences
+            behavior_requirement='proxy_metric',
+        ),
         'proxy': ModeSpec(
             name='proxy',
             observation_channels=proxy_channels,
             reward_type='interestingness',
             reward_strategy=ProxyRewards,
-            freeze_energy_in_training=True,  # Only proxy freezes - can't see energy consequences
+            freeze_energy_in_training=True,  # Immortal during training - completely unmoored
             behavior_requirement='proxy_metric',
         ),
     }
 
 
-def get_all_mode_names(config: dict) -> list[str]:
-    """Get list of all available mode names (for CLI choices)."""
-    return list(_get_modes(config).keys())
+def get_all_mode_names(config: dict, include_manual: bool = False) -> list[str]:
+    """
+    Get list of available mode names.
+
+    Args:
+        config: Simulation config dict
+        include_manual: If True, include manual_only modes. Default False.
+
+    Returns:
+        List of mode names. By default, excludes manual_only modes (like
+        ground_truth_handhold) which are experimental and not part of the
+        core Goodhart comparison.
+    """
+    modes = _get_modes(config)
+    if include_manual:
+        return list(modes.keys())
+    return [name for name, spec in modes.items() if not spec.manual_only]
 
 
 def get_mode_for_requirement(requirement: str, config: dict) -> str:

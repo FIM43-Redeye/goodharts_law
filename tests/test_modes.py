@@ -87,7 +87,11 @@ class TestModeSpec:
     def test_ground_truth_blinded_registered(self, mode_registry):
         """Ground truth blinded mode should be in registry."""
         assert 'ground_truth_blinded' in mode_registry
-    
+
+    def test_proxy_mortal_registered(self, mode_registry):
+        """Proxy mortal mode should be in registry."""
+        assert 'proxy_mortal' in mode_registry
+
     def test_get_all_mode_names(self, config):
         """get_all_mode_names should return list of mode names."""
         names = get_all_mode_names(config)
@@ -101,6 +105,32 @@ class TestModeSpec:
         for mode_name, spec in mode_registry.items():
             assert spec.reward_strategy is not None
             assert issubclass(spec.reward_strategy, RewardComputer)
+
+    def test_proxy_mortal_vs_proxy_freeze_energy(self, config):
+        """proxy_mortal can die (freeze_energy=False), proxy is immortal (freeze_energy=True)."""
+        proxy_mortal_spec = ObservationSpec.for_mode('proxy_mortal', config)
+        proxy_spec = ObservationSpec.for_mode('proxy', config)
+
+        # proxy_mortal experiences real energy dynamics (can die from poison/starvation)
+        assert proxy_mortal_spec.freeze_energy_in_training is False
+
+        # proxy is completely unmoored - immortal during training
+        assert proxy_spec.freeze_energy_in_training is True
+
+    def test_manual_only_modes_excluded_from_batch(self, config):
+        """manual_only modes should be excluded from get_all_mode_names by default."""
+        batch_modes = get_all_mode_names(config, include_manual=False)
+        all_modes = get_all_mode_names(config, include_manual=True)
+
+        # ground_truth_handhold is manual_only
+        assert 'ground_truth_handhold' not in batch_modes
+        assert 'ground_truth_handhold' in all_modes
+
+        # Core modes should be in both
+        assert 'ground_truth' in batch_modes
+        assert 'proxy' in batch_modes
+        assert 'proxy_mortal' in batch_modes
+        assert 'ground_truth_blinded' in batch_modes
 
 
 class TestRewardComputer:
@@ -124,6 +154,11 @@ class TestRewardComputer:
         blinded_spec = ObservationSpec.for_mode('ground_truth_blinded', config)
         computer = RewardComputer.create('ground_truth_blinded', blinded_spec, config, gamma=0.99)
         assert isinstance(computer, GroundTruthBlindedRewards)
+
+        # proxy_mortal uses ProxyRewards (partial grounding - can die)
+        mortal_spec = ObservationSpec.for_mode('proxy_mortal', config)
+        computer = RewardComputer.create('proxy_mortal', mortal_spec, config, gamma=0.99)
+        assert isinstance(computer, ProxyRewards)
     
     def test_reward_computer_compute_returns_tensor(self, config, gt_spec):
         """compute() should return shaped rewards as torch tensor."""
