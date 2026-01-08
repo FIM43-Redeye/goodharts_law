@@ -6,7 +6,7 @@ for side-by-side comparison of different training modes.
 
 Demonstrates Goodhart's Law through statistical divergence:
 - Ground truth agents maintain high food ratio
-- Proxy agents get attracted to poison (higher interestingness)
+- Proxy agents eat poison despite food being more interesting (interestingness doesn't encode harm)
 """
 import multiprocessing as mp
 from multiprocessing import Process, Queue as MPQueue

@@ -28,17 +28,27 @@ Efficiency directly measures the Goodhart failure: **can the agent distinguish b
 - **Proxy agents** see only interestingness → poor efficiency because the metric doesn't encode harm
 - **The efficiency gap** quantifies misalignment in a single number
 
-### Why Overall Efficiency, Not Mean
+### Efficiency Metrics: Per-Agent vs Aggregate
 
-- **Overall efficiency**: `total_food / (total_food + total_poison)` across all deaths
-- **Mean efficiency**: Average of per-death efficiency values
+We compute two efficiency metrics, each with different use cases:
 
-Mean efficiency is skewed by low-consumption deaths:
+- **Per-agent mean**: Average efficiency across individual agents (each agent weighted equally)
+- **Aggregate**: `total_food / (total_food + total_poison)` across all consumption
+
+**For cross-mode comparison, we use per-agent mean.** Here's why:
+
+Aggregate efficiency is dominated by high-consumption agents. Ground truth agents live ~16,000 steps and consume heavily. Proxy agents die after ~29 steps. Aggregate weights ground truth's consumption far more heavily, masking proxy's poor performance:
+- Aggregate proxy efficiency: 55% (looks almost reasonable)
+- Per-agent proxy efficiency: 24% (reveals the catastrophic failure)
+
+Per-agent mean treats each agent equally, regardless of lifespan. This reveals that the *typical* proxy agent performs worse than random chance.
+
+**For within-mode stability**, aggregate can be more stable when deaths vary in consumption:
 - Death 1: ate 100 food, 0 poison (100%)
 - Death 2: ate 1 food, 1 poison (50%)
-- Death 3: ate 0 food, 0 poison (undefined → 50%)
+- Mean: 75%. Aggregate: 99%.
 
-Mean: 67%. Overall: 99%. The overall metric better reflects true discrimination ability.
+But for our cross-mode Goodhart comparison, per-agent is the honest choice.
 
 ### Why Not Reward?
 

@@ -30,7 +30,7 @@ def test_proxy_observations_contain_interestingness(config):
     assert obs.max().item() > 0, \
         "Proxy observations are all zeros - encoding is broken!"
 
-    # Food has interestingness 0.5, poison 1.0
+    # Food has interestingness 1.0, poison 0.5
     # We should see these values in the observations
     nonzero_mask = obs > 0
     unique_values = torch.unique(obs[nonzero_mask])
