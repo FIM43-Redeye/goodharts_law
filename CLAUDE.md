@@ -57,10 +57,11 @@ User → main.py or train_ppo → Load TOML Config → TorchVecEnv (GPU) → Beh
 - **Behavior Registry** (`behaviors/registry.py`): Auto-discovery via introspection. Inherit from `BehaviorStrategy` and it's automatically available. Two types: hardcoded (OmniscientSeeker, ProxySeeker) and learned (CNN+PPO).
 
 - **Mode System** (`modes.py`): `ObservationSpec` + `RewardComputer` define training modes:
-  - `ground_truth`: One-hot cell types, energy-based reward
-  - `ground_truth_handhold`: Ground truth observations with scaled rewards (easier learning)
+  - `ground_truth`: One-hot cell types, energy-based reward (baseline)
   - `ground_truth_blinded`: Proxy observations but real energy reward (control condition)
-  - `proxy`: Interestingness values only, interestingness gain as reward
+  - `proxy_mortal`: Proxy observations, proxy reward, but can die (partial grounding)
+  - `proxy`: Proxy observations, proxy reward, immortal during training (main Goodhart case)
+  - `ground_truth_handhold`: Ground truth with shaped rewards (experimental, manual-only)
 
 - **Neural Network** (`behaviors/brains/base_cnn.py`): 3-layer CNN + 2 FC layers. Dynamic input channels based on observation format. Outputs 8-directional action logits.
 

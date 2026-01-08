@@ -3,42 +3,41 @@ Proxy-optimizing behavior that only sees interestingness signals.
 
 In proxy mode, both channels contain the same interestingness values,
 so this agent cannot distinguish food from poison based on cell type.
-With poison being MORE interesting (1.0) than food (0.5), this agent
-will actively PREFER poison. This is the Goodhart's Law trap.
+Even though food is MORE interesting (1.0) than poison (0.5), this agent
+still consumes poison because the metric doesn't encode harm.
 
 Goodhart's Law in Action:
     "When a measure becomes a target, it ceases to be a good measure."
 
     THE PROXY METRIC: "Interestingness" is a measurable signal that correlates
-    with valuable resources - food is interesting (0.5), poison is interesting
-    (1.0). But interestingness is NOT the true objective (survival/energy).
-    It's a proxy: easy to measure, but fundamentally disconnected from what
-    actually matters.
+    with resources - food is interesting (1.0), poison is also interesting
+    (0.5). But interestingness is NOT the true objective (survival/energy).
+    It's a proxy: easy to measure, but incomplete - it doesn't encode harm.
 
     INFORMATION BLINDNESS: The proxy observation encoding places the same
-    interestingness value in both channels. Food appears as (0.5, 0.5), poison
-    as (1.0, 1.0). The agent perceives different magnitudes but has no channel
-    that distinguishes cell TYPES. The encoding itself destroys the information
-    needed to survive.
+    interestingness value in both channels. Food appears as (1.0, 1.0), poison
+    as (0.5, 0.5). The agent perceives different magnitudes but has no channel
+    that distinguishes HARMFUL from SAFE. The encoding itself destroys the
+    information needed to survive.
 
     WHY OPTIMIZATION FAILS: This agent greedily maximizes interestingness.
-    Since poison (1.0) > food (0.5), the agent systematically PREFERS poison.
-    It achieves perfect performance on the proxy metric while dying. This is
-    the core Goodhart failure: optimizing the measure, not the goal.
+    Food is more interesting, so the agent prefers food when choosing. But
+    poison is ALSO interesting (0.5 > 0), so the agent consumes it too.
+    The metric doesn't signal "this will kill you" - it just says "interesting!"
+    This is the core Goodhart failure: the proxy is incomplete, not adversarial.
 
     REAL-WORLD PARALLELS:
     - Recommendation algorithms maximizing engagement (clicks, watch time)
-      instead of user wellbeing, leading to addictive or harmful content
+      without encoding "is this harmful?" - engagement doesn't mean wellbeing
     - Companies optimizing metrics that look good on reports but don't
-      reflect actual value creation
-    - ML models learning spurious correlations that ace benchmarks but
-      fail catastrophically in deployment
+      capture negative externalities
+    - ML models learning correlations that ace benchmarks but miss crucial
+      safety-relevant features
 
-    WHY ANTI-CORRELATION SHARPENS THE DEMONSTRATION: If poison had equal
-    interestingness to food, failures would be random (50% chance). By making
-    poison MORE interesting, the failure becomes systematic and dramatic -
-    the better the agent optimizes, the faster it dies. This makes the
-    Goodhart trap unmistakable rather than attributable to noise.
+    WHY INCOMPLETE > ANTI-CORRELATED: Real proxy metrics aren't designed to
+    cause harm - they just fail to capture everything that matters. Food being
+    MORE interesting than poison makes this demonstration more honest: the
+    metric isn't rigged against the agent, it's just missing a dimension.
 """
 import torch
 from goodharts.behaviors.base import BehaviorStrategy

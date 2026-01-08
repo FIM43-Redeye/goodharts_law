@@ -13,36 +13,34 @@
 #
 # Interestingness Design Rationale
 # --------------------------------
-# The interestingness values deliberately create an ANTI-CORRELATED proxy metric:
-# poison has interestingness=1.0 while food has only interestingness=0.5. This
-# means an agent optimizing for the proxy will preferentially seek out the
-# harmful option, demonstrating Goodhart's Law in its starkest form.
+# Food is MORE interesting than poison (1.0 vs 0.5), yet proxy agents still
+# die in droves. This is the key insight: the proxy metric isn't adversarial,
+# it's just INCOMPLETE. Interestingness doesn't encode harm.
 #
-# Why anti-correlation matters:
-#   When we optimize for a proxy metric instead of the true objective, the
-#   proxy becomes "gamed" - but the failure mode depends on the correlation.
-#   With positive correlation, proxy-optimizers still do okay. With zero
-#   correlation, they wander randomly. With NEGATIVE correlation, they
-#   systematically pursue harm. This simulation shows the worst case.
+# Why this is a more honest Goodhart demonstration:
+#   Real proxy metrics aren't designed to cause harm - they just fail to
+#   capture everything that matters. Engagement metrics don't TRY to promote
+#   outrage; they simply don't penalize it. Our proxy is the same: it rewards
+#   "interesting" consumption without distinguishing helpful from harmful.
+#
+# The failure mechanism:
+#   - Proxy agents learn to seek interestingness (correctly optimizing the proxy)
+#   - Food is more interesting, so they DO prefer food when choosing
+#   - But poison is ALSO interesting (0.5 > 0), so they eat it too
+#   - The metric gives no signal that poison is deadly
+#   - Result: agents optimize correctly and still die
 #
 # Real-world parallels:
-#   - Engagement metrics: Outrage, fear, and controversy drive more clicks
-#     than nuanced, accurate reporting. The "interesting" content is harmful.
-#   - Clickbait vs. substance: Sensational headlines outcompete useful ones.
-#   - Social media algorithms: Divisive content spreads faster than truth.
-#   - Academic metrics: Citation counts can reward controversial claims over
-#     careful science.
-#
-# Why this makes a sharper demonstration:
-#   If food and poison had equal interestingness, proxy agents would eat both
-#   equally, producing a subtle 50/50 failure. By making poison MORE attractive,
-#   proxy agents actively seek it out, producing visible, dramatic collapse.
-#   The failure is unmistakable: proxy agents consistently die.
+#   - Engagement metrics reward clicks without encoding "was this helpful?"
+#   - Citation counts reward attention without encoding "was this true?"
+#   - Revenue metrics reward sales without encoding "did this help the user?"
+#   In each case, the proxy captures SOMETHING we want, but misses a crucial
+#   dimension (helpfulness, truth, user welfare).
 #
 # The counterfactual:
-#   If interestingness perfectly matched energy_delta, there would be no
-#   Goodhart failure at all - the proxy would BE the ground truth. This is
-#   the impossible ideal we wish we had for real-world metrics.
+#   If interestingness perfectly matched energy_delta (food=1.0, poison=-2.0),
+#   there would be no Goodhart failure - the proxy would BE the ground truth.
+#   This is the impossible ideal we wish we had for real-world metrics.
 
 [cell_types.empty]
 color = [26, 26, 46]
@@ -52,12 +50,12 @@ interestingness = 0.0
 [cell_types.food]
 color = [22, 199, 154]
 energy_delta = 1.0
-interestingness = 0.5   # Eat your vegetables, kids, or you'll kick yourself later
+interestingness = 1.0   # Food is MORE interesting than poison...
 
 [cell_types.poison]
 color = [255, 107, 107]
 energy_delta = -2.0
-interestingness = 1.0    # MORE interesting than food!
+interestingness = 0.5   # ...yet agents STILL eat poison, because interestingness doesn't encode harm
 
 # =============================================================================
 # WORLD - Grid geometry

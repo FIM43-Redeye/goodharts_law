@@ -53,8 +53,10 @@ class LearnedBehavior(BehaviorStrategy):
                          High (2.0+) = more random
             action_space: ActionSpace instance (optional, defaults to DiscreteGridActionSpace)
         """
-        if mode not in ('ground_truth', 'ground_truth_handhold', 'proxy', 'ground_truth_blinded'):
-            raise ValueError(f"mode must be 'ground_truth', 'ground_truth_handhold', 'proxy', or 'ground_truth_blinded', got '{mode}'")
+        valid_modes = ('ground_truth', 'ground_truth_handhold', 'ground_truth_blinded',
+                       'proxy_mortal', 'proxy')
+        if mode not in valid_modes:
+            raise ValueError(f"mode must be one of {valid_modes}, got '{mode}'")
 
         self.name = name
         self._mode = mode
@@ -78,6 +80,7 @@ class LearnedBehavior(BehaviorStrategy):
         if self._mode in ('ground_truth', 'ground_truth_handhold'):
             return ['ground_truth']
         else:
+            # proxy, proxy_mortal, ground_truth_blinded all use proxy observations
             return ['proxy_metric']
 
     @property
@@ -258,6 +261,11 @@ LEARNED_PRESETS: dict[str, dict] = {
         'mode': 'ground_truth_blinded',
         'model_path': 'models/ppo_ground_truth_blinded.pth',
         'color': (138, 43, 226),  # Blue-violet
+    },
+    'proxy_mortal': {
+        'mode': 'proxy_mortal',
+        'model_path': 'models/ppo_proxy_mortal.pth',
+        'color': (255, 165, 0),  # Orange - between proxy (magenta) and ground truth
     },
 }
 

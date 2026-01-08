@@ -15,6 +15,7 @@ dependencies = [
     "dash-extensions>=1.0",
     "flask-sock>=0.6",
     "matplotlib",  # Still used by: main.py, visualization.py (main grid display)
+    "darkdetect",  # Cross-platform system theme detection (light/dark mode)
     "pytest",
 ]
 

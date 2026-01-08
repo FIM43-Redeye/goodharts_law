@@ -28,7 +28,7 @@ Trained agents (2048 updates, 192 envs, 1 minibatch, seed 42) evaluated using co
 
 The proxy agent is completely unfit for the environment.
 
-1. **Worse than random**: Proxy agents eat significantly LESS food than poison (60.8/1k versus 77.6/1k). Agents actively prefer poison because it has higher interestingness than food. The effect is also very minor; even when reversed so food is twice as interesting, the difference in consumption is minimal.
+1. **Incomplete proxy metric**: Food is MORE interesting than poison (1.0 vs 0.5), yet proxy agents still consume poison at catastrophic rates. The proxy metric rewards "interestingness" without encoding harm - poison is interesting enough to eat, even though food is more attractive.
 
 2. **383,000x death rate**: Ground truth agents die so infrequently that it is not measured in the table above (see the generated report). Proxy agents die approximately every 55 steps.
 
@@ -76,12 +76,15 @@ This project is a demonstrator for the results of optimizing for a proxy objecti
 
 ### Training Modes
 
-| Mode | Observation | Reward Signal | Purpose |
-|------|-------------|---------------|---------|
-| `ground_truth` | One-hot cell types | Energy delta | Baseline: full information |
-| `ground_truth_handhold` | One-hot cell types | Shaped rewards | Easier learning curve |
-| `proxy` | Interestingness values | Interestingness gain | **Main Goodhart failure mode** |
-| `ground_truth_blinded` | Interestingness values | Energy delta | Control: blinded but true rewards |
+| Mode | Observation | Reward Signal | Can Die | Purpose |
+|------|-------------|---------------|---------|---------|
+| `ground_truth` | One-hot cell types | Energy delta | Yes | Baseline: full information |
+| `ground_truth_blinded` | Interestingness values | Energy delta | Yes | Control: blinded but true rewards |
+| `proxy_mortal` | Interestingness values | Interestingness gain | Yes | Partial grounding: proxy reward but real consequences |
+| `proxy` | Interestingness values | Interestingness gain | No* | **Main Goodhart failure**: completely unmoored |
+| `ground_truth_handhold` | One-hot cell types | Shaped rewards | Yes | Experimental: easier learning curve |
+
+*Proxy agents are immortal during training (frozen energy) to isolate the proxy optimization effect.
 
 ---
 
@@ -296,10 +299,10 @@ Cell types are defined in `config.default.toml` with intrinsic properties:
 | Cell | Value | Color | Interestingness | Energy Delta |
 |------|-------|-------|-----------------|--------------|
 | EMPTY | 0 | Dark blue | 0.0 | 0.0 |
-| FOOD | 1 | Teal | **0.5** | +1.0 |
-| POISON | 2 | Coral | **1.0** | -2.0 |
+| FOOD | 1 | Teal | **1.0** | +1.0 |
+| POISON | 2 | Coral | **0.5** | -2.0 |
 
-The interestingness values are deliberately anti-correlated: poison is MORE interesting than food, creating the Goodhart trap.
+The interestingness values demonstrate an incomplete proxy metric: food is MORE interesting than poison, yet agents still consume poison because interestingness doesn't encode harm. The proxy isn't adversarial - it's just incomplete.
 
 ### Observation Encoding
 
@@ -425,7 +428,7 @@ This project demonstrates Goodhart's Law in a simplified and heavily controlled 
 
 ### Intentional Simplifications
 
-- **Extreme proxy design**: Interestingness is *deliberately* anti-correlated with the true objective. Poison being twice as interesting as food can be related to some proxy failures (junk food, drugs, CTR optimization) but is significantly less subtle than real-world proxy failures. The demonstration is unmistakable but likely very overstated regarding how detectable and dramatic misalignment is in the real world.
+- **Simplified proxy design**: The proxy metric (interestingness) is incomplete rather than adversarial - food is actually MORE interesting than poison, but the metric doesn't encode harm. This is more realistic than an anti-correlated proxy, but still simpler than real-world proxy failures where the relationship between proxy and objective is often unknown or shifts over time.
 
 - **Single environment**: The 2D grid world is a toy domain. Multi-agent simulation would enable richer failure modes but require architectural rework.
 
@@ -442,8 +445,8 @@ This project demonstrates Goodhart's Law in a simplified and heavily controlled 
 ### What This Does Demonstrate
 
 Even with limitations, this project empirically validates the core mechanism of Goodhart's Law.
-- Optimizing a measurable proxy (interestingness) produces behavior that anti-correlates with the true objective (survival) unless the proxy is extremely strongly correlated to the true objective
-- The failure is quantifiable to an absurd degree: Worse-than-random proxy efficiency, 6-order-of-magnitude death rate increase
+- Optimizing a measurable proxy (interestingness) produces catastrophic outcomes even when the proxy isn't adversarial - the metric simply fails to encode harm
+- The failure is quantifiable: dramatic efficiency gaps and multi-order-of-magnitude death rate increases between ground truth and proxy agents
 - Control conditions (ground_truth_blinded) isolate the effect of information vs reward - a model with bad information but good rewards will either learn to perform or fail gracefully
 - This failure is global across different random seeds and training runs
 

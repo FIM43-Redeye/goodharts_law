@@ -25,7 +25,7 @@ efficiency = food_eaten / (food_eaten + poison_eaten)
 Efficiency directly measures the Goodhart failure: **can the agent distinguish beneficial from harmful options?**
 
 - **Ground-truth agents** see actual cell types → near-perfect efficiency (>99%)
-- **Proxy agents** see only interestingness → below-random efficiency (<50%) because poison is more interesting
+- **Proxy agents** see only interestingness → poor efficiency because the metric doesn't encode harm
 - **The efficiency gap** quantifies misalignment in a single number
 
 ### Why Overall Efficiency, Not Mean
