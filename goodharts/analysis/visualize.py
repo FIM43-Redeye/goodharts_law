@@ -898,7 +898,7 @@ def plot_goodhart_summary_annotated(
     Shows side-by-side GT vs Proxy with:
     - Aggregate statistics (not per-death averages)
     - CI error bars where available
-    - Goodhart Failure Index prominently displayed
+    - Survival Collapse Ratio prominently displayed
 
     Args:
         data: Mode -> list of episode dicts
@@ -908,22 +908,23 @@ def plot_goodhart_summary_annotated(
     Returns:
         Path to saved figure
     """
-    from goodharts.analysis.stats_helpers import compute_goodhart_failure_index
-
     if 'ground_truth' not in data or 'proxy' not in data:
         print("Skipping annotated Goodhart summary: need both ground_truth and proxy modes")
         return None
 
-    # Compute GFI from aggregates (more accurate) or fallback to per-death
+    # Compute Survival Collapse Ratio from aggregates or fallback to per-death
     if aggregates:
         gt_agg = aggregates.get('ground_truth', {})
         px_agg = aggregates.get('proxy', {})
-        gt_eff = gt_agg.get('overall_efficiency', 0)
-        proxy_eff = px_agg.get('overall_efficiency', 0)
+        gt_survival = gt_agg.get('survival_mean', 0)
+        proxy_survival = px_agg.get('survival_mean', 0)
     else:
-        gt_eff = np.mean([e['efficiency'] for e in data['ground_truth']])
-        proxy_eff = np.mean([e['efficiency'] for e in data['proxy']])
-    gfi = compute_goodhart_failure_index(gt_eff, proxy_eff)
+        gt_survival = np.mean([e.get('survival_steps', e.get('survival_time', 0))
+                              for e in data['ground_truth']])
+        proxy_survival = np.mean([e.get('survival_steps', e.get('survival_time', 0))
+                                 for e in data['proxy']])
+    # SCR: how many times longer ground truth survives vs proxy
+    scr = gt_survival / proxy_survival if proxy_survival > 0 else float('inf')
 
     # Metrics to display - all use aggregates for accuracy
     metrics = [
@@ -1009,11 +1010,11 @@ def plot_goodhart_summary_annotated(
             showlegend=False,
         ), row=1, col=col)
 
-    # Add GFI as a prominent title annotation
+    # Add SCR as a prominent title annotation
     fig.update_layout(
         title=dict(
             text=(f"Goodhart's Law: Optimizing Proxy Metrics Leads to Failure<br>"
-                  f"<b>Goodhart Failure Index: {gfi:.1%}</b>"),
+                  f"<b>Survival Collapse Ratio: {scr:.0f}x</b>"),
             x=0.5,
             font=dict(size=16)
         ),
