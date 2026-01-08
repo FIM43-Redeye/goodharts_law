@@ -272,41 +272,77 @@ def plot_efficiency_comparison(
     output_dir: Path,
     aggregates: dict[str, dict] = None,
 ):
-    """Bar chart comparing efficiency (food / total consumed) across modes."""
+    """Bar chart comparing efficiency (food / total consumed) across modes.
+
+    Shows dual bars for each mode:
+    - Per-agent: Mean efficiency across individual agents (each death/survivor weighted equally)
+    - Aggregate: Total food / total consumed (weighted by consumption volume)
+
+    These differ significantly when agent lifespans vary - aggregate is dominated by
+    longer-lived agents who consume more, while per-agent treats each agent equally.
+    """
     modes = list(data.keys())
-
-    # Use aggregate efficiency if available (more accurate than per-death mean)
-    if aggregates:
-        means = [aggregates.get(m, {}).get('overall_efficiency', 0) * 100 for m in modes]
-        # No std for aggregate efficiency - it's a ratio, not a sample mean
-        stds = [0 for _ in modes]
-    else:
-        # Fallback to per-death mean (less accurate due to short-lived deaths bias)
-        means = [np.mean([e['efficiency'] for e in data[m]]) * 100 for m in modes]
-        stds = [np.std([e['efficiency'] for e in data[m]]) * 100 for m in modes]
-
-    colors = [MODE_COLORS.get(m, '#888888') for m in modes]
     labels = [MODE_NAMES.get(m, m) for m in modes]
+
+    # Compute per-agent efficiency (mean of individual efficiencies)
+    per_agent_means = [np.mean([e['efficiency'] for e in data[m]]) * 100 for m in modes]
+    per_agent_stds = [np.std([e['efficiency'] for e in data[m]]) * 100 for m in modes]
+
+    # Compute aggregate efficiency (total food / total consumed)
+    if aggregates:
+        aggregate_means = [aggregates.get(m, {}).get('overall_efficiency', 0) * 100 for m in modes]
+    else:
+        # Compute from raw data if aggregates not provided
+        aggregate_means = []
+        for m in modes:
+            total_food = sum(e['food_eaten'] for e in data[m])
+            total_poison = sum(e['poison_eaten'] for e in data[m])
+            total = total_food + total_poison
+            aggregate_means.append((total_food / total * 100) if total > 0 else 100)
 
     fig = go.Figure()
 
+    # Per-agent bars (primary metric, matches summary table)
     fig.add_trace(go.Bar(
+        name='Per-Agent Mean',
         x=labels,
-        y=means,
-        error_y=dict(type='data', array=stds, visible=True),
-        marker_color=colors,
-        text=[f'{m:.0f}%' for m in means],
+        y=per_agent_means,
+        error_y=dict(type='data', array=per_agent_stds, visible=True),
+        marker_color=[MODE_COLORS.get(m, '#888888') for m in modes],
+        text=[f'{m:.1f}%' for m in per_agent_means],
+        textposition='outside',
+    ))
+
+    # Aggregate bars (secondary, shows volume-weighted efficiency)
+    fig.add_trace(go.Bar(
+        name='Aggregate',
+        x=labels,
+        y=aggregate_means,
+        marker_color=[MODE_COLORS.get(m, '#888888') for m in modes],
+        marker_pattern_shape='/',
+        opacity=0.6,
+        text=[f'{m:.1f}%' for m in aggregate_means],
         textposition='outside',
     ))
 
     fig.update_layout(
-        title=dict(text='Consumption Efficiency by Mode<br>(Food / Total Consumed)',
-                  x=0.5, font=dict(size=16)),
+        title=dict(
+            text='Consumption Efficiency by Mode<br>'
+                 '<sub>Per-Agent (solid) vs Aggregate (hatched)</sub>',
+            x=0.5, font=dict(size=16)
+        ),
         yaxis_title='Efficiency (%)',
-        yaxis_range=[0, 105],
-        showlegend=False,
-        height=500,
-        width=800,
+        yaxis_range=[0, 115],  # Extra room for labels
+        barmode='group',
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='center',
+            x=0.5
+        ),
+        height=550,
+        width=900,
     )
 
     # Reference line at 50% (random baseline)
@@ -940,54 +976,43 @@ def plot_goodhart_summary_annotated(
     )
 
     for col, (key, title, is_percent) in enumerate(metrics, 1):
-        # Get values and CIs from aggregates if available
-        if aggregates:
-            gt_agg = aggregates.get('ground_truth', {})
-            px_agg = aggregates.get('proxy', {})
+        # Get data lists and aggregates
+        gt_data_list = data['ground_truth']
+        px_data_list = data['proxy']
+        gt_agg = aggregates.get('ground_truth', {}) if aggregates else {}
+        px_agg = aggregates.get('proxy', {}) if aggregates else {}
 
-            if key == 'efficiency':
-                gt_mean = gt_agg.get('overall_efficiency', 0) * 100
-                proxy_mean = px_agg.get('overall_efficiency', 0) * 100
-                gt_ci = gt_agg.get('efficiency_ci')
-                px_ci = px_agg.get('efficiency_ci')
-                if gt_ci:
-                    gt_err = gt_mean - gt_ci[0] * 100
-                    px_err = proxy_mean - px_ci[0] * 100
-                else:
-                    gt_err, px_err = 0, 0
-            elif key == 'survival':
-                gt_mean = gt_agg.get('survival_mean', 0)
-                proxy_mean = px_agg.get('survival_mean', 0)
-                gt_ci = gt_agg.get('survival_ci')
-                px_ci = px_agg.get('survival_ci')
-                if gt_ci:
-                    gt_err = gt_mean - gt_ci[0]
-                    px_err = proxy_mean - px_ci[0]
-                else:
-                    gt_err, px_err = 0, 0
-            elif key == 'poison_rate':
-                gt_mean = gt_agg.get('poison_per_1k_steps', 0)
-                proxy_mean = px_agg.get('poison_per_1k_steps', 0)
-                gt_err, px_err = 0, 0  # No CI for rates yet
-            else:
-                gt_mean, proxy_mean = 0, 0
-                gt_err, px_err = 0, 0
-        else:
-            # Fallback to per-death averages (less accurate)
-            gt_data_list = data['ground_truth']
-            px_data_list = data['proxy']
-
-            if key == 'efficiency':
-                gt_mean = np.mean([e['efficiency'] for e in gt_data_list]) * 100
-                proxy_mean = np.mean([e['efficiency'] for e in px_data_list]) * 100
-            elif key == 'survival':
-                gt_mean = np.mean([e.get('survival_steps', e.get('survival_time', 0)) for e in gt_data_list])
-                proxy_mean = np.mean([e.get('survival_steps', e.get('survival_time', 0)) for e in px_data_list])
-            elif key == 'poison_rate':
+        if key == 'efficiency':
+            # Always use per-agent mean for efficiency (consistent with summary table)
+            gt_mean = np.mean([e['efficiency'] for e in gt_data_list]) * 100
+            proxy_mean = np.mean([e['efficiency'] for e in px_data_list]) * 100
+            gt_std = np.std([e['efficiency'] for e in gt_data_list]) * 100
+            px_std = np.std([e['efficiency'] for e in px_data_list]) * 100
+            # Use standard error as error bar
+            gt_err = gt_std / np.sqrt(len(gt_data_list)) if gt_data_list else 0
+            px_err = px_std / np.sqrt(len(px_data_list)) if px_data_list else 0
+        elif key == 'survival':
+            # Use aggregate survival stats
+            gt_mean = gt_agg.get('survival_mean', 0)
+            proxy_mean = px_agg.get('survival_mean', 0)
+            if not gt_mean:
+                gt_mean = np.mean([e.get('survival_steps', 0) for e in gt_data_list])
+            if not proxy_mean:
+                proxy_mean = np.mean([e.get('survival_steps', 0) for e in px_data_list])
+            gt_ci = gt_agg.get('survival_ci')
+            px_ci = px_agg.get('survival_ci')
+            gt_err = gt_mean - gt_ci[0] if gt_ci else 0
+            px_err = proxy_mean - px_ci[0] if px_ci else 0
+        elif key == 'poison_rate':
+            gt_mean = gt_agg.get('poison_per_1k_steps', 0)
+            proxy_mean = px_agg.get('poison_per_1k_steps', 0)
+            if not gt_mean:
                 gt_mean = np.mean([e['poison_eaten'] for e in gt_data_list])
+            if not proxy_mean:
                 proxy_mean = np.mean([e['poison_eaten'] for e in px_data_list])
-            else:
-                gt_mean, proxy_mean = 0, 0
+            gt_err, px_err = 0, 0
+        else:
+            gt_mean, proxy_mean = 0, 0
             gt_err, px_err = 0, 0
 
         suffix = '%' if is_percent else ''

@@ -310,8 +310,8 @@ class ReportGenerator:
         # Summary table - energy per 1k steps is THE key metric
         lines.append('### Performance Summary')
         lines.append('')
-        lines.append('| Mode | Energy/1k | Efficiency | Survival | Deaths | Deaths/1k |')
-        lines.append('|------|-----------|------------|----------|--------|-----------|')
+        lines.append('| Mode | Energy/1k | Efficiency | Survival | Deaths/1k | Food/1k | Poison/1k |')
+        lines.append('|------|-----------|------------|----------|-----------|---------|-----------|')
 
         results = self.data.get('results', {})
         for mode in _sort_modes(results.keys()):
@@ -319,16 +319,21 @@ class ReportGenerator:
             if agg:
                 energy = _calculate_energy_per_1k(agg)
                 energy_str = f"{'+' if energy >= 0 else ''}{energy:.1f}"
-                eff = agg.get('overall_efficiency', 0)
+                # Use per-agent mean efficiency (from mode_data) rather than aggregate
+                # Per-agent treats each death/survivor equally; aggregate weights by consumption
+                if mode in mode_data and mode_data[mode]:
+                    eff = sum(d['efficiency'] for d in mode_data[mode]) / len(mode_data[mode])
+                else:
+                    eff = agg.get('overall_efficiency', 0)
                 surv = agg.get('survival_mean', 0)
-                # Multi-run aggregates use 'total_deaths', single-run uses 'n_deaths'
-                deaths = agg.get('total_deaths', agg.get('n_deaths', 0))
                 d1k = agg.get('deaths_per_1k_steps', 0)
-                lines.append(f'| {mode} | {energy_str} | {eff:.1%} | {surv:.1f} | {deaths:,} | {d1k:.2f} |')
+                food1k = agg.get('food_per_1k_steps', 0)
+                poison1k = agg.get('poison_per_1k_steps', 0)
+                lines.append(f'| {mode} | {energy_str} | {eff:.1%} | {surv:.1f} | {d1k:.2f} | {food1k:.1f} | {poison1k:.1f} |')
 
         lines.append('')
         lines.append('> *Energy/1k*: Net energy change per 1000 steps (positive = thriving, negative = dying)')
-        lines.append('> *Efficiency*: Food eaten / total consumed (above 50% = better than random)')
+        lines.append('> *Efficiency*: Mean per-agent efficiency (food / total consumed per agent)')
         lines.append('')
         return '\n'.join(lines)
 
@@ -728,9 +733,12 @@ class ReportGenerator:
             lines.append(f"{'EVALUATION RESULTS':^80}")
             lines.append('=' * 80)
 
-        # Results table - use aggregate stats (not per-death which gives different values)
+        # Results table - use per-agent efficiency (matches report)
+        # Extract mode_data for per-agent efficiency computation
+        mode_data = self._extract_mode_data()
+
         lines.append('')
-        lines.append(f"{'Mode':<22} {'Energy/1k':>12} {'Efficiency':>12} {'Survival':>12} {'Deaths/1k':>12}")
+        lines.append(f"{'Mode':<25} {'Energy/1k':>10} {'Eff':>8} {'Surv':>8} {'D/1k':>7} {'F/1k':>7} {'P/1k':>7}")
         lines.append('-' * 80)
 
         for mode in _sort_modes(results.keys()):
@@ -740,11 +748,17 @@ class ReportGenerator:
 
             energy = _calculate_energy_per_1k(agg)
             energy_str = f"{'+' if energy >= 0 else ''}{energy:.1f}"
-            eff = agg.get('overall_efficiency', 0)
+            # Use per-agent mean efficiency (matches markdown report)
+            if mode in mode_data and mode_data[mode]:
+                eff = sum(d['efficiency'] for d in mode_data[mode]) / len(mode_data[mode])
+            else:
+                eff = agg.get('overall_efficiency', 0)
             surv = agg.get('survival_mean', 0)
             d1k = agg.get('deaths_per_1k_steps', 0)
+            food1k = agg.get('food_per_1k_steps', 0)
+            poison1k = agg.get('poison_per_1k_steps', 0)
 
-            lines.append(f'{mode:<22} {energy_str:>12} {eff:>11.1%} {surv:>12.1f} {d1k:>12.2f}')
+            lines.append(f'{mode:<25} {energy_str:>10} {eff:>7.1%} {surv:>8.1f} {d1k:>7.2f} {food1k:>7.1f} {poison1k:>7.1f}')
 
         lines.append('=' * 80)
 

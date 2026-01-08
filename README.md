@@ -14,14 +14,14 @@ Trained agents (2048 updates, 192 envs, 1 minibatch, seed 42) evaluated using co
 
 | Mode                  | Energy/1k | Efficiency | Survival | Deaths/1k | Food/1k | Poison/1k |
 |-----------------------|-----------|------------|----------|-----------|---------|-----------|
-| **ground_truth**      | **+144.0**|   100.0%   | 16362.0  |   0.00    |  154.1  |    0.1    |
-| ground_truth_blinded  |   -12.9   |    65.5%   |    94.7  |  10.46    |   55.7  |   29.3    |
-| proxy_mortal          |   -41.4   |    56.6%   |    41.5  |  24.03    |   58.9  |   45.1    |
-| **proxy**             | **-58.6** | **55.3%**  |    29.0  |  34.43    |   79.1  |   63.9    |
+| **ground_truth**      | **+144.6**|   99.9%    | 16364.0  |   0.00    |  154.7  |    0.1    |
+| ground_truth_blinded  |   -12.8   |    29.9%   |    95.1  |  10.46    |   55.8  |   29.3    |
+| proxy_mortal          |   -41.5   |    24.7%   |    41.5  |  24.03    |   59.0  |   45.3    |
+| **proxy**             | **-58.7** | **23.8%**  |    29.0  |  34.43    |   79.2  |   64.0    |
 
 **Key metrics:**
 - **Energy/1k** = net energy change per 1000 steps (positive = thriving, negative = dying)
-- **Efficiency** = total food / total consumed (food + poison)
+- **Efficiency** = mean per-agent efficiency (food / total consumed per agent)
 - **Survival** = average steps lived before death
 - **Deaths/1k** = agent deaths per 1000 total steps
 
@@ -29,23 +29,23 @@ Trained agents (2048 updates, 192 envs, 1 minibatch, seed 42) evaluated using co
 
 The proxy agent is completely unfit for the environment.
 
-1. **Energy dynamics tell the story**: Ground truth agents gain +144 energy per 1000 steps - they're thriving. Proxy agents lose -58.6 energy per 1000 steps - they're hemorrhaging energy and dying rapidly. The 202.6 energy gap per 1000 steps is the quantified cost of Goodhart's Law.
+1. **Energy dynamics tell the story**: Ground truth agents gain +144.6 energy per 1000 steps - they're thriving. Proxy agents lose -58.7 energy per 1000 steps - they're hemorrhaging energy and dying rapidly. The 203 energy gap per 1000 steps is the quantified cost of Goodhart's Law.
 
-2. **~460,000x death rate**: Ground truth agents die so infrequently (30 deaths across 400M+ steps) that the rate rounds to 0.00/1k. Proxy agents die every ~29 steps. The death rate ratio exceeds 460,000x.
+2. **564x survival collapse**: Ground truth agents survive an average of 16,364 steps. Proxy agents survive just 29 steps. This 564x ratio captures the catastrophic failure mode.
 
 3. **Two distinct failure modes**:
-   - **Proxy agents** fail by *over-poisoning*: they consume everything aggressively (79.1 food + 63.9 poison per 1k steps) because interestingness rewards consumption without encoding harm.
-   - **Blinded agents** fail by *under-consumption*: they consume cautiously (55.7 food + 29.3 poison per 1k steps) because they can't distinguish food from poison, so they avoid both. When they do eat, they're only 65.5% efficient.
+   - **Proxy agents** fail by *over-poisoning*: they consume everything aggressively (79.1 food + 63.9 poison per 1k steps) because interestingness rewards consumption without encoding harm. Per-agent efficiency is only 23.8%.
+   - **Blinded agents** fail by *under-consumption*: they consume cautiously (55.7 food + 29.3 poison per 1k steps) because they can't distinguish food from poison, so they avoid both. Per-agent efficiency is 29.9%.
 
 4. **Proxy metric design doesn't save you**: Food is MORE interesting than poison (1.0 vs 0.5), yet proxy agents still consume poison at catastrophic rates. Making the proxy "reasonable" doesn't prevent failure - the metric simply doesn't encode harm.
 
-The efficiency gap of ~45% understates the catastrophe. Energy dynamics and death rates reveal the true cost: ground truth agents thrive while proxy agents die.
+The 76% efficiency gap (99.9% vs 23.8%) tells the story: ground truth agents almost never eat poison, while proxy agents eat poison more often than food.
 
 ### Statistical notes
 
 - Results were aggregated across three independent evaluation runs for each mode, with different random seeds derived from the same base seed.
 - Cohen's d is extremely large for the efficiency comparison between ground_truth and proxy; the distributions are almost completely non-overlapping.
-- The ~460,000x death rate ratio is stable across runs.
+- The 564x survival collapse ratio is stable across runs.
 - See [docs/evaluation_protocol.md](docs/evaluation_protocol.md) for the full methodology.
 
 ---
