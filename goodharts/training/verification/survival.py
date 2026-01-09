@@ -5,17 +5,10 @@ Runs headless simulations to compare how different agents (Ground Truth vs Proxy
 perform in terms of survival, food consumption, and poison avoidance.
 """
 import numpy as np
-import time
 from tabulate import tabulate
 
 from goodharts.configs.default_config import get_simulation_config
 from goodharts.simulation import Simulation
-from goodharts.behaviors import (
-    OmniscientSeeker, 
-    ProxySeeker, 
-    create_learned_behavior,
-    LEARNED_PRESETS
-)
 
 
 def run_survival_test(behavior_setup_func, behavior_name: str, 
@@ -45,9 +38,7 @@ def run_survival_test(behavior_setup_func, behavior_name: str,
         'poison_eaten': [], # From logs if available, or inferred
         'energy_avg': [],
     }
-    
-    start_time = time.time()
-    
+
     for run in range(num_runs):
         config = get_simulation_config()
         
@@ -88,8 +79,6 @@ def run_survival_test(behavior_setup_func, behavior_name: str,
         if verbose:
             print(f"  Run {run+1}: Poison Deaths={run_poison_deaths}, Starvation={run_starvation_deaths}, Avg E={avg_energy:.1f}")
 
-    duration = time.time() - start_time
-    
     # Aggregates
     results = {
         'avg_poison_deaths': np.mean(stats['deaths_poison']),

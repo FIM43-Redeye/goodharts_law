@@ -600,7 +600,7 @@ class TrainingDashboard:
     def _run_dash_server(self, fig: go.Figure):
         """Run a Dash server with WebSocket push updates."""
         try:
-            from dash import Dash, dcc, html, ALL
+            from dash import Dash, dcc, html
             from dash.dependencies import Input, Output
             from dash_extensions import WebSocket
             from flask_sock import Sock
@@ -841,7 +841,7 @@ class DashboardProcess:
 
         # Give it a moment to start
         time.sleep(0.5)
-        print(f"[Dashboard] Started")
+        print("[Dashboard] Started")
 
     def send_update(self, mode: str, update_type: str, data: dict):
         """Send an update to the dashboard."""

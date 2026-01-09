@@ -68,7 +68,7 @@ Falsification:
 
 import json
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 import numpy as np
@@ -76,7 +76,7 @@ import torch
 
 from goodharts.config import get_training_config
 from goodharts.configs.default_config import get_simulation_config
-from goodharts.modes import ObservationSpec, get_all_mode_names
+from goodharts.modes import ObservationSpec
 from goodharts.environments.torch_env import create_torch_vec_env
 from goodharts.behaviors.brains import load_brain
 from goodharts.utils.device import get_device

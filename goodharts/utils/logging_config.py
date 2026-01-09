@@ -1,6 +1,5 @@
 import logging
 import sys
-from pathlib import Path
 
 def setup_logging(log_file: str = "simulation.log", level: int = logging.INFO):
     """

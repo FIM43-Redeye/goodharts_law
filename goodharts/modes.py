@@ -61,7 +61,7 @@ The Mode System and Goodhart's Law:
     visible: same environment, same agent architecture, different information and
     incentive structures produce radically different outcomes.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from typing import Type
 import torch

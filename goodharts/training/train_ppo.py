@@ -20,7 +20,6 @@ import argparse
 import signal
 import sys
 import threading
-from pathlib import Path
 
 from goodharts.modes import get_all_mode_names
 from goodharts.configs.default_config import get_simulation_config
@@ -259,7 +258,7 @@ def main():
     # --random-seed overrides to use a random seed
     if args.random_seed:
         overrides['seed'] = None  # Will generate random seed in trainer
-        print(f"   Using random seed (results will vary between runs)")
+        print("   Using random seed (results will vary between runs)")
     else:
         overrides['seed'] = args.seed  # Default 42 or user-specified
 
@@ -314,7 +313,6 @@ def _run_with_profiling(mode: str, overrides: dict, n_updates: int):
 
     Runs warmup first, then profiles exactly n_updates and stops cleanly.
     """
-    import torch
     from torch.profiler import profile, schedule, ProfilerActivity
     import shutil
 
@@ -340,7 +338,7 @@ def _run_with_profiling(mode: str, overrides: dict, n_updates: int):
         # and graph capture overhead skews timing measurements
     }
 
-    print(f"\n[Profile] Configuration:")
+    print("\n[Profile] Configuration:")
     print(f"   Warmup: {warmup_updates} updates (not profiled)")
     print(f"   Profile: {n_updates} updates")
     print(f"   Output: {profile_dir}/")
@@ -407,7 +405,7 @@ def _run_with_profiling(mode: str, overrides: dict, n_updates: int):
         if update_count < warmup_updates:
             print(f"   [Warmup {update_count}/{warmup_updates}]")
         elif update_count < warmup_updates + 1:
-            print(f"   [Profiler warmup]")
+            print("   [Profiler warmup]")
         elif not profiler_state['done']:
             active_step = update_count - warmup_updates
             print(f"   [Profiling {active_step}/{n_updates}]")
@@ -437,7 +435,7 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool,
     from goodharts.training.train_dashboard import create_dashboard_process
     from goodharts.behaviors.action_space import num_actions
 
-    print(f"\nTraining with dashboard (process-isolated)")
+    print("\nTraining with dashboard (process-isolated)")
 
     # Create dashboard in separate process
     dashboard = create_dashboard_process(modes_to_train, n_actions=num_actions(1))
@@ -449,11 +447,11 @@ def _run_with_dashboard(modes_to_train: list, overrides: dict, sequential: bool,
             for mode in modes_to_train:
                 # Check if abort was requested (signal handler)
                 if is_abort_requested():
-                    print(f"[Sequential] Abort signal received, stopping")
+                    print("[Sequential] Abort signal received, stopping")
                     break
                 # Check if stop was requested or dashboard closed
                 if dashboard.should_stop():
-                    print(f"[Sequential] Dashboard stop requested, skipping remaining modes")
+                    print("[Sequential] Dashboard stop requested, skipping remaining modes")
                     break
                 if not dashboard.is_alive():
                     print("[Sequential] Dashboard closed, stopping training")
@@ -542,11 +540,11 @@ def _run_without_dashboard(modes_to_train: list, overrides: dict, sequential: bo
             for mode in modes_to_train:
                 # Check if abort was requested (signal handler)
                 if is_abort_requested():
-                    print(f"[Sequential] Abort signal received, stopping")
+                    print("[Sequential] Abort signal received, stopping")
                     break
                 # Legacy file-based stop signal (for compatibility)
                 if os.path.exists('.training_stop_signal'):
-                    print(f"[Sequential] Stop signal file detected, skipping remaining modes")
+                    print("[Sequential] Stop signal file detected, skipping remaining modes")
                     try:
                         os.remove('.training_stop_signal')
                     except OSError:

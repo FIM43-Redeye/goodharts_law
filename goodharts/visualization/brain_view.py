@@ -12,17 +12,11 @@ Uses matplotlib with in-place artist updates for smooth animation.
 import warnings
 import numpy as np
 import torch
-import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from matplotlib.figure import Figure
-from matplotlib.axes import Axes
-from matplotlib.image import AxesImage
-from matplotlib.container import BarContainer
-from typing import Optional
 
-from goodharts.utils.brain_viz import BrainVisualizer, get_action_label
+from goodharts.utils.brain_viz import BrainVisualizer
 from goodharts.visualization.utils import (
-    grid_to_rgb, observation_to_rgb, grid_with_agent_to_rgb
+    observation_to_rgb, grid_with_agent_to_rgb
 )
 
 
@@ -278,7 +272,6 @@ class MatplotlibBrainView:
             interval: Pause duration in seconds
         """
         # plt.pause() raises the window, so we use the backend directly
-        import time
         self.fig.canvas.start_event_loop(interval)
         # If start_event_loop doesn't work well, fall back to manual approach
         # time.sleep(interval)

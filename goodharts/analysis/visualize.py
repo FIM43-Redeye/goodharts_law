@@ -19,7 +19,6 @@ import json
 import signal
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import plotly.graph_objects as go

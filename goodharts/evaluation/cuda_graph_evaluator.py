@@ -16,8 +16,7 @@ Requirements:
 - No CPU-GPU sync in the captured region
 """
 
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Optional
 import time
 
@@ -543,7 +542,7 @@ def compare_graph_vs_standard(mode: str = 'ground_truth', timesteps: int = 50000
     )
     std_tester = ModelTester(std_config)
     std_start = time.perf_counter()
-    std_result = std_tester.run()
+    std_tester.run()  # Run for timing benchmark
     std_time = time.perf_counter() - std_start
     std_rate = timesteps * std_config.n_envs / std_time
 

@@ -26,24 +26,17 @@ Usage:
 """
 import argparse
 import json
-import os
-import sys
 import threading
-import queue
-import time
 from datetime import datetime
 from pathlib import Path
 
-import torch
 
-from goodharts.utils.device import get_device
-from goodharts.utils.seed import set_seed
 from goodharts.configs.default_config import get_simulation_config
 from goodharts.modes import get_all_mode_names
 from goodharts.config import get_training_config, get_evaluation_config
 from goodharts.evaluation import (
     EvaluationConfig, ModelTester,
-    generate_seeds, aggregate_runs, RunResult, MultiRunAggregates,
+    generate_seeds, aggregate_runs, RunResult,
 )
 
 
@@ -419,7 +412,7 @@ def run_full_report(
     # Step 2: Aggregate results
     print("\n[2/4] Aggregating results...")
     json_path = report_dir / 'results.json'
-    aggregated = aggregate_multi_run_results(multi_results, json_path)
+    aggregate_multi_run_results(multi_results, json_path)  # Writes JSON as side effect
 
     # Step 3 & 4: Generate report (includes figures)
     print("\n[3/4] Generating report and figures...")

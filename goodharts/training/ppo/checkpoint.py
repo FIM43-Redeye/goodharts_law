@@ -19,7 +19,6 @@ Usage:
     save_final_model(policy=policy, output_path=path, ...)
 """
 import os
-from typing import Optional
 
 import torch
 import torch.nn as nn

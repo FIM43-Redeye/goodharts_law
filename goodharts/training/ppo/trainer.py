@@ -7,7 +7,6 @@ Can be extended for multi-agent scenarios.
 import logging
 import os
 import time
-import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -22,35 +21,34 @@ from goodharts.configs.default_config import get_simulation_config
 from goodharts.config import get_training_config
 from goodharts.utils.device import get_device, apply_system_optimizations, is_tpu, sync_device
 from goodharts.utils.seed import set_seed
-from goodharts.behaviors.brains import create_brain, save_brain
-from goodharts.behaviors.action_space import create_action_space, ActionSpace
+from goodharts.behaviors.brains import create_brain
+from goodharts.behaviors.action_space import create_action_space
 from goodharts.environments.torch_env import create_torch_vec_env
 from datetime import datetime
 from goodharts.modes import RewardComputer
 
 from .models import Profiler, ValueHead, PopArtValueHead
 from .algorithms import compute_gae, ppo_update
-from .async_logger import AsyncLogger, LogPayload
+from .async_logger import AsyncLogger
 
 # Extracted modules
 from .monitoring import GPUMonitor
 from .ppo_config import PPOConfig
 from .metrics import (
-    METRICS_SCHEMA, N_SCALAR_METRICS,
-    PendingMetrics, BookkeepingWork, BackgroundBookkeeper
+    N_SCALAR_METRICS,
+    PendingMetrics, BackgroundBookkeeper
 )
 from .globals import (
-    request_abort, clear_abort, is_abort_requested, reset_training_state,
-    mark_warmup_done, check_warmup_done, get_compile_lock, get_warmup_lock,
+    is_abort_requested, mark_warmup_done, check_warmup_done, get_compile_lock, get_warmup_lock,
 )
 from .warmup import (
-    warmup_forward_backward, run_warmup_update,
+    run_warmup_update,
     WarmupBuffers, CompiledFunctions as WarmupCompiledFunctions,
 )
 from .validation import run_validation_episodes
 from .checkpoint import save_training_checkpoint, save_final_model
-from .buffers import RolloutBuffers, MetricsConstants, allocate_rollout_buffers, allocate_metrics_constants
-from .compilation import CompiledFunctions, create_compiled_functions
+from .buffers import allocate_rollout_buffers, allocate_metrics_constants
+from .compilation import create_compiled_functions
 from .cleanup import cleanup_training_resources
 
 
@@ -594,8 +592,6 @@ class PPOTrainer:
 
         self.start_time = time.perf_counter()
 
-        # Rolling window for sps calculation (all updates valid post-warmup)
-        sps_window = []  # (steps, time) pairs for last 4 updates
         last_update_time = self.start_time
         last_update_steps = 0
 

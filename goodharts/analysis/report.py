@@ -18,7 +18,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import json
-import numpy as np
 
 from goodharts.analysis.stats_helpers import (
     StatisticalComparison,

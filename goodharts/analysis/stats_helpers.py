@@ -9,7 +9,6 @@ a comparison between two groups (ground_truth vs proxy).
 """
 
 from dataclasses import dataclass
-from typing import Optional
 import numpy as np
 from scipy import stats
 

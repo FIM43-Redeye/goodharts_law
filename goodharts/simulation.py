@@ -199,7 +199,6 @@ class Simulation:
 
         dones_cpu = dones.cpu().numpy()
         terminated_cpu = terminated.cpu().numpy()
-        truncated_cpu = truncated.cpu().numpy()
         poison_cpu = poison_mask.cpu().numpy()
 
         for i, agent in enumerate(self.agents):
@@ -249,7 +248,6 @@ class Simulation:
         Get the environmental grid for rendering (no agent overlay).
         Converts to NumPy for matplotlib compatibility.
         """
-        import numpy as np
         return self.vec_env.grids[0].cpu().numpy().copy()
     
     def get_agent_positions(self) -> list[tuple[int, int, tuple[int, int, int]]]:

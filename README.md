@@ -490,8 +490,6 @@ This project uses type hints throughout. Key conventions:
 
 This project was developed with AI assistance, initially using Google's Antigravity IDE (Gemini 3 Pro), then Claude Code (Claude 4.5 Opus).
 
-**My contributions:** All architectural decisions were mine - the GPU-native vectorization strategy, eliminating CPU-GPU sync points, CUDA graph integration, and condensing the rollout loop into a single compiled graph. The experimental design (ground truth vs proxy dichotomy, the blinded control condition, immortality-during-training as a deliberate confound) was mine. For debugging, Claude would assess symptoms while I identified root causes - pair programming where I provided the "why" and Claude provided the "how."
-
-**Claude's contributions:** The vast majority of implementation code and documentation. Claude transformed my architectural sketches into working systems and served as an invaluable advisor throughout.
+All architectural and research direction decisions were mine. The core experimental design and iteration upon it was my responsibility, as was the direction of program structure, optimization, and debugging. Claude primarily served as an implementation tool and pair programmer, converting detailed natural-language descriptions to implementations and helping me explore unfamiliar technical territory.
 
 I am grateful to Google and Anthropic for making this project possible.

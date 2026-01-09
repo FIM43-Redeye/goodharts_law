@@ -22,7 +22,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from goodharts.visualization.components import (
-    THEME, MODE_COLORS, get_mode_color, get_dark_theme_index_string, apply_dark_theme
+    THEME, get_mode_color, get_dark_theme_index_string, apply_dark_theme
 )
 
 

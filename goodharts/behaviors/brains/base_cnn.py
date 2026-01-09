@@ -6,7 +6,10 @@ BaseCNN is a flexible architecture that supports:
 - Optional auxiliary scalar inputs (energy, step count, etc.)
 - Both discrete and continuous action outputs
 """
-from typing import Tuple
+from typing import Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from goodharts.modes import ObservationSpec
 
 import torch
 import torch.nn as nn

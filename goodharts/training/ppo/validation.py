@@ -17,7 +17,6 @@ Usage:
         device=self.device,
     )
 """
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -75,11 +74,9 @@ def run_validation_episodes(
             validation_poison, validation_poison
         )
         val_env.reset()
-        owns_env = True
     else:
         # Use training env directly (faster, same randomization)
         val_env = vec_env
-        owns_env = False
 
     # Run episodes
     total_reward = 0.0

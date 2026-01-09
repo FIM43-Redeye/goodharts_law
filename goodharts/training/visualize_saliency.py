@@ -299,7 +299,7 @@ def visualize_saliency(
             print(f"Saved: {save_path}")
         except ValueError as e:
             if 'kaleido' in str(e).lower():
-                print(f"Note: Install kaleido to save images (pip install kaleido)")
+                print("Note: Install kaleido to save images (pip install kaleido)")
             else:
                 raise
 
@@ -415,7 +415,7 @@ def compare_models_saliency(
             print(f"Saved comparison to {save_path}")
         except ValueError as e:
             if 'kaleido' in str(e).lower():
-                print(f"Note: Install kaleido to save images (pip install kaleido)")
+                print("Note: Install kaleido to save images (pip install kaleido)")
             else:
                 raise
 
@@ -534,7 +534,7 @@ def analyze_model_attention(
     model_name = Path(model_path).stem
 
     # Generate visualizations
-    print(f"Generating saliency maps...")
+    print("Generating saliency maps...")
     for i in range(min(num_samples, len(all_views))):
         view = all_views[i].cpu().numpy()  # Shape: (C, H, W) or (H, W)
 
@@ -613,7 +613,7 @@ def compare_all_models(
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     # Generate comparison visualizations
-    print(f"Generating comparison saliency maps...")
+    print("Generating comparison saliency maps...")
     for i in range(min(num_samples, len(all_views))):
         view = all_views[i].cpu().numpy()
         save_path = f"{output_dir}/comparison_saliency_{i}.png"

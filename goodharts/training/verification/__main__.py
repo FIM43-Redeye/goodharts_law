@@ -53,8 +53,8 @@ def main():
     print("DIRECTIONAL ACCURACY TESTS")
     print("=" * 60)
     
-    gt_acc = test_directional_accuracy('models/ppo_ground_truth.pth', 'Ground Truth Model')
-    proxy_acc = test_directional_accuracy('models/ppo_proxy.pth', 'Proxy Model')
+    test_directional_accuracy('models/ppo_ground_truth.pth', 'Ground Truth Model')
+    test_directional_accuracy('models/ppo_proxy.pth', 'Proxy Model')
 
     # Behavior comparison
     run_comparative_verification(steps=args.steps, runs=3)

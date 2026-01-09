@@ -26,7 +26,6 @@ Usage:
 """
 from abc import ABC, abstractmethod
 from functools import lru_cache
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -448,7 +447,6 @@ class FactoredActionSpace(ActionSpace):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Batch decode factored outputs."""
         device = output.device
-        batch_size = output.shape[0]
 
         dir_logits = output[:, :8]
         mag_logits = output[:, 8:]

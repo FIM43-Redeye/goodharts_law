@@ -34,7 +34,7 @@ ROLLING_WINDOW = 20               # Window for rolling average survival
 
 # Import canonical colors and theme from single source of truth
 from goodharts.visualization.components import (
-    MODE_COLORS, THEME, DEFAULT_COLOR, get_mode_color
+    THEME, DEFAULT_COLOR, get_mode_color
 )
 
 

@@ -10,7 +10,6 @@ Usage:
     python main.py report --input path/to/results.json
 """
 import argparse
-import shutil
 from pathlib import Path
 
 # Default paths

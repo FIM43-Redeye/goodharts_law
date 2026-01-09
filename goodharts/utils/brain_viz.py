@@ -255,7 +255,6 @@ class BrainVisualizer:
 # Re-export from action_space for convenience
 from goodharts.behaviors.action_space import (
     get_action_labels,
-    get_direction_arrow,
     DISCRETE_8,
 )
 
