@@ -8,6 +8,7 @@ Demonstrates Goodhart's Law through statistical divergence:
 - Ground truth agents maintain high food ratio
 - Proxy agents eat poison despite food being more interesting (interestingness doesn't encode harm)
 """
+import logging
 import multiprocessing as mp
 from multiprocessing import Process, Queue as MPQueue
 import queue
@@ -53,8 +54,8 @@ class ModeStats:
     total_poison: int = 0
     total_deaths: int = 0
 
-    # Recent survival times for rolling average
-    recent_survivals: list = field(default_factory=list)
+    # Banked survival times (confirmed at death)
+    banked_survivals: list = field(default_factory=list)
 
     # Status
     is_complete: bool = False
@@ -68,23 +69,32 @@ class ModeStats:
         food: int,
         poison: int,
         deaths: int,
-        survival_times: list[int],
+        death_times: list[int],
+        current_ages: list[int] | None = None,
     ):
         """
         Record a checkpoint with current totals.
 
         Called periodically from the runner to update dashboard state.
+
+        Args:
+            timesteps: Total timesteps so far
+            food: Total food eaten
+            poison: Total poison eaten
+            deaths: Total death count
+            death_times: Lifetimes of agents that died this checkpoint (banked)
+            current_ages: Current ages of all living agents (for rolling metric)
         """
         self.total_timesteps = timesteps
         self.total_food = food
         self.total_poison = poison
         self.total_deaths = deaths
 
-        # Update recent survivals for rolling average
-        if survival_times:
-            self.recent_survivals.extend(survival_times)
-            if len(self.recent_survivals) > ROLLING_WINDOW * 2:
-                self.recent_survivals = self.recent_survivals[-ROLLING_WINDOW:]
+        # Bank death times (these are confirmed final lifetimes)
+        if death_times:
+            self.banked_survivals.extend(death_times)
+            if len(self.banked_survivals) > ROLLING_WINDOW * 2:
+                self.banked_survivals = self.banked_survivals[-ROLLING_WINDOW:]
 
         # Append to time series
         self.timesteps.append(timesteps)
@@ -97,9 +107,17 @@ class ModeStats:
         # Cumulative deaths
         self.cumulative_deaths.append(deaths)
 
-        # Rolling average survival
-        if self.recent_survivals:
-            window = self.recent_survivals[-ROLLING_WINDOW:]
+        # Rolling survival metric: combine banked deaths with current ages
+        # This ensures we have data even when agents rarely die
+        if current_ages is not None and len(current_ages) > 0:
+            # Use current ages as the primary metric (what's happening now)
+            # plus recent banked deaths for context
+            recent_banked = self.banked_survivals[-ROLLING_WINDOW:] if self.banked_survivals else []
+            combined = list(current_ages) + recent_banked
+            self.survival_rolling.append(np.mean(combined))
+        elif self.banked_survivals:
+            # Fall back to banked deaths only
+            window = self.banked_survivals[-ROLLING_WINDOW:]
             self.survival_rolling.append(np.mean(window))
         else:
             self.survival_rolling.append(0)
@@ -113,8 +131,9 @@ class ModeStats:
     @property
     def current_survival_avg(self) -> float:
         """Current rolling average survival time."""
-        if self.recent_survivals:
-            return np.mean(self.recent_survivals[-ROLLING_WINDOW:])
+        # Use the most recent rolling value (includes current ages)
+        if self.survival_rolling:
+            return self.survival_rolling[-1]
         return 0.0
 
 
@@ -142,13 +161,14 @@ class ParallelStatsDashboard:
         food: int,
         poison: int,
         deaths: int,
-        survival_times: list[int],
+        death_times: list[int],
+        current_ages: list[int] | None = None,
     ):
         """Queue a checkpoint update."""
         try:
             self.update_queue.put_nowait((
                 'checkpoint', mode,
-                (timesteps, food, poison, deaths, survival_times)
+                (timesteps, food, poison, deaths, death_times, current_ages)
             ))
         except queue.Full:
             pass
@@ -173,8 +193,8 @@ class ParallelStatsDashboard:
                     continue
 
                 if msg_type == 'checkpoint':
-                    timesteps, food, poison, deaths, survivals = data
-                    stats.record_checkpoint(timesteps, food, poison, deaths, survivals)
+                    timesteps, food, poison, deaths, death_times, current_ages = data
+                    stats.record_checkpoint(timesteps, food, poison, deaths, death_times, current_ages)
                 elif msg_type == 'complete':
                     stats.is_complete = True
 
@@ -366,6 +386,9 @@ class ParallelStatsDashboard:
             self._process_updates()
             return self._build_figure()
 
+        # Suppress Werkzeug request logging (POST spam)
+        logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
         print(f"[ParallelStats] Dashboard running at http://localhost:{port}")
         app.run(debug=False, use_reloader=False, port=port)
 
@@ -411,13 +434,14 @@ class ParallelStatsApp:
         food: int,
         poison: int,
         deaths: int,
-        survival_times: list[int],
+        death_times: list[int],
+        current_ages: list[int] | None = None,
     ):
         """Send checkpoint update to dashboard."""
         try:
             self._queue.put_nowait((
                 'checkpoint', mode,
-                (timesteps, food, poison, deaths, survival_times)
+                (timesteps, food, poison, deaths, death_times, current_ages)
             ))
         except queue.Full:
             pass  # Dashboard will catch up on next update
@@ -463,9 +487,9 @@ def _parallel_stats_worker(
                 item = update_queue.get(timeout=0.02)
                 msg_type, mode, data = item
                 if msg_type == 'checkpoint':
-                    timesteps, food, poison, deaths, survivals = data
+                    timesteps, food, poison, deaths, death_times, current_ages = data
                     dashboard.stats[mode].record_checkpoint(
-                        timesteps, food, poison, deaths, survivals
+                        timesteps, food, poison, deaths, death_times, current_ages
                     )
                 elif msg_type == 'complete':
                     dashboard.stats[mode].is_complete = True

@@ -572,14 +572,16 @@ class ModelTester:
     def _update_dashboard(self):
         """Send checkpoint update to dashboard."""
         if self.dashboard:
-            # Send cumulative totals and recent survival times
+            # Include current ages of all living agents for survival metric
+            current_ages = self._survival_times.tolist()
             self.dashboard.send_checkpoint(
                 mode=self.config.mode,
                 timesteps=self.total_steps,
                 food=self.total_food,
                 poison=self.total_poison,
                 deaths=self.death_count,
-                survival_times=self._checkpoint_survivals,
+                death_times=self._checkpoint_survivals,
+                current_ages=current_ages,
             )
             # Clear checkpoint survivals after sending
             self._checkpoint_survivals = []

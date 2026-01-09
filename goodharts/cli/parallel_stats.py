@@ -51,6 +51,10 @@ def run_mode(
     spec = ObservationSpec.for_mode(mode, config)
     vec_env = create_vec_env(n_envs=n_envs, obs_spec=spec, config=config, device=device)
 
+    # Disable energy freezing - agents must be able to die during evaluation
+    # (freeze_energy_in_training exists only for training exploration)
+    vec_env.freeze_energy = False
+
     # No truncation - agents run until they die
     vec_env.max_steps = 1_000_000
 
@@ -98,18 +102,22 @@ def run_mode(
 
             # Send checkpoint
             if step % (checkpoint_interval * n_envs) == 0:
+                # Include current ages of all living agents for survival metric
+                current_ages = survival_times.tolist()
                 dashboard.send_checkpoint(
                     mode=mode,
                     timesteps=step,
                     food=total_food,
                     poison=total_poison,
                     deaths=total_deaths,
-                    survival_times=recent_survivals,
+                    death_times=recent_survivals,
+                    current_ages=current_ages,
                 )
                 recent_survivals = []
 
     # Final update
-    dashboard.send_checkpoint(mode, step, total_food, total_poison, total_deaths, recent_survivals)
+    current_ages = survival_times.tolist()
+    dashboard.send_checkpoint(mode, step, total_food, total_poison, total_deaths, recent_survivals, current_ages)
     dashboard.send_complete(mode)
     print(f"[{mode}] Complete: {step:,} steps, {total_deaths:,} deaths, "
           f"food ratio: {total_food/(total_food+total_poison+1):.1%}", flush=True)

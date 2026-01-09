@@ -8,11 +8,18 @@ Shows:
 - Action probabilities
 
 Uses matplotlib with in-place artist updates for smooth animation.
+
+GUI controls (bottom panel):
+- Pause/Resume button
+- Step button (advances one frame when paused)
+- Speed text box (milliseconds per step)
+- Sampling toggle (argmax vs multinomial)
 """
 import warnings
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from matplotlib.widgets import Button, TextBox
 
 from goodharts.utils.brain_viz import BrainVisualizer
 from goodharts.visualization.utils import (
@@ -20,8 +27,47 @@ from goodharts.visualization.utils import (
 )
 
 
-# Direction labels for 8-action space
-ACTION_LABELS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+def get_action_labels(max_move_distance: int = 1) -> list[str]:
+    """
+    Generate action labels matching the actual action space ordering.
+
+    Actions are ordered by iterating dx, dy from -max to +max (skipping 0,0).
+    Coordinate system: +x=East, +y=South (screen coordinates).
+    """
+    from goodharts.behaviors.action_space import build_action_list
+
+    actions = build_action_list(max_move_distance)
+    labels = []
+
+    for dx, dy in actions:
+        # Map (dx, dy) to compass direction
+        # +x = East, +y = South (screen coords where y increases downward)
+        if dx == 0 and dy < 0:
+            d = 'N'
+        elif dx > 0 and dy < 0:
+            d = 'NE'
+        elif dx > 0 and dy == 0:
+            d = 'E'
+        elif dx > 0 and dy > 0:
+            d = 'SE'
+        elif dx == 0 and dy > 0:
+            d = 'S'
+        elif dx < 0 and dy > 0:
+            d = 'SW'
+        elif dx < 0 and dy == 0:
+            d = 'W'
+        elif dx < 0 and dy < 0:
+            d = 'NW'
+        else:
+            d = '?'
+        labels.append(d)
+
+    return labels
+
+
+# Default labels for 8-action space (max_move_distance=1)
+# Order: NW, W, SW, N, S, NE, E, SE (matches build_action_list iteration)
+ACTION_LABELS = get_action_labels(1)
 
 
 class MatplotlibBrainView:
@@ -30,6 +76,8 @@ class MatplotlibBrainView:
 
     Creates a figure with subplots for grid, observation, activations, and actions.
     Uses in-place artist updates for efficient animation.
+
+    GUI controls are provided in a bottom panel for pause/step/speed/sampling.
     """
 
     def __init__(
@@ -37,12 +85,14 @@ class MatplotlibBrainView:
         mode: str,
         model: torch.nn.Module,
         grid_size: tuple[int, int] = (128, 128),
+        initial_speed_ms: int = 50,
     ):
         """
         Args:
             mode: Training mode name (ground_truth, proxy, etc.)
             model: Neural network model to visualize
             grid_size: Grid dimensions (height, width)
+            initial_speed_ms: Initial step interval in milliseconds
         """
         self.mode = mode
         self.model = model
@@ -55,6 +105,15 @@ class MatplotlibBrainView:
         # Configure matplotlib for dark theme
         plt.style.use('dark_background')
 
+        # Playback control state
+        self.paused = False
+        self.step_requested = False
+        self.quit_requested = False
+        self.use_multinomial = False  # False = argmax, True = multinomial sampling
+
+        # Speed control (milliseconds per step)
+        self._speed_ms = initial_speed_ms
+
         # Create figure and artists
         self._setup_figure()
 
@@ -62,24 +121,37 @@ class MatplotlibBrainView:
         self.step_count = 0
         self._closed = False
 
+    @property
+    def speed_ms(self) -> int:
+        """Current speed in milliseconds."""
+        return self._speed_ms
+
+    @speed_ms.setter
+    def speed_ms(self, value: int):
+        """Set speed, clamped to reasonable range."""
+        self._speed_ms = max(1, min(5000, value))
+
     def _setup_figure(self):
-        """Create the figure layout with proper sizing."""
+        """Create the figure layout with proper sizing and control panel."""
         n_layers = len(self.layer_names)
 
         # Dynamic layout based on layer count
         # Row 1: Grid | Activation layers... | Actions
-        # Row 2: Observation | More activations... | Energy
+        # Row 2: Observation | More activations... | Status
+        # Bottom: Control panel with buttons
 
-        # Calculate columns: 1 (grid/obs) + ceil(n_layers/2) + 1 (actions/energy)
+        # Calculate columns: 1 (grid/obs) + ceil(n_layers/2) + 1 (actions/status)
         layer_cols = max(1, (n_layers + 1) // 2)
         n_cols = 1 + layer_cols + 1
 
         # Width ratios: main views are larger than activations
         width_ratios = [2] + [1] * layer_cols + [1]
 
+        # Create figure with extra space at bottom for controls
+        fig_height = 7  # Slightly taller to accommodate controls
         self.fig, self.axes = plt.subplots(
             2, n_cols,
-            figsize=(3 * n_cols, 6),
+            figsize=(3 * n_cols, fig_height),
             gridspec_kw={'width_ratios': width_ratios, 'wspace': 0.1, 'hspace': 0.15}
         )
 
@@ -175,10 +247,13 @@ class MatplotlibBrainView:
         # Connect close event
         self.fig.canvas.mpl_connect('close_event', self._on_close)
 
-        # Adjust layout (suppress warning for mixed axes types)
+        # Adjust layout with space at bottom for controls
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            plt.tight_layout(rect=[0, 0.08, 1, 0.95])
+
+        # Add control panel widgets at the bottom
+        self._setup_controls()
 
         plt.ion()
         plt.show(block=False)
@@ -198,6 +273,83 @@ class MatplotlibBrainView:
                     manager.window.show()
         except Exception:
             pass  # Not all backends support this
+
+    def _setup_controls(self):
+        """Set up the control panel with buttons and text input."""
+        # Button styling
+        button_color = '#333333'
+        button_hover = '#555555'
+        text_color = 'white'
+
+        # Pause/Resume button
+        ax_pause = self.fig.add_axes([0.05, 0.02, 0.12, 0.04])
+        self._btn_pause = Button(ax_pause, 'Pause', color=button_color, hovercolor=button_hover)
+        self._btn_pause.label.set_color(text_color)
+        self._btn_pause.on_clicked(self._on_pause_clicked)
+
+        # Step button
+        ax_step = self.fig.add_axes([0.19, 0.02, 0.10, 0.04])
+        self._btn_step = Button(ax_step, 'Step', color=button_color, hovercolor=button_hover)
+        self._btn_step.label.set_color(text_color)
+        self._btn_step.on_clicked(self._on_step_clicked)
+
+        # Speed label and text box
+        ax_speed_label = self.fig.add_axes([0.32, 0.02, 0.08, 0.04])
+        ax_speed_label.axis('off')
+        ax_speed_label.text(0.5, 0.5, 'Speed (ms):', ha='center', va='center',
+                           color=text_color, fontsize=9, transform=ax_speed_label.transAxes)
+
+        ax_speed = self.fig.add_axes([0.41, 0.02, 0.08, 0.04])
+        self._txt_speed = TextBox(ax_speed, '', initial=str(self._speed_ms),
+                                  color=button_color, hovercolor=button_hover)
+        self._txt_speed.text_disp.set_color(text_color)
+        self._txt_speed.on_submit(self._on_speed_submit)
+
+        # Sampling mode toggle button
+        ax_sampling = self.fig.add_axes([0.52, 0.02, 0.14, 0.04])
+        sampling_label = 'multinomial' if self.use_multinomial else 'argmax'
+        self._btn_sampling = Button(ax_sampling, f'Sample: {sampling_label}',
+                                    color=button_color, hovercolor=button_hover)
+        self._btn_sampling.label.set_color(text_color)
+        self._btn_sampling.on_clicked(self._on_sampling_clicked)
+
+        # Quit button
+        ax_quit = self.fig.add_axes([0.85, 0.02, 0.10, 0.04])
+        self._btn_quit = Button(ax_quit, 'Quit', color='#662222', hovercolor='#883333')
+        self._btn_quit.label.set_color(text_color)
+        self._btn_quit.on_clicked(self._on_quit_clicked)
+
+    def _on_pause_clicked(self, event):
+        """Handle pause button click."""
+        self.paused = not self.paused
+        label = 'Resume' if self.paused else 'Pause'
+        self._btn_pause.label.set_text(label)
+
+    def _on_step_clicked(self, event):
+        """Handle step button click."""
+        if self.paused:
+            self.step_requested = True
+
+    def _on_speed_submit(self, text):
+        """Handle speed text box submission."""
+        try:
+            value = int(text.strip())
+            self.speed_ms = value
+            # Update text box to show clamped value
+            self._txt_speed.set_val(str(self._speed_ms))
+        except ValueError:
+            # Reset to current value on invalid input
+            self._txt_speed.set_val(str(self._speed_ms))
+
+    def _on_sampling_clicked(self, event):
+        """Handle sampling mode toggle."""
+        self.use_multinomial = not self.use_multinomial
+        label = 'multinomial' if self.use_multinomial else 'argmax'
+        self._btn_sampling.label.set_text(f'Sample: {label}')
+
+    def _on_quit_clicked(self, event):
+        """Handle quit button click."""
+        self.quit_requested = True
 
     def _on_close(self, event):
         """Handle figure close event."""
@@ -253,7 +405,7 @@ class MatplotlibBrainView:
             bar.set_width(prob)
             bar.set_color('#ff6b6b' if i == chosen_idx else '#00d9ff')
 
-        # Update status text
+        # Update status text (controls are in bottom panel)
         self._status_text.set_text(
             f'Step: {step_count:,}\n'
             f'Energy: {agent_energy:.1f}\n'
@@ -292,6 +444,7 @@ def create_brain_view(
     mode: str,
     model: torch.nn.Module,
     grid_size: tuple[int, int] = (128, 128),
+    initial_speed_ms: int = 50,
 ) -> MatplotlibBrainView:
     """
     Factory function for brain view visualization.
@@ -300,11 +453,12 @@ def create_brain_view(
         mode: Training mode name
         model: Neural network model to visualize
         grid_size: Grid dimensions (H, W)
+        initial_speed_ms: Initial step interval in milliseconds
 
     Returns:
         MatplotlibBrainView instance ready for updates
     """
-    return MatplotlibBrainView(mode, model, grid_size)
+    return MatplotlibBrainView(mode, model, grid_size, initial_speed_ms)
 
 
 # Legacy compatibility alias

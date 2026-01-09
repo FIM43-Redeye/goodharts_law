@@ -8,8 +8,16 @@ Usage:
     python main.py brain-view --mode ground_truth
     python main.py brain-view --mode proxy --model models/ppo_proxy.pth
     python main.py brain-view --mode ground_truth --speed 100 --steps 1000
+
+GUI controls (bottom of window):
+    Pause/Resume - Toggle simulation
+    Step         - Advance one frame (when paused)
+    Speed (ms)   - Set delay between steps
+    Sample       - Toggle argmax/multinomial action selection
+    Quit         - Close window
 """
 import argparse
+import sys
 from pathlib import Path
 
 import torch
@@ -69,30 +77,44 @@ def main():
     grid_size = (config['GRID_HEIGHT'], config['GRID_WIDTH'])
 
     # Create visualization (matplotlib-based, runs in main thread)
-    view = create_brain_view(args.mode, brain, grid_size=grid_size)
+    view = create_brain_view(args.mode, brain, grid_size=grid_size, initial_speed_ms=args.speed)
 
     print(f"\nBrain View: {args.mode}")
     print(f"Speed: {args.speed}ms/step")
     if args.steps:
         print(f"Steps: {args.steps}")
-    print("\nClose the window or press Ctrl+C to stop\n")
+    print("\nUse GUI controls at bottom of window. Close window or Ctrl+C to stop.\n")
 
     # Run simulation loop
     obs = vec_env.reset()
     step = 0
-    interval_sec = args.speed / 1000.0
 
     try:
         while args.steps is None or step < args.steps:
-            if not view.is_open():
+            if not view.is_open() or view.quit_requested:
                 print("\nWindow closed")
                 break
+
+            # Handle pause state
+            if view.paused and not view.step_requested:
+                # Process events but don't advance simulation
+                view.pause(0.05)
+                continue
+
+            # Clear step request flag
+            view.step_requested = False
 
             # Single forward pass - BrainVisualizer hooks capture activations
             with torch.no_grad():
                 logits = brain(obs.float())
                 probs = F.softmax(logits, dim=-1).squeeze().cpu().numpy()
-                action = logits.argmax(dim=-1)
+
+                # Choose action based on sampling mode
+                if view.use_multinomial:
+                    dist = torch.distributions.Categorical(logits=logits)
+                    action = dist.sample()
+                else:
+                    action = logits.argmax(dim=-1)
 
             # Update visualization with current state
             view.update(
@@ -110,6 +132,7 @@ def main():
             step += 1
 
             # Control speed and process matplotlib events
+            interval_sec = view.speed_ms / 1000.0
             view.pause(interval_sec)
 
     except KeyboardInterrupt:

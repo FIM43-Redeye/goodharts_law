@@ -11,6 +11,7 @@ Layout:
 Uses process isolation for zero overhead on the testing thread.
 """
 
+import logging
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional
@@ -62,8 +63,8 @@ class ModeStats:
     total_food: int = 0
     total_poison: int = 0
 
-    # Recent survival times for rolling average
-    recent_survivals: list = field(default_factory=list)
+    # Banked survival times (confirmed at death)
+    banked_survivals: list = field(default_factory=list)
 
     # Status
     is_complete: bool = False
@@ -72,23 +73,31 @@ class ModeStats:
         self.color = get_mode_color(self.mode)
 
     def record_checkpoint(self, timesteps: int, food: int, poison: int, deaths: int,
-                          survival_times: list[int]):
+                          death_times: list[int], current_ages: list[int] | None = None):
         """
         Record a checkpoint with current totals.
 
         Called periodically from the evaluator to update dashboard state.
+
+        Args:
+            timesteps: Total timesteps so far
+            food: Total food eaten
+            poison: Total poison eaten
+            deaths: Total death count
+            death_times: Lifetimes of agents that died this checkpoint (banked)
+            current_ages: Current ages of all living agents (for rolling metric)
         """
         self.total_timesteps = timesteps
         self.total_food = food
         self.total_poison = poison
         self.total_deaths = deaths
 
-        # Update recent survivals for rolling average
-        if survival_times:
-            self.recent_survivals.extend(survival_times)
+        # Bank death times (these are confirmed final lifetimes)
+        if death_times:
+            self.banked_survivals.extend(death_times)
             # Keep only recent window
-            if len(self.recent_survivals) > ROLLING_WINDOW * 2:
-                self.recent_survivals = self.recent_survivals[-ROLLING_WINDOW:]
+            if len(self.banked_survivals) > ROLLING_WINDOW * 2:
+                self.banked_survivals = self.banked_survivals[-ROLLING_WINDOW:]
 
         # Append to history
         self.timesteps.append(timesteps)
@@ -101,12 +110,19 @@ class ModeStats:
         # Cumulative deaths
         self.cumulative_deaths.append(deaths)
 
-        # Rolling average survival
-        if self.recent_survivals:
-            window = self.recent_survivals[-ROLLING_WINDOW:]
+        # Rolling survival metric: combine banked deaths with current ages
+        # This ensures we have data even when agents rarely die
+        if current_ages is not None and len(current_ages) > 0:
+            # Use current ages as the primary metric (what's happening now)
+            # plus recent banked deaths for context
+            recent_banked = self.banked_survivals[-ROLLING_WINDOW:] if self.banked_survivals else []
+            combined = list(current_ages) + recent_banked
+            self.survival_rolling.append(np.mean(combined))
+        elif self.banked_survivals:
+            # Fall back to banked deaths only
+            window = self.banked_survivals[-ROLLING_WINDOW:]
             self.survival_rolling.append(np.mean(window))
         else:
-            # No deaths yet - show 0 (or could show max possible)
             self.survival_rolling.append(0)
 
     @property
@@ -118,8 +134,9 @@ class ModeStats:
     @property
     def current_survival_avg(self) -> float:
         """Current rolling average survival time."""
-        if self.recent_survivals:
-            return np.mean(self.recent_survivals[-ROLLING_WINDOW:])
+        # Use the most recent rolling value (includes current ages)
+        if self.survival_rolling:
+            return self.survival_rolling[-1]
         return 0.0
 
     @property
@@ -169,12 +186,13 @@ class TestingDashboard:
         self._trace_indices: dict[str, dict[str, int]] = {}
 
     def send_checkpoint(self, mode: str, timesteps: int, food: int, poison: int,
-                        deaths: int, survival_times: list[int]):
+                        deaths: int, death_times: list[int],
+                        current_ages: list[int] | None = None):
         """Queue a checkpoint update from evaluator."""
         try:
             self.update_queue.put_nowait((
                 'checkpoint', mode,
-                (timesteps, food, poison, deaths, survival_times)
+                (timesteps, food, poison, deaths, death_times, current_ages)
             ))
             self.dirty = True
         except queue.Full:
@@ -201,8 +219,8 @@ class TestingDashboard:
                     continue
 
                 if msg_type == 'checkpoint':
-                    timesteps, food, poison, deaths, survivals = data
-                    stats.record_checkpoint(timesteps, food, poison, deaths, survivals)
+                    timesteps, food, poison, deaths, death_times, current_ages = data
+                    stats.record_checkpoint(timesteps, food, poison, deaths, death_times, current_ages)
                 elif msg_type == 'complete':
                     stats.is_complete = True
 
@@ -450,6 +468,9 @@ class TestingDashboard:
 
             return fig
 
+        # Suppress Werkzeug request logging (POST spam)
+        logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
         # Run server
         app.run(debug=False, use_reloader=False, port=8051)
 
@@ -520,12 +541,13 @@ class TestingDashboardProcess:
         print(f"[Dashboard] Started (PID {self._process.pid})")
 
     def send_checkpoint(self, mode: str, timesteps: int, food: int, poison: int,
-                        deaths: int, survival_times: list[int]):
+                        deaths: int, death_times: list[int],
+                        current_ages: list[int] | None = None):
         """Send checkpoint to dashboard."""
         try:
             self._queue.put_nowait((
                 'checkpoint', mode,
-                (timesteps, food, poison, deaths, survival_times)
+                (timesteps, food, poison, deaths, death_times, current_ages)
             ))
         except queue.Full:
             pass

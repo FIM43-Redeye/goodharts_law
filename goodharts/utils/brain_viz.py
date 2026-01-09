@@ -184,7 +184,8 @@ class BrainVisualizer:
         """
         Arrange 8-directional action values as a compass rose.
 
-        Input indices: [N, NE, E, SE, S, SW, W, NW] (standard 8-action space)
+        Input indices match build_action_list iteration order:
+        [NW, W, SW, N, S, NE, E, SE] (indices 0-7)
 
         Output 3x3 masked array:
             NW  N  NE
@@ -194,16 +195,16 @@ class BrainVisualizer:
         Center cell is masked (not rendered at all).
         """
         # Map from action index to (row, col) in 3x3 grid
-        # Actions: 0=N, 1=NE, 2=E, 3=SE, 4=S, 5=SW, 6=W, 7=NW
+        # Actions from build_action_list: 0=NW, 1=W, 2=SW, 3=N, 4=S, 5=NE, 6=E, 7=SE
         compass = np.zeros((3, 3))
-        compass[0, 1] = values[0]  # N
-        compass[0, 2] = values[1]  # NE
-        compass[1, 2] = values[2]  # E
-        compass[2, 2] = values[3]  # SE
+        compass[0, 0] = values[0]  # NW
+        compass[1, 0] = values[1]  # W
+        compass[2, 0] = values[2]  # SW
+        compass[0, 1] = values[3]  # N
         compass[2, 1] = values[4]  # S
-        compass[2, 0] = values[5]  # SW
-        compass[1, 0] = values[6]  # W
-        compass[0, 0] = values[7]  # NW
+        compass[0, 2] = values[5]  # NE
+        compass[1, 2] = values[6]  # E
+        compass[2, 2] = values[7]  # SE
 
         # Mask the center cell so it's not rendered
         mask = np.zeros((3, 3), dtype=bool)
