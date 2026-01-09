@@ -19,8 +19,10 @@ import os
 # Set BEFORE any torch imports happen (module-level, not in fixture)
 # - torch.compile adds 30-60s of startup time per test file
 # - cuDNN benchmark adds 60-300s on AMD/ROCm (MIOpen doesn't cache across processes)
+# - CUBLAS_WORKSPACE_CONFIG is required for deterministic cuBLAS operations
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 os.environ.setdefault("GOODHARTS_CUDNN_BENCHMARK", "0")
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import pytest
 import torch

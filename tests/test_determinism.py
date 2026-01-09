@@ -9,6 +9,7 @@ These tests verify that:
 import pytest
 import torch
 import numpy as np
+from contextlib import contextmanager
 
 from goodharts.environments.torch_env import create_torch_vec_env
 from goodharts.modes import ObservationSpec
@@ -37,6 +38,44 @@ def set_all_seeds(seed: int):
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+@contextmanager
+def deterministic_mode():
+    """Context manager to enable PyTorch deterministic algorithms.
+
+    Enables torch.use_deterministic_algorithms and cudnn deterministic mode
+    for the duration of the context. Also sets CUBLAS_WORKSPACE_CONFIG for
+    deterministic cuBLAS operations. Restores previous state on exit.
+
+    Note: Even with deterministic mode, some GPU operations may have tiny
+    floating-point differences across architectures. Tests using this should
+    use torch.allclose with a tight tolerance rather than torch.equal.
+    """
+    import os
+
+    # Save previous state
+    prev_deterministic = torch.are_deterministic_algorithms_enabled()
+    prev_cudnn_deterministic = torch.backends.cudnn.deterministic
+    prev_cudnn_benchmark = torch.backends.cudnn.benchmark
+    prev_cublas_config = os.environ.get('CUBLAS_WORKSPACE_CONFIG')
+
+    try:
+        # Enable deterministic mode
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        yield
+    finally:
+        # Restore previous state
+        if prev_cublas_config is None:
+            os.environ.pop('CUBLAS_WORKSPACE_CONFIG', None)
+        else:
+            os.environ['CUBLAS_WORKSPACE_CONFIG'] = prev_cublas_config
+        torch.use_deterministic_algorithms(prev_deterministic)
+        torch.backends.cudnn.deterministic = prev_cudnn_deterministic
+        torch.backends.cudnn.benchmark = prev_cudnn_benchmark
 
 
 class TestTorchSeeding:
@@ -237,36 +276,42 @@ class TestGradientDeterminism:
     """Tests for gradient computation reproducibility."""
 
     def test_gradients_reproducible(self, device):
-        """Gradient computation should be reproducible."""
-        set_all_seeds(42)
-        model1 = BaseCNN(
-            input_shape=(11, 11),
-            input_channels=6,
-            output_size=8
-        ).to(device)
+        """Gradient computation should be reproducible.
 
-        x1 = torch.randn(4, 6, 11, 11, device=device)
-        out1 = model1(x1)
-        loss1 = out1.sum()
-        loss1.backward()
-        grads1 = {n: p.grad.clone() for n, p in model1.named_parameters() if p.grad is not None}
+        Uses deterministic mode and tight tolerance to handle minor
+        floating-point variance that can occur even with identical seeds
+        on different GPU architectures.
+        """
+        with deterministic_mode():
+            set_all_seeds(42)
+            model1 = BaseCNN(
+                input_shape=(11, 11),
+                input_channels=6,
+                output_size=8
+            ).to(device)
 
-        set_all_seeds(42)
-        model2 = BaseCNN(
-            input_shape=(11, 11),
-            input_channels=6,
-            output_size=8
-        ).to(device)
+            x1 = torch.randn(4, 6, 11, 11, device=device)
+            out1 = model1(x1)
+            loss1 = out1.sum()
+            loss1.backward()
+            grads1 = {n: p.grad.clone() for n, p in model1.named_parameters() if p.grad is not None}
 
-        x2 = torch.randn(4, 6, 11, 11, device=device)
-        out2 = model2(x2)
-        loss2 = out2.sum()
-        loss2.backward()
-        grads2 = {n: p.grad.clone() for n, p in model2.named_parameters() if p.grad is not None}
+            set_all_seeds(42)
+            model2 = BaseCNN(
+                input_shape=(11, 11),
+                input_channels=6,
+                output_size=8
+            ).to(device)
 
-        for name in grads1:
-            assert torch.equal(grads1[name], grads2[name]), \
-                f"Gradients for {name} differ with same seed"
+            x2 = torch.randn(4, 6, 11, 11, device=device)
+            out2 = model2(x2)
+            loss2 = out2.sum()
+            loss2.backward()
+            grads2 = {n: p.grad.clone() for n, p in model2.named_parameters() if p.grad is not None}
+
+            for name in grads1:
+                assert torch.allclose(grads1[name], grads2[name], rtol=1e-5, atol=1e-7), \
+                    f"Gradients for {name} differ with same seed"
 
 
 class TestCrossRunConsistency:

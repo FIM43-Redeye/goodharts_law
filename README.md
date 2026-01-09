@@ -95,36 +95,31 @@ This project is a demonstrator for the results of optimizing for a proxy objecti
 
 ## Project Structure
 
-```
-goodharts_law/
-├── main.py                     # Visual demo entry point
-├── config.default.toml         # Configuration template
-├── goodharts/                  # Main package
-│   ├── simulation.py           # Visual demo orchestrator
-│   ├── modes.py                # Training modes (ObservationSpec, RewardComputer)
-│   ├── config.py               # TOML config loader
-│   ├── behaviors/              # Agent decision-making
-│   │   ├── registry.py         # Auto-discovery system
-│   │   ├── learned.py          # Neural network agents
-│   │   ├── hardcoded/          # Baseline heuristics (OmniscientSeeker, ProxySeeker)
-│   │   └── brains/base_cnn.py  # CNN architecture
-│   ├── environments/
-│   │   └── torch_env.py        # GPU-native vectorized environment
-│   ├── training/
-│   │   ├── train_ppo.py        # Training CLI
-│   │   └── ppo/                # PPO implementation (trainer, algorithms, models)
-│   ├── evaluation/             # Evaluation infrastructure
-│   │   └── evaluator.py        # Core evaluation logic
-│   └── analysis/               # Statistical analysis and visualization
-│   └── cli/                    # CLI modules
-│       ├── evaluate.py         # Evaluation CLI
-│       ├── brain_view.py       # Neural network visualization
-│       └── parallel_stats.py   # Multi-mode comparison
-├── scripts/                    # Development tools (profiling, benchmarking)
-├── tests/                      # pytest suite
-├── models/                     # Saved weights
-└── generated/                  # Evaluation outputs
-```
+**Entry points:**
+- `main.py` - Unified CLI dispatcher (train, evaluate, brain-view, parallel-stats, report)
+- `config.default.toml` - Configuration template with documented defaults
+
+**Core package (`goodharts/`):**
+- `simulation.py` - Visual demo orchestrator
+- `modes.py` - Training modes defining observation/reward pairs (ObservationSpec, RewardComputer)
+- `config.py` - TOML configuration loader with precedence handling
+
+**Subpackages:**
+- `behaviors/` - Agent decision-making: registry for auto-discovery, learned agents (CNN), hardcoded baselines (OmniscientSeeker, ProxySeeker)
+- `environments/` - GPU-native vectorized environment (TorchVecEnv)
+- `training/` - PPO implementation and training dashboards
+- `evaluation/` - Multi-run evaluation, CUDA graph acceleration, live dashboard
+- `analysis/` - Statistical analysis, power calculations, figure generation, report builder
+- `visualization/` - matplotlib brain-view, Plotly/Dash parallel stats dashboard
+- `cli/` - CLI modules for each command (evaluate, brain-view, parallel-stats, report)
+- `configs/` - Default configuration values and CellType registry
+- `utils/` - Device selection, seeding, logging, brain visualization helpers
+
+**Other directories:**
+- `tests/` - pytest suite
+- `scripts/` - Development tools (profiling, benchmarking, tracing)
+- `models/` - Saved model weights
+- `generated/` - Evaluation outputs and reports
 
 ---
 
@@ -401,6 +396,13 @@ BehaviorClass = get_behavior('OmniscientSeeker')
 # Create learned behavior from preset
 behavior = create_learned_behavior('ground_truth', model_path='models/ppo_ground_truth.pth')
 ```
+
+### Visualization Stack
+
+Two libraries, chosen for their strengths:
+
+- **Plotly/Dash** for dashboards and saved figures. Headless-compatible (Colab, SSH, containers) - serves to browser or renders via kaleido without requiring a display.
+- **matplotlib** for `brain-view` only. Real-time animation of grid state, agent observations, and neural network layer activations requires fast in-place updates. matplotlib's artist system handles this efficiently; Plotly would require constant figure rebuilding or complex callback chains.
 
 ---
 

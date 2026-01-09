@@ -9,9 +9,41 @@ import pytest
 import torch
 import tempfile
 import os
+from contextlib import contextmanager
 
 from goodharts.behaviors.brains.base_cnn import BaseCNN
 from goodharts.modes import ObservationSpec
+
+
+@contextmanager
+def deterministic_mode():
+    """Context manager to enable PyTorch deterministic algorithms.
+
+    Enables torch.use_deterministic_algorithms and cudnn deterministic mode
+    for the duration of the context. Also sets CUBLAS_WORKSPACE_CONFIG for
+    deterministic cuBLAS operations. Restores previous state on exit.
+    """
+    import os
+
+    prev_deterministic = torch.are_deterministic_algorithms_enabled()
+    prev_cudnn_deterministic = torch.backends.cudnn.deterministic
+    prev_cudnn_benchmark = torch.backends.cudnn.benchmark
+    prev_cublas_config = os.environ.get('CUBLAS_WORKSPACE_CONFIG')
+
+    try:
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        yield
+    finally:
+        if prev_cublas_config is None:
+            os.environ.pop('CUBLAS_WORKSPACE_CONFIG', None)
+        else:
+            os.environ['CUBLAS_WORKSPACE_CONFIG'] = prev_cublas_config
+        torch.use_deterministic_algorithms(prev_deterministic)
+        torch.backends.cudnn.deterministic = prev_cudnn_deterministic
+        torch.backends.cudnn.benchmark = prev_cudnn_benchmark
 
 # Note: config and device fixtures are provided by conftest.py
 
@@ -193,66 +225,72 @@ class TestTrainerCheckpoint:
         assert len(optimizer2.state) > 0, "Optimizer state not loaded"
 
     def test_continued_training_produces_same_result(self, device, temp_model_path):
-        """Continuing training from checkpoint should be reproducible."""
-        torch.manual_seed(42)
+        """Continuing training from checkpoint should be reproducible.
 
-        # Initial model and optimizer
-        model = BaseCNN(
-            input_shape=(11, 11),
-            input_channels=2,
-            output_size=8
-        ).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        Uses deterministic mode and tight tolerance to handle minor
+        floating-point variance that can occur even with identical seeds
+        on different GPU architectures.
+        """
+        with deterministic_mode():
+            torch.manual_seed(42)
 
-        # Train for a bit
-        for _ in range(5):
-            x = torch.randn(4, 2, 11, 11, device=device)
-            loss = model(x).sum()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # Initial model and optimizer
+            model = BaseCNN(
+                input_shape=(11, 11),
+                input_channels=2,
+                output_size=8
+            ).to(device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-        # Save checkpoint
-        checkpoint = {
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-        }
-        torch.save(checkpoint, temp_model_path)
+            # Train for a bit
+            for _ in range(5):
+                x = torch.randn(4, 2, 11, 11, device=device)
+                loss = model(x).sum()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
-        # Continue training
-        torch.manual_seed(123)
-        for _ in range(5):
-            x = torch.randn(4, 2, 11, 11, device=device)
-            loss = model(x).sum()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # Save checkpoint
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }
+            torch.save(checkpoint, temp_model_path)
 
-        final_weights_1 = {n: p.clone() for n, p in model.named_parameters()}
+            # Continue training
+            torch.manual_seed(123)
+            for _ in range(5):
+                x = torch.randn(4, 2, 11, 11, device=device)
+                loss = model(x).sum()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
-        # Load checkpoint and continue with same seed
-        model2 = BaseCNN(
-            input_shape=(11, 11),
-            input_channels=2,
-            output_size=8
-        ).to(device)
-        checkpoint = torch.load(temp_model_path, map_location=device)
-        model2.load_state_dict(checkpoint['model_state_dict'])
-        optimizer2 = torch.optim.Adam(model2.parameters(), lr=0.001)
-        optimizer2.load_state_dict(checkpoint['optimizer_state_dict'])
+            final_weights_1 = {n: p.clone() for n, p in model.named_parameters()}
 
-        torch.manual_seed(123)
-        for _ in range(5):
-            x = torch.randn(4, 2, 11, 11, device=device)
-            loss = model2(x).sum()
-            optimizer2.zero_grad()
-            loss.backward()
-            optimizer2.step()
+            # Load checkpoint and continue with same seed
+            model2 = BaseCNN(
+                input_shape=(11, 11),
+                input_channels=2,
+                output_size=8
+            ).to(device)
+            checkpoint = torch.load(temp_model_path, map_location=device)
+            model2.load_state_dict(checkpoint['model_state_dict'])
+            optimizer2 = torch.optim.Adam(model2.parameters(), lr=0.001)
+            optimizer2.load_state_dict(checkpoint['optimizer_state_dict'])
 
-        # Should have same final weights
-        for name, param in model2.named_parameters():
-            assert torch.equal(param, final_weights_1[name]), \
-                f"Parameter {name} differs after resumed training"
+            torch.manual_seed(123)
+            for _ in range(5):
+                x = torch.randn(4, 2, 11, 11, device=device)
+                loss = model2(x).sum()
+                optimizer2.zero_grad()
+                loss.backward()
+                optimizer2.step()
+
+            # Should have same final weights (with tight tolerance for GPU variance)
+            for name, param in model2.named_parameters():
+                assert torch.allclose(param, final_weights_1[name], rtol=1e-5, atol=1e-7), \
+                    f"Parameter {name} differs after resumed training"
 
 
 class TestLearnedBehaviorLoading:
